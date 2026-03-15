@@ -280,6 +280,15 @@
   // The colors that are used for different indentation levels are defined in the theme (theme key: `accents`).
   // They can be customized by using theme overrides.
   "colorize_brackets": false,
+  // Controls how bracket colors are derived from theme accents.
+  // Auto adjusts colors for readability and reorders when adjacent pairs are weak.
+  // Theme preserves the authored order exactly.
+  //
+  // This setting can take two values:
+  //
+  // 1. "auto" (default)
+  // 2. "theme"
+  "bracket_colorization_mode": "auto",
   // When to show the scrollbar in the completion menu.
   // This setting can take four values:
   //

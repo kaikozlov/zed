@@ -640,6 +640,35 @@ pub struct LanguageSettingsContent {
     ///
     /// Default: false
     pub colorize_brackets: Option<bool>,
+    /// Controls how bracket colors are derived from theme accents.
+    /// Auto adjusts colors for readability and reorders when adjacent pairs are weak.
+    /// Theme preserves the authored order exactly.
+    ///
+    /// Default: auto
+    pub bracket_colorization_mode: Option<BracketColorizationMode>,
+}
+
+/// Controls how rainbow bracket colors are derived from theme accents.
+#[derive(
+    Debug,
+    PartialEq,
+    Clone,
+    Copy,
+    Default,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum BracketColorizationMode {
+    /// Reorder theme accents only when adjacent bracket contrast is weak.
+    #[default]
+    Auto,
+    /// Preserve the theme-provided accent order exactly.
+    Theme,
 }
 
 /// Controls how whitespace should be displayedin the editor.

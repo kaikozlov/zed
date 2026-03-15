@@ -8526,7 +8526,7 @@ fn language_settings_data() -> Box<[SettingsPageItem]> {
         ]
     }
 
-    fn miscellaneous_section() -> [SettingsPageItem; 6] {
+    fn miscellaneous_section() -> [SettingsPageItem; 7] {
         [
             SettingsPageItem::SectionHeader("Miscellaneous"),
             SettingsPageItem::SettingItem(SettingItem {
@@ -8619,6 +8619,25 @@ fn language_settings_data() -> Box<[SettingsPageItem]> {
                     write: |settings_content, value| {
                         language_settings_field_mut(settings_content, value, |language, value| {
                             language.colorize_brackets = value;
+                        })
+                    },
+                }),
+                metadata: None,
+                files: USER | PROJECT,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Bracket Colorization Mode",
+                description: "Controls how bracket colors are derived from theme accents. Auto adjusts colors for readability and reorders when adjacent pairs are weak. Theme preserves the authored order exactly.",
+                field: Box::new(SettingField {
+                    json_path: Some("languages.$(language).bracket_colorization_mode"),
+                    pick: |settings_content| {
+                        language_settings_field(settings_content, |language| {
+                            language.bracket_colorization_mode.as_ref()
+                        })
+                    },
+                    write: |settings_content, value| {
+                        language_settings_field_mut(settings_content, value, |language, value| {
+                            language.bracket_colorization_mode = value;
                         })
                     },
                 }),
