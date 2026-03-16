@@ -194,38 +194,146 @@ struct PaletteScore {
     average_adjacent_distance: f32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BracketColorizationPaletteScore {
+    pub min_adjacent_distance: f32,
+    pub average_adjacent_distance: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BracketColorizationPaletteStrategy {
+    ThemeOrder,
+    PreservedSmallPalette,
+    PreservedStrongPalette,
+    PreservedWeakPalette,
+    ReorderedWeakPalette,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BracketColorizationPaletteAnalysis {
+    pub mode: BracketColorizationMode,
+    pub appearance: Appearance,
+    pub original_palette: Arc<[Hsla]>,
+    pub final_palette: Arc<[Hsla]>,
+    pub original_score: BracketColorizationPaletteScore,
+    pub final_score: BracketColorizationPaletteScore,
+    pub threshold: Option<f32>,
+    pub changed: bool,
+    pub strategy: BracketColorizationPaletteStrategy,
+}
+
 pub(crate) fn bracket_colorization_accents(
     accents: &[Hsla],
     appearance: Appearance,
     mode: BracketColorizationMode,
 ) -> Arc<[Hsla]> {
+    analyze_bracket_colorization_palette(accents, appearance, mode).final_palette
+}
+
+pub fn analyze_bracket_colorization_palette(
+    accents: &[Hsla],
+    appearance: Appearance,
+    mode: BracketColorizationMode,
+) -> BracketColorizationPaletteAnalysis {
     match mode {
-        BracketColorizationMode::Theme => Arc::from(accents.to_vec()),
-        BracketColorizationMode::Auto => auto_bracket_colorization_accents(accents, appearance),
+        BracketColorizationMode::Theme => {
+            let palette: Arc<[Hsla]> = Arc::from(accents.to_vec());
+            let score = palette_score_for_public_api(palette_score(accents));
+            BracketColorizationPaletteAnalysis {
+                mode,
+                appearance,
+                original_palette: palette.clone(),
+                final_palette: palette,
+                original_score: score,
+                final_score: score,
+                threshold: None,
+                changed: false,
+                strategy: BracketColorizationPaletteStrategy::ThemeOrder,
+            }
+        }
+        BracketColorizationMode::Auto => auto_bracket_colorization_analysis(accents, appearance),
     }
 }
 
-fn auto_bracket_colorization_accents(accents: &[Hsla], appearance: Appearance) -> Arc<[Hsla]> {
+fn auto_bracket_colorization_analysis(
+    accents: &[Hsla],
+    appearance: Appearance,
+) -> BracketColorizationPaletteAnalysis {
+    let original_palette: Arc<[Hsla]> = Arc::from(accents.to_vec());
+    let original_score = palette_score(accents);
     if accents.len() < 3 {
-        return Arc::from(accents.to_vec());
+        let score = palette_score_for_public_api(original_score);
+        return BracketColorizationPaletteAnalysis {
+            mode: BracketColorizationMode::Auto,
+            appearance,
+            original_palette: original_palette.clone(),
+            final_palette: original_palette,
+            original_score: score,
+            final_score: score,
+            threshold: Some(minimum_adjacent_distance(appearance)),
+            changed: false,
+            strategy: BracketColorizationPaletteStrategy::PreservedSmallPalette,
+        };
     }
 
-    let original_score = palette_score(accents);
-    let minimum_distance = match appearance {
-        Appearance::Light => 0.24,
-        Appearance::Dark => 0.20,
-    };
+    let minimum_distance = minimum_adjacent_distance(appearance);
     if original_score.min_adjacent_distance >= minimum_distance {
-        return Arc::from(accents.to_vec());
+        let score = palette_score_for_public_api(original_score);
+        return BracketColorizationPaletteAnalysis {
+            mode: BracketColorizationMode::Auto,
+            appearance,
+            original_palette: original_palette.clone(),
+            final_palette: original_palette,
+            original_score: score,
+            final_score: score,
+            threshold: Some(minimum_distance),
+            changed: false,
+            strategy: BracketColorizationPaletteStrategy::PreservedStrongPalette,
+        };
     }
 
     let reordered = maximize_adjacent_separation(accents);
     let reordered_score = palette_score(&reordered);
 
     if reordered_score.min_adjacent_distance > original_score.min_adjacent_distance + 0.04 {
-        Arc::from(reordered)
+        BracketColorizationPaletteAnalysis {
+            mode: BracketColorizationMode::Auto,
+            appearance,
+            original_palette,
+            final_palette: Arc::from(reordered),
+            original_score: palette_score_for_public_api(original_score),
+            final_score: palette_score_for_public_api(reordered_score),
+            threshold: Some(minimum_distance),
+            changed: true,
+            strategy: BracketColorizationPaletteStrategy::ReorderedWeakPalette,
+        }
     } else {
-        Arc::from(accents.to_vec())
+        let score = palette_score_for_public_api(original_score);
+        BracketColorizationPaletteAnalysis {
+            mode: BracketColorizationMode::Auto,
+            appearance,
+            original_palette: original_palette.clone(),
+            final_palette: original_palette,
+            original_score: score,
+            final_score: score,
+            threshold: Some(minimum_distance),
+            changed: false,
+            strategy: BracketColorizationPaletteStrategy::PreservedWeakPalette,
+        }
+    }
+}
+
+fn minimum_adjacent_distance(appearance: Appearance) -> f32 {
+    match appearance {
+        Appearance::Light => 0.24,
+        Appearance::Dark => 0.20,
+    }
+}
+
+fn palette_score_for_public_api(score: PaletteScore) -> BracketColorizationPaletteScore {
+    BracketColorizationPaletteScore {
+        min_adjacent_distance: score.min_adjacent_distance,
+        average_adjacent_distance: score.average_adjacent_distance,
     }
 }
 
@@ -457,12 +565,22 @@ mod tests {
             hsla(0.40, 1.0, 0.5, 1.0),
         ];
 
+        let analysis = analyze_bracket_colorization_palette(
+            &accents,
+            Appearance::Light,
+            BracketColorizationMode::Theme,
+        );
         let palette = bracket_colorization_accents(
             &accents,
             Appearance::Light,
             BracketColorizationMode::Theme,
         );
 
+        assert_eq!(
+            analysis.strategy,
+            BracketColorizationPaletteStrategy::ThemeOrder
+        );
+        assert!(!analysis.changed);
         assert_eq!(palette.as_ref(), accents.as_slice());
     }
 
@@ -476,6 +594,11 @@ mod tests {
         ];
 
         let original_score = palette_score(&accents);
+        let analysis = analyze_bracket_colorization_palette(
+            &accents,
+            Appearance::Light,
+            BracketColorizationMode::Auto,
+        );
         let palette = bracket_colorization_accents(
             &accents,
             Appearance::Light,
@@ -483,6 +606,11 @@ mod tests {
         );
         let reordered_score = palette_score(&palette);
 
+        assert_eq!(
+            analysis.strategy,
+            BracketColorizationPaletteStrategy::ReorderedWeakPalette
+        );
+        assert!(analysis.changed);
         assert_ne!(palette.as_ref(), accents.as_slice());
         assert!(reordered_score.min_adjacent_distance > original_score.min_adjacent_distance);
     }
@@ -496,9 +624,19 @@ mod tests {
             hsla(0.66, 1.0, 0.5, 1.0),
         ];
 
+        let analysis = analyze_bracket_colorization_palette(
+            &accents,
+            Appearance::Dark,
+            BracketColorizationMode::Auto,
+        );
         let palette =
             bracket_colorization_accents(&accents, Appearance::Dark, BracketColorizationMode::Auto);
 
+        assert_eq!(
+            analysis.strategy,
+            BracketColorizationPaletteStrategy::PreservedStrongPalette
+        );
+        assert!(!analysis.changed);
         assert_eq!(palette.as_ref(), accents.as_slice());
     }
 

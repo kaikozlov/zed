@@ -5477,6 +5477,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "serde_json_lenient",
  "settings",
  "smallvec",
  "smol",

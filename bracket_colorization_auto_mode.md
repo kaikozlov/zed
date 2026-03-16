@@ -24,6 +24,9 @@ This setting works alongside the existing `colorize_brackets` boolean:
 - `crates/settings_ui/src/page_data.rs`
 - `crates/settings/src/vscode_import.rs`
 - `crates/editor/src/bracket_colorization.rs`
+- `crates/editor/src/editor.rs`
+- `crates/editor/Cargo.toml`
+- `crates/editor/examples/test_bracket_contrast.rs`
 
 Demo files used for visual comparison:
 
@@ -109,6 +112,21 @@ The current approach:
 
 The reordered palette is only used if it meaningfully improves the weakest neighboring pair.
 
+### Analysis Helper
+
+The auto-mode logic is also exposed through a pure analysis helper so it can be run without opening the editor UI.
+
+The helper returns:
+
+- the original palette
+- the final palette used for bracket rendering
+- the original and final palette scores
+- the threshold used for the current appearance
+- whether the palette changed
+- the strategy that was chosen
+
+This keeps the CLI/example output aligned with the actual runtime logic instead of duplicating the heuristic elsewhere.
+
 ## Rendering Model
 
 Bracket colorization now effectively supports two highlight families:
@@ -122,6 +140,46 @@ The editor maps bracket depth to one of these families based on the current lang
 - the reordered auto palette
 
 This keeps `theme` and `auto` behavior available simultaneously without changing the underlying bracket-depth logic.
+
+## Caching
+
+The derived `auto` palette is cached in editor accent state rather than being recomputed on every bracket-colorization pass.
+
+Specifically:
+
+- the raw theme accents are stored in `AccentData`
+- the derived `auto` accent order is also stored in `AccentData`
+- both are refreshed when theme/accent state changes
+
+This matters because `colorize_brackets()` can run on more than just settings/theme changes. It also runs on existing editor refresh paths such as reparses, excerpt changes, and scroll-driven updates. The caching change removes unnecessary repeated palette analysis from that path.
+
+The current implementation now reuses the cached `Arc<[Hsla]>` data directly for both theme and auto mode.
+
+## Theme File Analysis
+
+This worktree also adds a small example program that can run the bracket auto-mode logic directly against a theme JSON file without opening the full editor:
+
+```sh
+cargo run -p editor --example test_bracket_contrast -- assets/themes/one/one.json
+```
+
+The example:
+
+1. parses the theme JSON
+2. refines it through the real theme pipeline
+3. runs the same bracket auto-mode analysis used by the editor
+4. prints a report for each theme variant in the file
+
+The report includes:
+
+- whether adjacent bracket contrast is considered good or bad under the current heuristic
+- whether bracket colors changed
+- which strategy was used
+- the original palette
+- the final palette
+- the original and final palette scores
+
+This is intended as a developer tool for quickly evaluating shipped or custom themes outside the editor UI.
 
 ## Why This Approach
 
@@ -166,6 +224,12 @@ Verification command used:
 
 ```sh
 cargo test -p editor bracket_colorization --lib
+```
+
+Additional verification used:
+
+```sh
+cargo run -p editor --example test_bracket_contrast -- assets/themes/one/one.json
 ```
 
 ## Possible Follow-Ups

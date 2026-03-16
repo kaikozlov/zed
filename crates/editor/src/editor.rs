@@ -54,6 +54,10 @@ mod signature_help;
 pub mod test;
 
 pub(crate) use actions::*;
+pub use bracket_colorization::{
+    BracketColorizationPaletteAnalysis, BracketColorizationPaletteScore,
+    BracketColorizationPaletteStrategy, analyze_bracket_colorization_palette,
+};
 pub use display_map::{
     ChunkRenderer, ChunkRendererContext, DisplayPoint, FoldPlaceholder, HighlightKey,
     SemanticTokenHighlight,
