@@ -280,6 +280,15 @@
   // The colors that are used for different indentation levels are defined in the theme (theme key: `accents`).
   // They can be customized by using theme overrides.
   "colorize_brackets": false,
+  // Controls how rainbow brackets derive colors from the active theme.
+  //
+  // This setting can take two values:
+  //
+  // 1. Automatically reorder weak accent palettes to improve adjacent bracket contrast:
+  //    "auto" (default)
+  // 2. Preserve the theme-provided accent order exactly:
+  //    "theme"
+  "bracket_colorization_mode": "auto",
   // When to show the scrollbar in the completion menu.
   // This setting can take four values:
   //

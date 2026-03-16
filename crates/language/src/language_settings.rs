@@ -12,10 +12,10 @@ use itertools::{Either, Itertools};
 use settings::{DocumentFoldingRanges, DocumentSymbols, IntoGpui, SemanticTokens};
 
 pub use settings::{
-    AutoIndentMode, CompletionSettingsContent, EditPredictionPromptFormat, EditPredictionProvider,
-    EditPredictionsMode, FormatOnSave, Formatter, FormatterList, InlayHintKind,
-    LanguageSettingsContent, LspInsertMode, RewrapBehavior, ShowWhitespaceSetting, SoftWrap,
-    WordsCompletionMode,
+    AutoIndentMode, BracketColorizationMode, CompletionSettingsContent, EditPredictionPromptFormat,
+    EditPredictionProvider, EditPredictionsMode, FormatOnSave, Formatter, FormatterList,
+    InlayHintKind, LanguageSettingsContent, LspInsertMode, RewrapBehavior, ShowWhitespaceSetting,
+    SoftWrap, WordsCompletionMode,
 };
 use settings::{RegisterSetting, Settings, SettingsLocation, SettingsStore};
 use shellexpand;
@@ -175,6 +175,8 @@ pub struct LanguageSettings {
     pub word_diff_enabled: bool,
     /// Whether to use tree-sitter bracket queries to detect and colorize the brackets in the editor.
     pub colorize_brackets: bool,
+    /// Controls how rainbow bracket colors are derived from theme accents.
+    pub bracket_colorization_mode: BracketColorizationMode,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -661,6 +663,7 @@ impl settings::Settings for AllLanguageSettings {
                 show_completions_on_input: settings.show_completions_on_input.unwrap(),
                 show_completion_documentation: settings.show_completion_documentation.unwrap(),
                 colorize_brackets: settings.colorize_brackets.unwrap(),
+                bracket_colorization_mode: settings.bracket_colorization_mode.unwrap(),
                 completions: CompletionSettings {
                     words: completions.words.unwrap(),
                     words_min_length: completions.words_min_length.unwrap() as usize,

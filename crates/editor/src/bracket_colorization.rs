@@ -2,14 +2,18 @@
 //! Uses tree-sitter queries from brackets.scm to capture bracket pairs,
 //! and theme accents to colorize those.
 
+use std::cmp::Ordering;
 use std::ops::Range;
+use std::sync::Arc;
 
 use crate::{Editor, HighlightKey};
 use collections::{HashMap, HashSet};
-use gpui::{AppContext as _, Context, HighlightStyle};
+use gpui::{AppContext as _, Context, HighlightStyle, Hsla, Rgba};
 use itertools::Itertools;
+use language::language_settings::BracketColorizationMode;
 use language::{BufferRow, BufferSnapshot, language_settings};
 use multi_buffer::{Anchor, ExcerptId};
+use theme::Appearance;
 use ui::ActiveTheme;
 
 impl Editor {
@@ -22,22 +26,37 @@ impl Editor {
             self.bracket_fetched_tree_sitter_chunks.clear();
         }
 
-        let accents_count = cx.theme().accents().0.len();
+        let theme_accents = Arc::from(cx.theme().accents().0.to_vec());
+        let auto_accents = bracket_colorization_accents(
+            &theme_accents,
+            cx.theme().appearance,
+            BracketColorizationMode::Auto,
+        );
         let multi_buffer_snapshot = self.buffer().read(cx).snapshot(cx);
 
         let visible_excerpts = self.visible_excerpts(false, cx);
-        let excerpt_data: Vec<(ExcerptId, BufferSnapshot, Range<usize>)> = visible_excerpts
+        let excerpt_data: Vec<(
+            ExcerptId,
+            BufferSnapshot,
+            Range<usize>,
+            BracketColorizationMode,
+        )> = visible_excerpts
             .into_iter()
             .filter_map(|(excerpt_id, (buffer, _, buffer_range))| {
                 let buffer_snapshot = buffer.read(cx).snapshot();
-                if language_settings::language_settings(
+                let file = buffer_snapshot.file().cloned();
+                let language_settings = language_settings::language_settings(
                     buffer_snapshot.language().map(|language| language.name()),
-                    buffer_snapshot.file(),
+                    file.as_ref(),
                     cx,
-                )
-                .colorize_brackets
-                {
-                    Some((excerpt_id, buffer_snapshot, buffer_range))
+                );
+                if language_settings.colorize_brackets {
+                    Some((
+                        excerpt_id,
+                        buffer_snapshot,
+                        buffer_range,
+                        language_settings.bracket_colorization_mode,
+                    ))
                 } else {
                     None
                 }
@@ -56,6 +75,8 @@ impl Editor {
             })
             .collect::<HashMap<ExcerptId, HashSet<Range<BufferRow>>>>();
 
+        let theme_accents_for_ranges = theme_accents.clone();
+        let auto_accents_for_ranges = auto_accents.clone();
         let bracket_matches_by_accent = cx.background_spawn(async move {
             let anchors_in_multi_buffer = |current_excerpt: ExcerptId,
                                            text_anchors: [text::Anchor; 4]|
@@ -68,22 +89,27 @@ impl Editor {
             let bracket_matches_by_accent: HashMap<usize, Vec<Range<Anchor>>> =
                 excerpt_data.into_iter().fold(
                     HashMap::default(),
-                    |mut acc, (excerpt_id, buffer_snapshot, buffer_range)| {
+                    |mut acc, (excerpt_id, buffer_snapshot, buffer_range, mode)| {
                         let fetched_chunks =
                             fetched_tree_sitter_chunks.entry(excerpt_id).or_default();
+                        let accent_count = accent_count_for_mode(
+                            mode,
+                            theme_accents_for_ranges.len(),
+                            auto_accents_for_ranges.len(),
+                        );
 
                         let brackets_by_accent = compute_bracket_ranges(
                             &buffer_snapshot,
                             buffer_range,
                             fetched_chunks,
                             excerpt_id,
-                            accents_count,
+                            accent_count,
                             &anchors_in_multi_buffer,
                         );
 
                         for (accent_number, new_ranges) in brackets_by_accent {
                             let ranges = acc
-                                .entry(accent_number)
+                                .entry(highlight_key_for_mode(mode, accent_number))
                                 .or_insert_with(Vec::<Range<Anchor>>::new);
 
                             for new_range in new_ranges {
@@ -103,7 +129,8 @@ impl Editor {
             (bracket_matches_by_accent, fetched_tree_sitter_chunks)
         });
 
-        let accents = cx.theme().accents().clone();
+        let theme_accents = theme_accents.clone();
+        let auto_accents = auto_accents.clone();
 
         self.colorize_brackets_task = cx.spawn(async move |editor, cx| {
             if invalidate {
@@ -124,15 +151,19 @@ impl Editor {
                     editor
                         .bracket_fetched_tree_sitter_chunks
                         .extend(updated_chunks);
-                    for (accent_number, bracket_highlights) in bracket_matches_by_accent {
-                        let bracket_color = accents.color_for_index(accent_number as u32);
+                    for (highlight_key, bracket_highlights) in bracket_matches_by_accent {
+                        let bracket_color = bracket_color_for_highlight_key(
+                            highlight_key,
+                            &theme_accents,
+                            &auto_accents,
+                        );
                         let style = HighlightStyle {
                             color: Some(bracket_color),
                             ..HighlightStyle::default()
                         };
 
                         editor.highlight_text_key(
-                            HighlightKey::ColorizeBracket(accent_number),
+                            HighlightKey::ColorizeBracket(highlight_key),
                             bracket_highlights,
                             style,
                             true,
@@ -143,6 +174,178 @@ impl Editor {
                 .ok();
         });
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PaletteScore {
+    min_adjacent_distance: f32,
+    average_adjacent_distance: f32,
+}
+
+fn bracket_colorization_accents(
+    accents: &[Hsla],
+    appearance: Appearance,
+    mode: BracketColorizationMode,
+) -> Arc<[Hsla]> {
+    match mode {
+        BracketColorizationMode::Theme => Arc::from(accents.to_vec()),
+        BracketColorizationMode::Auto => auto_bracket_colorization_accents(accents, appearance),
+    }
+}
+
+fn auto_bracket_colorization_accents(accents: &[Hsla], appearance: Appearance) -> Arc<[Hsla]> {
+    if accents.len() < 3 {
+        return Arc::from(accents.to_vec());
+    }
+
+    let original_score = palette_score(accents);
+    let minimum_distance = match appearance {
+        Appearance::Light => 0.24,
+        Appearance::Dark => 0.20,
+    };
+    if original_score.min_adjacent_distance >= minimum_distance {
+        return Arc::from(accents.to_vec());
+    }
+
+    let reordered = maximize_adjacent_separation(accents);
+    let reordered_score = palette_score(&reordered);
+
+    if reordered_score.min_adjacent_distance > original_score.min_adjacent_distance + 0.04 {
+        Arc::from(reordered)
+    } else {
+        Arc::from(accents.to_vec())
+    }
+}
+
+fn accent_count_for_mode(
+    mode: BracketColorizationMode,
+    theme_count: usize,
+    auto_count: usize,
+) -> usize {
+    match mode {
+        BracketColorizationMode::Theme => theme_count,
+        BracketColorizationMode::Auto => auto_count,
+    }
+}
+
+fn highlight_key_for_mode(mode: BracketColorizationMode, accent_number: usize) -> usize {
+    accent_number * 2
+        + match mode {
+            BracketColorizationMode::Theme => 0,
+            BracketColorizationMode::Auto => 1,
+        }
+}
+
+fn bracket_color_for_highlight_key(
+    highlight_key: usize,
+    theme_accents: &[Hsla],
+    auto_accents: &[Hsla],
+) -> Hsla {
+    let accent_number = highlight_key / 2;
+    match highlight_key % 2 {
+        0 => theme_accents[accent_number],
+        _ => auto_accents[accent_number],
+    }
+}
+
+fn maximize_adjacent_separation(accents: &[Hsla]) -> Vec<Hsla> {
+    let mut best_order = accents.to_vec();
+    let mut best_score = palette_score(&best_order);
+
+    for start in 0..accents.len() {
+        let mut used = vec![false; accents.len()];
+        let mut order = Vec::with_capacity(accents.len());
+        order.push(start);
+        used[start] = true;
+
+        while order.len() < accents.len() {
+            let last = *order.last().unwrap_or(&start);
+            let first = order[0];
+            let next = (0..accents.len())
+                .filter(|&index| !used[index])
+                .max_by(|&left, &right| compare_candidates(accents, last, first, left, right))
+                .unwrap_or(start);
+            used[next] = true;
+            order.push(next);
+        }
+
+        let reordered = order
+            .into_iter()
+            .map(|index| accents[index])
+            .collect::<Vec<_>>();
+        let score = palette_score(&reordered);
+        if palette_score_is_better(score, best_score) {
+            best_order = reordered;
+            best_score = score;
+        }
+    }
+
+    best_order
+}
+
+fn compare_candidates(
+    accents: &[Hsla],
+    last: usize,
+    first: usize,
+    left: usize,
+    right: usize,
+) -> Ordering {
+    let left_score = (
+        adjacent_distance(accents[last], accents[left]),
+        adjacent_distance(accents[first], accents[left]),
+    );
+    let right_score = (
+        adjacent_distance(accents[last], accents[right]),
+        adjacent_distance(accents[first], accents[right]),
+    );
+    compare_float_tuple(left_score, right_score)
+}
+
+fn palette_score(accents: &[Hsla]) -> PaletteScore {
+    if accents.len() < 2 {
+        return PaletteScore {
+            min_adjacent_distance: f32::MAX,
+            average_adjacent_distance: f32::MAX,
+        };
+    }
+
+    let distances = accents
+        .iter()
+        .copied()
+        .zip(accents.iter().copied().cycle().skip(1))
+        .take(accents.len())
+        .map(|(left, right)| adjacent_distance(left, right))
+        .collect::<Vec<_>>();
+
+    let min_adjacent_distance = distances.iter().copied().fold(f32::MAX, f32::min);
+    let average_adjacent_distance = distances.iter().sum::<f32>() / distances.len() as f32;
+
+    PaletteScore {
+        min_adjacent_distance,
+        average_adjacent_distance,
+    }
+}
+
+fn palette_score_is_better(left: PaletteScore, right: PaletteScore) -> bool {
+    left.min_adjacent_distance > right.min_adjacent_distance + 0.0001
+        || ((left.min_adjacent_distance - right.min_adjacent_distance).abs() <= 0.0001
+            && left.average_adjacent_distance > right.average_adjacent_distance + 0.0001)
+}
+
+fn compare_float_tuple(left: (f32, f32), right: (f32, f32)) -> Ordering {
+    match left.0.partial_cmp(&right.0).unwrap_or(Ordering::Equal) {
+        Ordering::Equal => left.1.partial_cmp(&right.1).unwrap_or(Ordering::Equal),
+        ordering => ordering,
+    }
+}
+
+fn adjacent_distance(left: Hsla, right: Hsla) -> f32 {
+    let left = Rgba::from(left);
+    let right = Rgba::from(right);
+    let red_delta = left.r - right.r;
+    let green_delta = left.g - right.g;
+    let blue_delta = left.b - right.b;
+    (red_delta * red_delta + green_delta * green_delta + blue_delta * blue_delta).sqrt()
 }
 
 fn compute_bracket_ranges(
@@ -216,9 +419,10 @@ mod tests {
     };
     use collections::HashSet;
     use fs::FakeFs;
-    use gpui::UpdateGlobal as _;
+    use gpui::{UpdateGlobal as _, hsla};
     use indoc::indoc;
     use itertools::Itertools;
+    use language::language_settings::BracketColorizationMode;
     use language::{Capability, markdown_lang};
     use languages::rust_lang;
     use multi_buffer::{MultiBuffer, PathKey};
@@ -228,9 +432,63 @@ mod tests {
     use serde_json::json;
     use settings::{AccentContent, SettingsStore};
     use text::{Bias, OffsetRangeExt, ToOffset};
-    use theme::ThemeStyleContent;
+    use theme::{Appearance, ThemeStyleContent};
 
     use util::{path, post_inc};
+
+    #[test]
+    fn test_theme_bracket_colorization_mode_preserves_theme_order() {
+        let accents = vec![
+            hsla(0.0, 1.0, 0.5, 1.0),
+            hsla(0.08, 1.0, 0.5, 1.0),
+            hsla(0.66, 1.0, 0.5, 1.0),
+            hsla(0.40, 1.0, 0.5, 1.0),
+        ];
+
+        let palette = bracket_colorization_accents(
+            &accents,
+            Appearance::Light,
+            BracketColorizationMode::Theme,
+        );
+
+        assert_eq!(palette.as_ref(), accents.as_slice());
+    }
+
+    #[test]
+    fn test_auto_bracket_colorization_mode_reorders_weak_palette() {
+        let accents = vec![
+            hsla(0.0, 1.0, 0.5, 1.0),
+            hsla(0.02, 1.0, 0.5, 1.0),
+            hsla(0.33, 1.0, 0.5, 1.0),
+            hsla(0.66, 1.0, 0.5, 1.0),
+        ];
+
+        let original_score = palette_score(&accents);
+        let palette = bracket_colorization_accents(
+            &accents,
+            Appearance::Light,
+            BracketColorizationMode::Auto,
+        );
+        let reordered_score = palette_score(&palette);
+
+        assert_ne!(palette.as_ref(), accents.as_slice());
+        assert!(reordered_score.min_adjacent_distance > original_score.min_adjacent_distance);
+    }
+
+    #[test]
+    fn test_auto_bracket_colorization_mode_preserves_strong_palette() {
+        let accents = vec![
+            hsla(0.0, 1.0, 0.5, 1.0),
+            hsla(0.16, 1.0, 0.5, 1.0),
+            hsla(0.33, 1.0, 0.5, 1.0),
+            hsla(0.66, 1.0, 0.5, 1.0),
+        ];
+
+        let palette =
+            bracket_colorization_accents(&accents, Appearance::Dark, BracketColorizationMode::Auto);
+
+        assert_eq!(palette.as_ref(), accents.as_slice());
+    }
 
     #[gpui::test]
     async fn test_basic_bracket_colorization(cx: &mut gpui::TestAppContext) {

@@ -8523,6 +8523,25 @@ fn language_settings_data() -> Box<[SettingsPageItem]> {
                 metadata: None,
                 files: USER | PROJECT,
             }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Bracket Colorization Mode",
+                description: "Controls whether rainbow brackets preserve the theme accent order or automatically reorder weak palettes.",
+                field: Box::new(SettingField {
+                    json_path: Some("languages.$(language).bracket_colorization_mode"),
+                    pick: |settings_content| {
+                        language_settings_field(settings_content, |language| {
+                            language.bracket_colorization_mode.as_ref()
+                        })
+                    },
+                    write: |settings_content, value| {
+                        language_settings_field_mut(settings_content, value, |language, value| {
+                            language.bracket_colorization_mode = value;
+                        })
+                    },
+                }),
+                metadata: None,
+                files: USER | PROJECT,
+            }),
         ]
     }
 
