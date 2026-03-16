@@ -55,8 +55,9 @@ pub mod test;
 
 pub(crate) use actions::*;
 pub use bracket_colorization::{
-    BracketColorizationPaletteAnalysis, BracketColorizationPaletteScore,
-    BracketColorizationPaletteStrategy, analyze_bracket_colorization_palette,
+    AutoBracketColorizationConfig, BracketColorizationPaletteAnalysis,
+    BracketColorizationPaletteScore, BracketColorizationPaletteStrategy,
+    analyze_bracket_colorization_palette, analyze_bracket_colorization_palette_with_config,
 };
 pub use display_map::{
     ChunkRenderer, ChunkRendererContext, DisplayPoint, FoldPlaceholder, HighlightKey,
@@ -1338,6 +1339,7 @@ pub struct Editor {
 struct AccentData {
     colors: AccentColors,
     auto_colors: AccentColors,
+    editor_background: Hsla,
     overrides: Vec<SharedString>,
 }
 
@@ -23947,10 +23949,12 @@ impl Editor {
         let theme_settings = theme::ThemeSettings::get_global(cx);
         let theme = cx.theme();
         let accent_colors = theme.accents().clone();
+        let editor_background = theme.colors().editor_background;
         let auto_accent_colors =
             AccentColors(crate::bracket_colorization::bracket_colorization_accents(
                 &accent_colors.0,
                 theme.appearance,
+                editor_background,
                 language::language_settings::BracketColorizationMode::Auto,
             ));
 
@@ -23974,6 +23978,7 @@ impl Editor {
         Some(AccentData {
             colors: accent_colors,
             auto_colors: auto_accent_colors,
+            editor_background,
             overrides: accent_overrides,
         })
     }
