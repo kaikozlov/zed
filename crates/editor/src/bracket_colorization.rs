@@ -26,12 +26,24 @@ impl Editor {
             self.bracket_fetched_tree_sitter_chunks.clear();
         }
 
-        let theme_accents = Arc::from(cx.theme().accents().0.to_vec());
-        let auto_accents = bracket_colorization_accents(
-            &theme_accents,
-            cx.theme().appearance,
-            BracketColorizationMode::Auto,
-        );
+        let (theme_accents, auto_accents) = self
+            .accent_data
+            .as_ref()
+            .map(|accent_data| {
+                (
+                    accent_data.colors.0.clone(),
+                    accent_data.auto_colors.0.clone(),
+                )
+            })
+            .unwrap_or_else(|| {
+                let theme_accents = Arc::from(cx.theme().accents().0.to_vec());
+                let auto_accents = bracket_colorization_accents(
+                    &theme_accents,
+                    cx.theme().appearance,
+                    BracketColorizationMode::Auto,
+                );
+                (theme_accents, auto_accents)
+            });
         let multi_buffer_snapshot = self.buffer().read(cx).snapshot(cx);
 
         let visible_excerpts = self.visible_excerpts(false, cx);
@@ -182,7 +194,7 @@ struct PaletteScore {
     average_adjacent_distance: f32,
 }
 
-fn bracket_colorization_accents(
+pub(crate) fn bracket_colorization_accents(
     accents: &[Hsla],
     appearance: Appearance,
     mode: BracketColorizationMode,

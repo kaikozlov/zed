@@ -1333,6 +1333,7 @@ pub struct Editor {
 #[derive(Debug, PartialEq)]
 struct AccentData {
     colors: AccentColors,
+    auto_colors: AccentColors,
     overrides: Vec<SharedString>,
 }
 
@@ -23942,6 +23943,12 @@ impl Editor {
         let theme_settings = theme::ThemeSettings::get_global(cx);
         let theme = cx.theme();
         let accent_colors = theme.accents().clone();
+        let auto_accent_colors =
+            AccentColors(crate::bracket_colorization::bracket_colorization_accents(
+                &accent_colors.0,
+                theme.appearance,
+                language::language_settings::BracketColorizationMode::Auto,
+            ));
 
         let accent_overrides = theme_settings
             .theme_overrides
@@ -23962,6 +23969,7 @@ impl Editor {
 
         Some(AccentData {
             colors: accent_colors,
+            auto_colors: auto_accent_colors,
             overrides: accent_overrides,
         })
     }
