@@ -116,7 +116,8 @@ Auto mode uses different minimum thresholds for light and dark themes:
 
 - light themes:
   - minimum background APCA = `35.0`
-  - minimum adjacent OKLab distance = `0.10`
+  - target minimum adjacent OKLab distance = `0.10`
+  - reorder intervention band starts below `0.095`
 - dark themes:
   - minimum background APCA = `30.0`
   - minimum adjacent OKLab distance = `0.08`
@@ -143,7 +144,7 @@ The current approach:
 - greedily picks the next unused accent that best separates from the previous one
 - compares candidate orders by minimum adjacent distance first, then average adjacent distance
 
-The reordered palette is only used if it turns a materially failing adjacent-separation result into a passing one. In light themes, the auto mode includes a narrow tolerance band below the `0.10` target so a `0.099` near miss does not force a full palette reorder.
+The reordered palette is only used if it turns a materially failing adjacent-separation result into a passing one. In light themes, the auto mode keeps a narrow tolerance band between the `0.095` intervention point and the `0.10` target so a `0.099` near miss does not force a full palette reorder.
 
 At the palette level, the implementation currently distinguishes these auto strategies:
 
@@ -320,9 +321,9 @@ The image panes include treatment summaries directly in the editor content:
 For auto mode, the label reflects the detected palette-level treatment:
 
 - `unchanged`
-- `minimal per-accent background fix only`
+- `per-accent background fix only`
 - `adjacency reorder only`
-- `minimal per-accent background fix + adjacency reorder`
+- `per-accent background fix + adjacency reorder`
 
 When `--stack-upstream-apca-thresholds` is used, the saved threshold stack image starts with the raw theme pane and then appends one upstream pane per APCA value in the order provided.
 
@@ -394,7 +395,7 @@ The main conclusions from the bundled-theme sweep are:
 - the tuned adjacent OKLab floors that held up best were:
   - light: `0.10`
   - dark: `0.08`
-- the proposed `auto` behavior currently produces more usable results because it preserves hue/chroma, applies minimal per-accent OKLCH lightness correction only when needed, and treats adjacent separation as a separate concern
+- the proposed `auto` behavior currently produces more usable results because it preserves hue/chroma, applies per-accent OKLCH lightness correction only when needed, and treats adjacent separation as a separate concern
 
 ## Research Notes
 
@@ -493,8 +494,7 @@ Current direction:
 Practical follow-ups from here:
 
 - Broaden the APCA/OKLab sweep to more shipped themes and community themes
-- Re-evaluate whether adjacency reordering should stay as aggressive as it is now, since it can improve separation while still making the palette feel less natural
+- Re-evaluate the light-theme adjacency intervention band if more bundled or community themes reveal new threshold artifacts
 - Track per-accent provenance through adjustment + reorder if richer reports become useful
-- Consider whether the minimum reorder-improvement gate should become configurable in dev tooling
 - Revisit shipped theme accent palettes independently of bracket logic
 - If stronger guarantees are ever required, consider a bracket-specific palette system instead of trying to infer everything from theme accents

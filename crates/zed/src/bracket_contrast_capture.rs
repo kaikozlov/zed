@@ -924,9 +924,9 @@ fn strategy_treatments_label(strategy: BracketColorizationPaletteStrategy) -> &'
         strategy_reordered(strategy),
         strategy_adjusted_background(strategy),
     ) {
-        (true, true) => "minimal per-accent background fix + adjacency reorder",
+        (true, true) => "per-accent background fix + adjacency reorder",
         (true, false) => "adjacency reorder only",
-        (false, true) => "minimal per-accent background fix only",
+        (false, true) => "per-accent background fix only",
         (false, false) => "unchanged",
     }
 }

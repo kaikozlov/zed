@@ -425,7 +425,7 @@ fn auto_bracket_colorization_analysis(
     let reordered = maximize_adjacent_separation(&background_adjusted, background);
     let reordered_score = palette_score(&reordered, background);
 
-    if reordered_score.min_adjacent_distance >= minimum_adjacent_distance {
+    if reordered_score.min_adjacent_distance >= minimum_adjacent_intervention_distance {
         BracketColorizationPaletteAnalysis {
             mode: BracketColorizationMode::Auto,
             appearance,
@@ -1035,6 +1035,58 @@ mod tests {
         );
         assert!(analysis.changed);
         assert_eq!(analysis.final_palette.as_ref(), reordered.as_slice());
+    }
+
+    #[test]
+    fn test_auto_bracket_colorization_mode_keeps_reorder_that_crosses_intervention_band() {
+        let accents = vec![
+            hsla(0.0, 1.0, 0.68, 1.0),
+            hsla(0.02, 1.0, 0.68, 1.0),
+            hsla(0.34, 1.0, 0.68, 1.0),
+            hsla(0.36, 1.0, 0.68, 1.0),
+        ];
+        let original_score = palette_score(&accents, light_editor_background());
+        let reordered = maximize_adjacent_separation(&accents, light_editor_background());
+        let reordered_score = palette_score(&reordered, light_editor_background());
+        let config = AutoBracketColorizationConfig {
+            minimum_background_apca_light: 0.0,
+            minimum_background_apca_dark: 0.0,
+            minimum_adjacent_oklab_light: reordered_score.min_adjacent_distance + 0.003,
+            minimum_adjacent_oklab_dark: reordered_score.min_adjacent_distance + 0.003,
+            ..AutoBracketColorizationConfig::default()
+        };
+
+        assert!(
+            original_score.min_adjacent_distance
+                < minimum_adjacent_intervention_distance(Appearance::Light, config,)
+        );
+        assert!(
+            reordered_score.min_adjacent_distance
+                < minimum_adjacent_distance(Appearance::Light, config,)
+        );
+        assert!(
+            reordered_score.min_adjacent_distance
+                >= minimum_adjacent_intervention_distance(Appearance::Light, config,)
+        );
+
+        let analysis = analyze_bracket_colorization_palette_with_config(
+            &accents,
+            Appearance::Light,
+            light_editor_background(),
+            BracketColorizationMode::Auto,
+            config,
+        );
+
+        assert_eq!(
+            analysis.strategy,
+            BracketColorizationPaletteStrategy::ReorderedWeakPalette
+        );
+        assert!(analysis.changed);
+        assert_eq!(analysis.final_palette.as_ref(), reordered.as_slice());
+        assert!(
+            analysis.final_score.min_adjacent_distance
+                < analysis.adjacent_threshold.unwrap_or_default()
+        );
     }
 
     #[test]

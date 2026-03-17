@@ -95,10 +95,10 @@ This means the threshold needs to be **well above JND** — at least 3–5× the
 
 | | Current auto mode | Recommended | Reasoning |
 |---|---|---|---|
-| **Light theme adjacent OKLab** | 0.10 | **0.08–0.10** | Light themes have brighter accents with more chroma headroom, so a slightly higher floor is achievable without distortion. 0.10 is a solid "4–5× JND" target. |
-| **Dark theme adjacent OKLab** | 0.08 | **0.08–0.10** | Dark themes have less lightness headroom for their accents, so achieving high adjacent distance is harder. 0.08 (4× JND) is reasonable as a floor. |
+| **Light theme adjacent OKLab** | 0.10 | **target 0.10, intervene below 0.095** | `0.10` remains the readability target, but bundled themes such as Gruvbox Light showed that a `0.099` near miss is visually fine and should not force a reorder. |
+| **Dark theme adjacent OKLab** | 0.08 | **0.08** | Dark themes have less lightness headroom for their accents, so `0.08` remains a reasonable floor and does not show the same threshold-artifact behavior in the bundled-theme sweep. |
 
-The current values (0.10 light / 0.08 dark) are in the right range. The dark value could potentially be raised to 0.10 to match, since the reordering step (rather than color adjustment) is the main lever for improving adjacency.
+The final shipped heuristic keeps the dark floor at `0.08`, keeps the light target at `0.10`, and adds a narrow light-theme tolerance band so reorder only triggers once the adjusted palette drops meaningfully below that target.
 
 ---
 
@@ -151,7 +151,7 @@ The 30/35 split serves as a "safety net" rather than a strict body-text target.
 ## Summary of Final Recommendations
 
 1. **Keep APCA floors at 30 (Dark) / 35 (Light).** The capture sweeps confirm this is the optimal empirical balance between accessibility and theme preservation.
-2. **Maintain standard OKLab Adjacent Separation (0.08 Dark / 0.10 Light).**
+2. **Maintain `0.08` dark adjacency and a `0.10` light target with a `0.095` light intervention band.**
 3. **Retain the "Minimize OKLab Distance" Direction Heuristic.** While pushing away from the background guarantees visibility, it creates an undesirable uniformity in lightness across adjusted palettes. Minimizing OKLab distance preserves the relative lightness mapping within the theme author's original palette design.
 4. **Make reordering threshold-crossing only, with a narrow light-theme tolerance band.** Reordering is the most theme-violating intervention in auto mode, so it should only happen when the background-adjusted palette is materially below the adjacency target and the reordered palette actually reaches that target. In practice, light themes get a small tolerance band below `0.10` so a `0.099` near miss does not trigger a reorder by itself.
 5. **Do not add an abandon ceiling.** A fixed "too broken to rescue" cutoff would knowingly leave bundled themes with unreadable brackets, which is not acceptable for the default safety-net mode.
