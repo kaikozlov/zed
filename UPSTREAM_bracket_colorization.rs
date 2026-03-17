@@ -2,23 +2,15 @@
 //! Uses tree-sitter queries from brackets.scm to capture bracket pairs,
 //! and theme accents to colorize those.
 
-use std::cmp::Ordering;
 use std::ops::Range;
-use std::sync::Arc;
 
 use crate::{Editor, HighlightKey};
 use collections::{HashMap, HashSet};
-use gpui::{AppContext as _, Context, HighlightStyle, Hsla, Rgba};
+use gpui::{AppContext as _, Context, HighlightStyle};
 use itertools::Itertools;
-use language::language_settings::BracketColorizationMode;
 use language::{BufferRow, BufferSnapshot, language_settings};
 use multi_buffer::{Anchor, ExcerptId};
-use palette::{
-    FromColor, Oklab, Oklch,
-    rgb::{LinSrgba, Srgba},
-};
-use theme::Appearance;
-use ui::{ActiveTheme, utils::apca_contrast};
+use ui::{ActiveTheme, utils::ensure_minimum_contrast};
 
 impl Editor {
     pub(crate) fn colorize_brackets(&mut self, invalidate: bool, cx: &mut Context<Editor>) {
@@ -30,50 +22,22 @@ impl Editor {
             self.bracket_fetched_tree_sitter_chunks.clear();
         }
 
-        let (theme_accents, auto_accents) = self
-            .accent_data
-            .as_ref()
-            .map(|accent_data| {
-                (
-                    accent_data.colors.0.clone(),
-                    accent_data.auto_colors.0.clone(),
-                )
-            })
-            .unwrap_or_else(|| {
-                let theme_accents = Arc::from(cx.theme().accents().0.to_vec());
-                let auto_accents = bracket_colorization_accents(
-                    &theme_accents,
-                    cx.theme().appearance,
-                    cx.theme().colors().editor_background,
-                    BracketColorizationMode::Auto,
-                );
-                (theme_accents, auto_accents)
-            });
+        let accents_count = cx.theme().accents().0.len();
         let multi_buffer_snapshot = self.buffer().read(cx).snapshot(cx);
 
         let visible_excerpts = self.visible_excerpts(false, cx);
-        let excerpt_data: Vec<(
-            ExcerptId,
-            BufferSnapshot,
-            Range<usize>,
-            BracketColorizationMode,
-        )> = visible_excerpts
+        let excerpt_data: Vec<(ExcerptId, BufferSnapshot, Range<usize>)> = visible_excerpts
             .into_iter()
             .filter_map(|(excerpt_id, (buffer, _, buffer_range))| {
                 let buffer_snapshot = buffer.read(cx).snapshot();
-                let file = buffer_snapshot.file().cloned();
-                let language_settings = language_settings::language_settings(
+                if language_settings::language_settings(
                     buffer_snapshot.language().map(|language| language.name()),
-                    file.as_ref(),
+                    buffer_snapshot.file(),
                     cx,
-                );
-                if language_settings.colorize_brackets {
-                    Some((
-                        excerpt_id,
-                        buffer_snapshot,
-                        buffer_range,
-                        language_settings.bracket_colorization_mode,
-                    ))
+                )
+                .colorize_brackets
+                {
+                    Some((excerpt_id, buffer_snapshot, buffer_range))
                 } else {
                     None
                 }
@@ -92,8 +56,6 @@ impl Editor {
             })
             .collect::<HashMap<ExcerptId, HashSet<Range<BufferRow>>>>();
 
-        let theme_accents_for_ranges = theme_accents.clone();
-        let auto_accents_for_ranges = auto_accents.clone();
         let bracket_matches_by_accent = cx.background_spawn(async move {
             let anchors_in_multi_buffer = |current_excerpt: ExcerptId,
                                            text_anchors: [text::Anchor; 4]|
@@ -106,27 +68,22 @@ impl Editor {
             let bracket_matches_by_accent: HashMap<usize, Vec<Range<Anchor>>> =
                 excerpt_data.into_iter().fold(
                     HashMap::default(),
-                    |mut acc, (excerpt_id, buffer_snapshot, buffer_range, mode)| {
+                    |mut acc, (excerpt_id, buffer_snapshot, buffer_range)| {
                         let fetched_chunks =
                             fetched_tree_sitter_chunks.entry(excerpt_id).or_default();
-                        let accent_count = accent_count_for_mode(
-                            mode,
-                            theme_accents_for_ranges.len(),
-                            auto_accents_for_ranges.len(),
-                        );
 
                         let brackets_by_accent = compute_bracket_ranges(
                             &buffer_snapshot,
                             buffer_range,
                             fetched_chunks,
                             excerpt_id,
-                            accent_count,
+                            accents_count,
                             &anchors_in_multi_buffer,
                         );
 
                         for (accent_number, new_ranges) in brackets_by_accent {
                             let ranges = acc
-                                .entry(highlight_key_for_mode(mode, accent_number))
+                                .entry(accent_number)
                                 .or_insert_with(Vec::<Range<Anchor>>::new);
 
                             for new_range in new_ranges {
@@ -146,8 +103,8 @@ impl Editor {
             (bracket_matches_by_accent, fetched_tree_sitter_chunks)
         });
 
-        let theme_accents = theme_accents.clone();
-        let auto_accents = auto_accents.clone();
+        let editor_background = cx.theme().colors().editor_background;
+        let accents = cx.theme().accents().clone();
 
         self.colorize_brackets_task = cx.spawn(async move |editor, cx| {
             if invalidate {
@@ -168,19 +125,17 @@ impl Editor {
                     editor
                         .bracket_fetched_tree_sitter_chunks
                         .extend(updated_chunks);
-                    for (highlight_key, bracket_highlights) in bracket_matches_by_accent {
-                        let bracket_color = bracket_color_for_highlight_key(
-                            highlight_key,
-                            &theme_accents,
-                            &auto_accents,
-                        );
+                    for (accent_number, bracket_highlights) in bracket_matches_by_accent {
+                        let bracket_color = accents.color_for_index(accent_number as u32);
+                        let adjusted_color =
+                            ensure_minimum_contrast(bracket_color, editor_background, 55.0);
                         let style = HighlightStyle {
-                            color: Some(bracket_color),
+                            color: Some(adjusted_color),
                             ..HighlightStyle::default()
                         };
 
                         editor.highlight_text_key(
-                            HighlightKey::ColorizeBracket(highlight_key),
+                            HighlightKey::ColorizeBracket(accent_number),
                             bracket_highlights,
                             style,
                             true,
@@ -191,602 +146,6 @@ impl Editor {
                 .ok();
         });
     }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct PaletteScore {
-    min_adjacent_distance: f32,
-    average_adjacent_distance: f32,
-    min_background_contrast: f32,
-    average_background_contrast: f32,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct BracketColorizationPaletteScore {
-    pub min_adjacent_distance: f32,
-    pub average_adjacent_distance: f32,
-    pub min_background_contrast: f32,
-    pub average_background_contrast: f32,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct AutoBracketColorizationConfig {
-    pub minimum_background_apca_light: f32,
-    pub minimum_background_apca_dark: f32,
-    pub minimum_adjacent_oklab_light: f32,
-    pub minimum_adjacent_oklab_dark: f32,
-    pub lightness_clamp_min: f32,
-    pub lightness_clamp_max: f32,
-}
-
-impl Default for AutoBracketColorizationConfig {
-    fn default() -> Self {
-        Self {
-            minimum_background_apca_light: 35.0,
-            minimum_background_apca_dark: 30.0,
-            minimum_adjacent_oklab_light: 0.10,
-            minimum_adjacent_oklab_dark: 0.08,
-            lightness_clamp_min: 0.18,
-            lightness_clamp_max: 0.92,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BracketColorizationPaletteStrategy {
-    ThemeOrder,
-    PreservedSmallPalette,
-    PreservedStrongPalette,
-    PreservedWeakPalette,
-    AdjustedBackgroundPalette,
-    ReorderedWeakPalette,
-    AdjustedBackgroundAndReorderedPalette,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct BracketColorizationPaletteAnalysis {
-    pub mode: BracketColorizationMode,
-    pub appearance: Appearance,
-    pub original_palette: Arc<[Hsla]>,
-    pub final_palette: Arc<[Hsla]>,
-    pub original_score: BracketColorizationPaletteScore,
-    pub final_score: BracketColorizationPaletteScore,
-    pub adjacent_threshold: Option<f32>,
-    pub background_threshold: Option<f32>,
-    pub changed: bool,
-    pub strategy: BracketColorizationPaletteStrategy,
-}
-
-pub(crate) fn bracket_colorization_accents(
-    accents: &[Hsla],
-    appearance: Appearance,
-    background: Hsla,
-    mode: BracketColorizationMode,
-) -> Arc<[Hsla]> {
-    analyze_bracket_colorization_palette_with_config(
-        accents,
-        appearance,
-        background,
-        mode,
-        AutoBracketColorizationConfig::default(),
-    )
-    .final_palette
-}
-
-pub fn analyze_bracket_colorization_palette(
-    accents: &[Hsla],
-    appearance: Appearance,
-    background: Hsla,
-    mode: BracketColorizationMode,
-) -> BracketColorizationPaletteAnalysis {
-    analyze_bracket_colorization_palette_with_config(
-        accents,
-        appearance,
-        background,
-        mode,
-        AutoBracketColorizationConfig::default(),
-    )
-}
-
-pub fn analyze_bracket_colorization_palette_with_config(
-    accents: &[Hsla],
-    appearance: Appearance,
-    background: Hsla,
-    mode: BracketColorizationMode,
-    config: AutoBracketColorizationConfig,
-) -> BracketColorizationPaletteAnalysis {
-    match mode {
-        BracketColorizationMode::Theme => {
-            let palette: Arc<[Hsla]> = Arc::from(accents.to_vec());
-            let score = palette_score_for_public_api(palette_score(accents, background));
-            BracketColorizationPaletteAnalysis {
-                mode,
-                appearance,
-                original_palette: palette.clone(),
-                final_palette: palette,
-                original_score: score,
-                final_score: score,
-                adjacent_threshold: None,
-                background_threshold: None,
-                changed: false,
-                strategy: BracketColorizationPaletteStrategy::ThemeOrder,
-            }
-        }
-        BracketColorizationMode::Auto => {
-            auto_bracket_colorization_analysis(accents, appearance, background, config)
-        }
-    }
-}
-
-fn auto_bracket_colorization_analysis(
-    accents: &[Hsla],
-    appearance: Appearance,
-    background: Hsla,
-    config: AutoBracketColorizationConfig,
-) -> BracketColorizationPaletteAnalysis {
-    let original_palette: Arc<[Hsla]> = Arc::from(accents.to_vec());
-    let original_score = palette_score(accents, background);
-    let minimum_adjacent_distance = minimum_adjacent_distance(appearance, config);
-    let minimum_adjacent_intervention_distance =
-        minimum_adjacent_intervention_distance(appearance, config);
-    let minimum_background_contrast = minimum_background_contrast(appearance, config);
-    let background_adjusted =
-        adjust_background_failures(accents, background, minimum_background_contrast, config);
-    let background_adjusted_score = palette_score(&background_adjusted, background);
-    let background_adjusted_changed = background_adjusted.as_slice() != accents;
-
-    if accents.len() < 3 {
-        let final_palette = if background_adjusted_changed {
-            Arc::from(background_adjusted)
-        } else {
-            original_palette.clone()
-        };
-        let final_score = if background_adjusted_changed {
-            palette_score_for_public_api(background_adjusted_score)
-        } else {
-            palette_score_for_public_api(original_score)
-        };
-        return BracketColorizationPaletteAnalysis {
-            mode: BracketColorizationMode::Auto,
-            appearance,
-            original_palette: original_palette.clone(),
-            final_palette,
-            original_score: palette_score_for_public_api(original_score),
-            final_score,
-            adjacent_threshold: Some(minimum_adjacent_distance),
-            background_threshold: Some(minimum_background_contrast),
-            changed: background_adjusted_changed,
-            strategy: if background_adjusted_changed {
-                BracketColorizationPaletteStrategy::AdjustedBackgroundPalette
-            } else {
-                BracketColorizationPaletteStrategy::PreservedSmallPalette
-            },
-        };
-    }
-
-    if background_adjusted_score.min_adjacent_distance >= minimum_adjacent_distance {
-        let final_palette = if background_adjusted_changed {
-            Arc::from(background_adjusted)
-        } else {
-            original_palette.clone()
-        };
-        let final_score = if background_adjusted_changed {
-            palette_score_for_public_api(background_adjusted_score)
-        } else {
-            palette_score_for_public_api(original_score)
-        };
-        return BracketColorizationPaletteAnalysis {
-            mode: BracketColorizationMode::Auto,
-            appearance,
-            original_palette: original_palette.clone(),
-            final_palette,
-            original_score: palette_score_for_public_api(original_score),
-            final_score,
-            adjacent_threshold: Some(minimum_adjacent_distance),
-            background_threshold: Some(minimum_background_contrast),
-            changed: background_adjusted_changed,
-            strategy: if background_adjusted_changed {
-                BracketColorizationPaletteStrategy::AdjustedBackgroundPalette
-            } else {
-                BracketColorizationPaletteStrategy::PreservedStrongPalette
-            },
-        };
-    }
-
-    if background_adjusted_score.min_adjacent_distance >= minimum_adjacent_intervention_distance {
-        let final_palette = if background_adjusted_changed {
-            Arc::from(background_adjusted)
-        } else {
-            original_palette.clone()
-        };
-        let final_score = if background_adjusted_changed {
-            palette_score_for_public_api(background_adjusted_score)
-        } else {
-            palette_score_for_public_api(original_score)
-        };
-        return BracketColorizationPaletteAnalysis {
-            mode: BracketColorizationMode::Auto,
-            appearance,
-            original_palette: original_palette.clone(),
-            final_palette,
-            original_score: palette_score_for_public_api(original_score),
-            final_score,
-            adjacent_threshold: Some(minimum_adjacent_distance),
-            background_threshold: Some(minimum_background_contrast),
-            changed: background_adjusted_changed,
-            strategy: if background_adjusted_changed {
-                BracketColorizationPaletteStrategy::AdjustedBackgroundPalette
-            } else {
-                BracketColorizationPaletteStrategy::PreservedWeakPalette
-            },
-        };
-    }
-
-    let reordered = maximize_adjacent_separation(&background_adjusted, background);
-    let reordered_score = palette_score(&reordered, background);
-
-    if reordered_score.min_adjacent_distance >= minimum_adjacent_distance {
-        BracketColorizationPaletteAnalysis {
-            mode: BracketColorizationMode::Auto,
-            appearance,
-            original_palette,
-            final_palette: Arc::from(reordered),
-            original_score: palette_score_for_public_api(original_score),
-            final_score: palette_score_for_public_api(reordered_score),
-            adjacent_threshold: Some(minimum_adjacent_distance),
-            background_threshold: Some(minimum_background_contrast),
-            changed: true,
-            strategy: if background_adjusted_changed {
-                BracketColorizationPaletteStrategy::AdjustedBackgroundAndReorderedPalette
-            } else {
-                BracketColorizationPaletteStrategy::ReorderedWeakPalette
-            },
-        }
-    } else {
-        let final_palette = if background_adjusted_changed {
-            Arc::from(background_adjusted)
-        } else {
-            original_palette.clone()
-        };
-        let final_score = if background_adjusted_changed {
-            palette_score_for_public_api(background_adjusted_score)
-        } else {
-            palette_score_for_public_api(original_score)
-        };
-        BracketColorizationPaletteAnalysis {
-            mode: BracketColorizationMode::Auto,
-            appearance,
-            original_palette: original_palette.clone(),
-            final_palette,
-            original_score: palette_score_for_public_api(original_score),
-            final_score,
-            adjacent_threshold: Some(minimum_adjacent_distance),
-            background_threshold: Some(minimum_background_contrast),
-            changed: background_adjusted_changed,
-            strategy: if background_adjusted_changed {
-                BracketColorizationPaletteStrategy::AdjustedBackgroundPalette
-            } else {
-                BracketColorizationPaletteStrategy::PreservedWeakPalette
-            },
-        }
-    }
-}
-
-fn minimum_adjacent_distance(appearance: Appearance, config: AutoBracketColorizationConfig) -> f32 {
-    match appearance {
-        Appearance::Light => config.minimum_adjacent_oklab_light,
-        Appearance::Dark => config.minimum_adjacent_oklab_dark,
-    }
-}
-
-fn minimum_adjacent_intervention_distance(
-    appearance: Appearance,
-    config: AutoBracketColorizationConfig,
-) -> f32 {
-    match appearance {
-        Appearance::Light => (config.minimum_adjacent_oklab_light - 0.005).max(0.0),
-        Appearance::Dark => config.minimum_adjacent_oklab_dark,
-    }
-}
-
-fn minimum_background_contrast(
-    appearance: Appearance,
-    config: AutoBracketColorizationConfig,
-) -> f32 {
-    match appearance {
-        Appearance::Light => config.minimum_background_apca_light,
-        Appearance::Dark => config.minimum_background_apca_dark,
-    }
-}
-
-fn palette_score_for_public_api(score: PaletteScore) -> BracketColorizationPaletteScore {
-    BracketColorizationPaletteScore {
-        min_adjacent_distance: score.min_adjacent_distance,
-        average_adjacent_distance: score.average_adjacent_distance,
-        min_background_contrast: score.min_background_contrast,
-        average_background_contrast: score.average_background_contrast,
-    }
-}
-
-fn accent_count_for_mode(
-    mode: BracketColorizationMode,
-    theme_count: usize,
-    auto_count: usize,
-) -> usize {
-    match mode {
-        BracketColorizationMode::Theme => theme_count,
-        BracketColorizationMode::Auto => auto_count,
-    }
-}
-
-fn highlight_key_for_mode(mode: BracketColorizationMode, accent_number: usize) -> usize {
-    accent_number * 2
-        + match mode {
-            BracketColorizationMode::Theme => 0,
-            BracketColorizationMode::Auto => 1,
-        }
-}
-
-fn bracket_color_for_highlight_key(
-    highlight_key: usize,
-    theme_accents: &[Hsla],
-    auto_accents: &[Hsla],
-) -> Hsla {
-    let accent_number = highlight_key / 2;
-    match highlight_key % 2 {
-        0 => theme_accents[accent_number],
-        _ => auto_accents[accent_number],
-    }
-}
-
-fn maximize_adjacent_separation(accents: &[Hsla], background: Hsla) -> Vec<Hsla> {
-    let mut best_order = accents.to_vec();
-    let best_score = palette_score(&best_order, background);
-
-    let mut used = vec![false; accents.len()];
-    let mut order = Vec::with_capacity(accents.len());
-    order.push(0);
-    used[0] = true;
-
-    while order.len() < accents.len() {
-        let last = *order.last().unwrap_or(&0);
-        let first = order[0];
-        let next = (0..accents.len())
-            .filter(|&index| !used[index])
-            .max_by(|&left, &right| {
-                compare_candidates(accents, background, last, first, left, right)
-            })
-            .unwrap_or(0);
-        used[next] = true;
-        order.push(next);
-    }
-
-    let reordered = order
-        .into_iter()
-        .map(|index| accents[index])
-        .collect::<Vec<_>>();
-    let score = palette_score(&reordered, background);
-    if palette_score_is_better(score, best_score) {
-        best_order = reordered;
-    }
-
-    best_order
-}
-
-fn compare_candidates(
-    accents: &[Hsla],
-    background: Hsla,
-    last: usize,
-    first: usize,
-    left: usize,
-    right: usize,
-) -> Ordering {
-    let left_score = (
-        adjacent_distance(accents[last], accents[left], background),
-        adjacent_distance(accents[first], accents[left], background),
-    );
-    let right_score = (
-        adjacent_distance(accents[last], accents[right], background),
-        adjacent_distance(accents[first], accents[right], background),
-    );
-    compare_float_tuple(left_score, right_score)
-}
-
-fn palette_score(accents: &[Hsla], background: Hsla) -> PaletteScore {
-    if accents.is_empty() {
-        return PaletteScore {
-            min_adjacent_distance: f32::MAX,
-            average_adjacent_distance: f32::MAX,
-            min_background_contrast: f32::MAX,
-            average_background_contrast: f32::MAX,
-        };
-    }
-
-    let (min_adjacent_distance, average_adjacent_distance) = if accents.len() < 2 {
-        (f32::MAX, f32::MAX)
-    } else {
-        let distances = accents
-            .iter()
-            .copied()
-            .zip(accents.iter().copied().cycle().skip(1))
-            .take(accents.len())
-            .map(|(left, right)| adjacent_distance(left, right, background))
-            .collect::<Vec<_>>();
-        (
-            distances.iter().copied().fold(f32::MAX, f32::min),
-            distances.iter().sum::<f32>() / distances.len() as f32,
-        )
-    };
-
-    let background_contrasts = accents
-        .iter()
-        .copied()
-        .map(|accent| background_contrast(accent, background))
-        .collect::<Vec<_>>();
-    let min_background_contrast = background_contrasts
-        .iter()
-        .copied()
-        .fold(f32::MAX, f32::min);
-    let average_background_contrast =
-        background_contrasts.iter().sum::<f32>() / background_contrasts.len() as f32;
-
-    PaletteScore {
-        min_adjacent_distance,
-        average_adjacent_distance,
-        min_background_contrast,
-        average_background_contrast,
-    }
-}
-
-fn palette_score_is_better(left: PaletteScore, right: PaletteScore) -> bool {
-    left.min_adjacent_distance > right.min_adjacent_distance + 0.0001
-        || ((left.min_adjacent_distance - right.min_adjacent_distance).abs() <= 0.0001
-            && left.average_adjacent_distance > right.average_adjacent_distance + 0.0001)
-}
-
-fn compare_float_tuple(left: (f32, f32), right: (f32, f32)) -> Ordering {
-    match left.0.partial_cmp(&right.0).unwrap_or(Ordering::Equal) {
-        Ordering::Equal => left.1.partial_cmp(&right.1).unwrap_or(Ordering::Equal),
-        ordering => ordering,
-    }
-}
-
-fn adjacent_distance(left: Hsla, right: Hsla, background: Hsla) -> f32 {
-    let left = color_to_oklab(composited_foreground(left, background));
-    let right = color_to_oklab(composited_foreground(right, background));
-    let lightness_delta = left.l - right.l;
-    let a_delta = left.a - right.a;
-    let b_delta = left.b - right.b;
-    (lightness_delta * lightness_delta + a_delta * a_delta + b_delta * b_delta).sqrt()
-}
-
-fn adjust_background_failures(
-    accents: &[Hsla],
-    background: Hsla,
-    minimum_background_contrast: f32,
-    config: AutoBracketColorizationConfig,
-) -> Vec<Hsla> {
-    accents
-        .iter()
-        .copied()
-        .map(|accent| {
-            adjust_color_for_background(accent, background, minimum_background_contrast, config)
-        })
-        .collect()
-}
-
-fn adjust_color_for_background(
-    color: Hsla,
-    background: Hsla,
-    minimum_background_contrast: f32,
-    config: AutoBracketColorizationConfig,
-) -> Hsla {
-    if background_contrast(color, background) >= minimum_background_contrast {
-        return color;
-    }
-
-    let original = color_to_oklab(color);
-    let darker_candidate = adjusted_lightness_candidate(
-        color,
-        background,
-        minimum_background_contrast,
-        config.lightness_clamp_min,
-    );
-    let lighter_candidate = adjusted_lightness_candidate(
-        color,
-        background,
-        minimum_background_contrast,
-        config.lightness_clamp_max,
-    );
-
-    match (darker_candidate, lighter_candidate) {
-        (Some(darker_candidate), Some(lighter_candidate)) => {
-            let darker_distance = perceptual_distance(original, color_to_oklab(darker_candidate));
-            let lighter_distance = perceptual_distance(original, color_to_oklab(lighter_candidate));
-            if darker_distance <= lighter_distance {
-                darker_candidate
-            } else {
-                lighter_candidate
-            }
-        }
-        (Some(darker_candidate), None) => darker_candidate,
-        (None, Some(lighter_candidate)) => lighter_candidate,
-        (None, None) => color,
-    }
-}
-
-fn adjusted_lightness_candidate(
-    color: Hsla,
-    background: Hsla,
-    minimum_background_contrast: f32,
-    target_lightness: f32,
-) -> Option<Hsla> {
-    let original = color_to_oklch(color);
-    let lightness_delta = target_lightness - original.l;
-
-    if lightness_delta.abs() <= f32::EPSILON {
-        return None;
-    }
-
-    (1..=128).find_map(|step| {
-        let amount = step as f32 / 128.0;
-        let candidate = oklch_to_hsla(
-            Oklch {
-                l: (original.l + lightness_delta * amount).clamp(0.0, 1.0),
-                chroma: original.chroma,
-                hue: original.hue,
-            },
-            color.a,
-        );
-        (background_contrast(candidate, background) >= minimum_background_contrast)
-            .then_some(candidate)
-    })
-}
-
-fn background_contrast(foreground: Hsla, background: Hsla) -> f32 {
-    apca_contrast(composited_foreground(foreground, background), background).abs()
-}
-
-fn composited_foreground(foreground: Hsla, background: Hsla) -> Hsla {
-    let background_rgba = Rgba::from(background);
-    let foreground_rgba = background_rgba.blend(Rgba::from(foreground));
-    Hsla::from(foreground_rgba)
-}
-
-fn color_to_oklab(color: Hsla) -> Oklab {
-    let rgba: Srgba = color_to_palette_rgba(color);
-    let linear: LinSrgba = rgba.into_linear();
-    Oklab::from_color(linear)
-}
-
-fn color_to_oklch(color: Hsla) -> Oklch {
-    let rgba: Srgba = color_to_palette_rgba(color);
-    let linear: LinSrgba = rgba.into_linear();
-    Oklch::from_color(linear)
-}
-
-fn oklch_to_hsla(color: Oklch, alpha: f32) -> Hsla {
-    let linear_rgba = LinSrgba::from_color(color);
-    let rgba: Srgba = Srgba::from_linear(linear_rgba);
-    let (red, green, blue, _): (f32, f32, f32, f32) = rgba.into_components();
-    Hsla::from(Rgba {
-        r: red.clamp(0.0, 1.0),
-        g: green.clamp(0.0, 1.0),
-        b: blue.clamp(0.0, 1.0),
-        a: alpha,
-    })
-}
-
-fn color_to_palette_rgba(color: Hsla) -> Srgba {
-    let rgba = Rgba::from(color);
-    Srgba::new(rgba.r, rgba.g, rgba.b, rgba.a)
-}
-
-fn perceptual_distance(left: Oklab, right: Oklab) -> f32 {
-    let lightness_delta = left.l - right.l;
-    let a_delta = left.a - right.a;
-    let b_delta = left.b - right.b;
-    (lightness_delta * lightness_delta + a_delta * a_delta + b_delta * b_delta).sqrt()
 }
 
 fn compute_bracket_ranges(
@@ -860,10 +219,9 @@ mod tests {
     };
     use collections::HashSet;
     use fs::FakeFs;
-    use gpui::{UpdateGlobal as _, hsla};
+    use gpui::UpdateGlobal as _;
     use indoc::indoc;
     use itertools::Itertools;
-    use language::language_settings::BracketColorizationMode;
     use language::{Capability, markdown_lang};
     use languages::rust_lang;
     use multi_buffer::{MultiBuffer, PathKey};
@@ -873,473 +231,9 @@ mod tests {
     use serde_json::json;
     use settings::{AccentContent, SettingsStore};
     use text::{Bias, OffsetRangeExt, ToOffset};
-    use theme::{Appearance, ThemeStyleContent};
+    use theme::ThemeStyleContent;
 
     use util::{path, post_inc};
-
-    fn light_editor_background() -> Hsla {
-        hsla(0.0, 0.0, 0.98, 1.0)
-    }
-
-    fn dark_editor_background() -> Hsla {
-        hsla(0.0, 0.0, 0.12, 1.0)
-    }
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum BackgroundFailureSeverity {
-        NearMiss,
-        ModerateFail,
-        SevereFail,
-    }
-
-    fn background_failure_severity(
-        current_contrast: f32,
-        minimum_background_contrast: f32,
-        has_passing_candidate: bool,
-    ) -> Option<BackgroundFailureSeverity> {
-        if current_contrast >= minimum_background_contrast {
-            return None;
-        }
-
-        if !has_passing_candidate {
-            return Some(BackgroundFailureSeverity::SevereFail);
-        }
-
-        let contrast_deficit = minimum_background_contrast - current_contrast;
-        if contrast_deficit <= 5.0 {
-            Some(BackgroundFailureSeverity::NearMiss)
-        } else if contrast_deficit <= 15.0 {
-            Some(BackgroundFailureSeverity::ModerateFail)
-        } else {
-            Some(BackgroundFailureSeverity::SevereFail)
-        }
-    }
-
-    #[test]
-    fn test_theme_bracket_colorization_mode_preserves_theme_order() {
-        let accents = vec![
-            hsla(0.0, 1.0, 0.5, 1.0),
-            hsla(0.08, 1.0, 0.5, 1.0),
-            hsla(0.66, 1.0, 0.5, 1.0),
-            hsla(0.40, 1.0, 0.5, 1.0),
-        ];
-
-        let analysis = analyze_bracket_colorization_palette(
-            &accents,
-            Appearance::Light,
-            light_editor_background(),
-            BracketColorizationMode::Theme,
-        );
-        let palette = bracket_colorization_accents(
-            &accents,
-            Appearance::Light,
-            light_editor_background(),
-            BracketColorizationMode::Theme,
-        );
-
-        assert_eq!(
-            analysis.strategy,
-            BracketColorizationPaletteStrategy::ThemeOrder
-        );
-        assert!(!analysis.changed);
-        assert_eq!(palette.as_ref(), accents.as_slice());
-    }
-
-    #[test]
-    fn test_auto_bracket_colorization_mode_reorders_weak_palette() {
-        let accents = vec![
-            hsla(0.0, 1.0, 0.68, 1.0),
-            hsla(0.02, 1.0, 0.68, 1.0),
-            hsla(0.34, 1.0, 0.68, 1.0),
-            hsla(0.36, 1.0, 0.68, 1.0),
-        ];
-
-        let original_score = palette_score(&accents, dark_editor_background());
-        let reordered = maximize_adjacent_separation(&accents, dark_editor_background());
-        let reordered_score = palette_score(&reordered, dark_editor_background());
-
-        assert_ne!(reordered.as_slice(), accents.as_slice());
-        assert!(reordered_score.min_adjacent_distance > original_score.min_adjacent_distance);
-    }
-
-    #[test]
-    fn test_auto_bracket_colorization_mode_does_not_reorder_without_crossing_threshold() {
-        let accents = vec![
-            hsla(0.0, 1.0, 0.68, 1.0),
-            hsla(0.02, 1.0, 0.68, 1.0),
-            hsla(0.34, 1.0, 0.68, 1.0),
-            hsla(0.36, 1.0, 0.68, 1.0),
-        ];
-        let reordered = maximize_adjacent_separation(&accents, dark_editor_background());
-        let reordered_score = palette_score(&reordered, dark_editor_background());
-        let config = AutoBracketColorizationConfig {
-            minimum_background_apca_light: 0.0,
-            minimum_background_apca_dark: 0.0,
-            minimum_adjacent_oklab_light: reordered_score.min_adjacent_distance + 0.001,
-            minimum_adjacent_oklab_dark: reordered_score.min_adjacent_distance + 0.001,
-            ..AutoBracketColorizationConfig::default()
-        };
-
-        let analysis = analyze_bracket_colorization_palette_with_config(
-            &accents,
-            Appearance::Dark,
-            dark_editor_background(),
-            BracketColorizationMode::Auto,
-            config,
-        );
-
-        assert_eq!(
-            analysis.strategy,
-            BracketColorizationPaletteStrategy::PreservedWeakPalette
-        );
-        assert!(!analysis.changed);
-        assert_eq!(analysis.final_palette.as_ref(), accents.as_slice());
-        assert!(
-            analysis.final_score.min_adjacent_distance
-                < analysis.adjacent_threshold.unwrap_or_default()
-        );
-    }
-
-    #[test]
-    fn test_auto_bracket_colorization_mode_reorders_when_threshold_is_crossed() {
-        let accents = vec![
-            hsla(0.0, 1.0, 0.68, 1.0),
-            hsla(0.02, 1.0, 0.68, 1.0),
-            hsla(0.34, 1.0, 0.68, 1.0),
-            hsla(0.36, 1.0, 0.68, 1.0),
-        ];
-        let original_score = palette_score(&accents, dark_editor_background());
-        let reordered = maximize_adjacent_separation(&accents, dark_editor_background());
-        let reordered_score = palette_score(&reordered, dark_editor_background());
-        let config = AutoBracketColorizationConfig {
-            minimum_background_apca_light: 0.0,
-            minimum_background_apca_dark: 0.0,
-            minimum_adjacent_oklab_light: reordered_score.min_adjacent_distance - 0.001,
-            minimum_adjacent_oklab_dark: reordered_score.min_adjacent_distance - 0.001,
-            ..AutoBracketColorizationConfig::default()
-        };
-
-        let analysis = analyze_bracket_colorization_palette_with_config(
-            &accents,
-            Appearance::Dark,
-            dark_editor_background(),
-            BracketColorizationMode::Auto,
-            config,
-        );
-
-        assert!(original_score.min_adjacent_distance < config.minimum_adjacent_oklab_dark);
-        assert!(reordered_score.min_adjacent_distance >= config.minimum_adjacent_oklab_dark);
-        assert_eq!(
-            analysis.strategy,
-            BracketColorizationPaletteStrategy::ReorderedWeakPalette
-        );
-        assert!(analysis.changed);
-        assert_eq!(analysis.final_palette.as_ref(), reordered.as_slice());
-    }
-
-    #[test]
-    fn test_auto_bracket_colorization_mode_preserves_strong_palette() {
-        let accents = vec![
-            hsla(0.0, 1.0, 0.78, 1.0),
-            hsla(0.16, 1.0, 0.78, 1.0),
-            hsla(0.33, 1.0, 0.78, 1.0),
-            hsla(0.66, 1.0, 0.78, 1.0),
-        ];
-        let config = AutoBracketColorizationConfig {
-            minimum_background_apca_light: 0.0,
-            minimum_background_apca_dark: 0.0,
-            ..AutoBracketColorizationConfig::default()
-        };
-
-        let analysis = analyze_bracket_colorization_palette_with_config(
-            &accents,
-            Appearance::Dark,
-            dark_editor_background(),
-            BracketColorizationMode::Auto,
-            config,
-        );
-        let palette = analysis.final_palette.clone();
-
-        assert_eq!(
-            analysis.strategy,
-            BracketColorizationPaletteStrategy::PreservedStrongPalette
-        );
-        assert!(!analysis.changed);
-        assert_eq!(palette.as_ref(), accents.as_slice());
-    }
-
-    #[test]
-    fn test_auto_bracket_colorization_mode_adjusts_only_lightness_for_background_failures() {
-        let accents = vec![
-            hsla(0.58, 1.0, 0.28, 1.0),
-            hsla(0.12, 1.0, 0.28, 1.0),
-            hsla(0.22, 0.9, 0.76, 1.0),
-        ];
-
-        let analysis = analyze_bracket_colorization_palette(
-            &accents,
-            Appearance::Light,
-            light_editor_background(),
-            BracketColorizationMode::Auto,
-        );
-        let original = color_to_oklch(accents[2]);
-        let adjusted = color_to_oklch(analysis.final_palette[2]);
-
-        assert!(analysis.changed);
-        assert!((original.chroma - adjusted.chroma).abs() < 0.0001);
-        assert!(
-            (original.hue.into_positive_degrees() - adjusted.hue.into_positive_degrees()).abs()
-                < 0.001
-        );
-        assert_ne!(original.l, adjusted.l);
-    }
-
-    #[test]
-    fn test_auto_bracket_colorization_scores_use_appearance_specific_thresholds() {
-        let config = AutoBracketColorizationConfig::default();
-
-        assert_eq!(
-            minimum_background_contrast(Appearance::Light, config),
-            config.minimum_background_apca_light
-        );
-        assert_eq!(
-            minimum_background_contrast(Appearance::Dark, config),
-            config.minimum_background_apca_dark
-        );
-        assert_eq!(
-            minimum_adjacent_distance(Appearance::Light, config),
-            config.minimum_adjacent_oklab_light
-        );
-        assert_eq!(
-            minimum_adjacent_distance(Appearance::Dark, config),
-            config.minimum_adjacent_oklab_dark
-        );
-        assert_eq!(
-            minimum_adjacent_intervention_distance(Appearance::Light, config),
-            config.minimum_adjacent_oklab_light - 0.005
-        );
-        assert_eq!(
-            minimum_adjacent_intervention_distance(Appearance::Dark, config),
-            config.minimum_adjacent_oklab_dark
-        );
-    }
-
-    #[test]
-    fn test_auto_bracket_colorization_mode_adjusts_background_failures_without_reordering() {
-        let accents = vec![
-            hsla(0.58, 1.0, 0.28, 1.0),
-            hsla(0.12, 1.0, 0.28, 1.0),
-            hsla(0.22, 0.9, 0.76, 1.0),
-        ];
-
-        let analysis = analyze_bracket_colorization_palette(
-            &accents,
-            Appearance::Light,
-            light_editor_background(),
-            BracketColorizationMode::Auto,
-        );
-
-        assert_eq!(
-            analysis.strategy,
-            BracketColorizationPaletteStrategy::AdjustedBackgroundPalette
-        );
-        assert!(analysis.changed);
-        assert_eq!(analysis.final_palette.len(), accents.len());
-        assert_eq!(analysis.final_palette[0], accents[0]);
-        assert_eq!(analysis.final_palette[1], accents[1]);
-        assert_ne!(analysis.final_palette[2], accents[2]);
-        assert!(
-            analysis.final_score.min_background_contrast
-                >= analysis.background_threshold.unwrap_or_default()
-        );
-    }
-
-    #[test]
-    fn test_auto_bracket_colorization_mode_preserves_light_near_miss_palette() {
-        let accents = vec![
-            Hsla::from(Rgba::try_from("#CC241D").expect("valid color")),
-            Hsla::from(Rgba::try_from("#98971A").expect("valid color")),
-            Hsla::from(Rgba::try_from("#D79921").expect("valid color")),
-            Hsla::from(Rgba::try_from("#458588").expect("valid color")),
-            Hsla::from(Rgba::try_from("#B16286").expect("valid color")),
-            Hsla::from(Rgba::try_from("#689D6A").expect("valid color")),
-            Hsla::from(Rgba::try_from("#D65D0E").expect("valid color")),
-        ];
-        let background = Hsla::from(Rgba::try_from("#FBF1C7").expect("valid color"));
-
-        let analysis = analyze_bracket_colorization_palette(
-            &accents,
-            Appearance::Light,
-            background,
-            BracketColorizationMode::Auto,
-        );
-
-        assert_eq!(
-            analysis.strategy,
-            BracketColorizationPaletteStrategy::PreservedWeakPalette
-        );
-        assert!(!analysis.changed);
-        assert_eq!(analysis.final_palette.as_ref(), accents.as_slice());
-        assert!(analysis.original_score.min_adjacent_distance < 0.10);
-        assert!(analysis.original_score.min_adjacent_distance >= 0.095);
-    }
-
-    #[test]
-    fn test_adjust_color_for_background_prefers_closest_passing_candidate() {
-        let config = AutoBracketColorizationConfig::default();
-        let backgrounds = [
-            hsla(0.0, 0.0, 0.15, 1.0),
-            hsla(0.0, 0.0, 0.30, 1.0),
-            hsla(0.0, 0.0, 0.50, 1.0),
-            hsla(0.0, 0.0, 0.70, 1.0),
-            hsla(0.0, 0.0, 0.85, 1.0),
-        ];
-        let minimum_background_contrasts = [10.0, 15.0, 20.0, 25.0, 30.0, 35.0];
-
-        for background in backgrounds {
-            let away_from_background_is_lighter = background.l <= 0.5;
-            for minimum_background_contrast in minimum_background_contrasts {
-                for hue in [0.0, 0.08, 0.16, 0.33, 0.58, 0.75] {
-                    for saturation in [0.4, 0.7, 1.0] {
-                        for lightness in [0.22, 0.30, 0.38, 0.46, 0.54, 0.62, 0.70] {
-                            let color = hsla(hue, saturation, lightness, 1.0);
-                            if background_contrast(color, background) >= minimum_background_contrast
-                            {
-                                continue;
-                            }
-
-                            let original = color_to_oklab(color);
-                            let darker_candidate = adjusted_lightness_candidate(
-                                color,
-                                background,
-                                minimum_background_contrast,
-                                config.lightness_clamp_min,
-                            );
-                            let lighter_candidate = adjusted_lightness_candidate(
-                                color,
-                                background,
-                                minimum_background_contrast,
-                                config.lightness_clamp_max,
-                            );
-                            let (Some(darker_candidate), Some(lighter_candidate)) =
-                                (darker_candidate, lighter_candidate)
-                            else {
-                                continue;
-                            };
-
-                            let darker_distance =
-                                perceptual_distance(original, color_to_oklab(darker_candidate));
-                            let lighter_distance =
-                                perceptual_distance(original, color_to_oklab(lighter_candidate));
-                            let closest_candidate = if darker_distance <= lighter_distance {
-                                darker_candidate
-                            } else {
-                                lighter_candidate
-                            };
-                            let away_from_background_candidate = if away_from_background_is_lighter
-                            {
-                                lighter_candidate
-                            } else {
-                                darker_candidate
-                            };
-
-                            if closest_candidate == away_from_background_candidate {
-                                continue;
-                            }
-
-                            assert_eq!(
-                                adjust_color_for_background(
-                                    color,
-                                    background,
-                                    minimum_background_contrast,
-                                    config,
-                                ),
-                                closest_candidate
-                            );
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-
-        panic!(
-            "expected to find a color where the closest passing candidate differs from the away-from-background candidate"
-        );
-    }
-
-    #[test]
-    fn test_auto_bracket_colorization_rescues_severe_background_failure() {
-        let color = hsla(0.22, 0.9, 0.76, 1.0);
-        let minimum_background_contrast = 35.0;
-        let darker_candidate = adjusted_lightness_candidate(
-            color,
-            light_editor_background(),
-            minimum_background_contrast,
-            AutoBracketColorizationConfig::default().lightness_clamp_min,
-        );
-        let lighter_candidate = adjusted_lightness_candidate(
-            color,
-            light_editor_background(),
-            minimum_background_contrast,
-            AutoBracketColorizationConfig::default().lightness_clamp_max,
-        );
-        let analysis = analyze_bracket_colorization_palette(
-            &[color],
-            Appearance::Light,
-            light_editor_background(),
-            BracketColorizationMode::Auto,
-        );
-        let original_contrast = background_contrast(color, light_editor_background());
-
-        assert!(original_contrast < 20.0);
-        assert_eq!(
-            background_failure_severity(
-                original_contrast,
-                minimum_background_contrast,
-                darker_candidate.is_some() || lighter_candidate.is_some(),
-            ),
-            Some(BackgroundFailureSeverity::SevereFail)
-        );
-        assert!(analysis.changed);
-        assert!(
-            analysis.final_score.min_background_contrast
-                >= analysis.background_threshold.unwrap_or_default()
-        );
-    }
-
-    #[test]
-    fn test_adjust_color_for_background_returns_original_when_clamped_out() {
-        let color = hsla(0.58, 1.0, 0.47, 1.0);
-        let background = hsla(0.0, 0.0, 0.50, 1.0);
-        let minimum_background_contrast = 200.0;
-        let config = AutoBracketColorizationConfig::default();
-        let darker_candidate = adjusted_lightness_candidate(
-            color,
-            background,
-            minimum_background_contrast,
-            config.lightness_clamp_min,
-        );
-        let lighter_candidate = adjusted_lightness_candidate(
-            color,
-            background,
-            minimum_background_contrast,
-            config.lightness_clamp_max,
-        );
-
-        assert_eq!(
-            background_failure_severity(
-                background_contrast(color, background),
-                minimum_background_contrast,
-                darker_candidate.is_some() || lighter_candidate.is_some(),
-            ),
-            Some(BackgroundFailureSeverity::SevereFail)
-        );
-        assert_eq!(
-            adjust_color_for_background(color, background, minimum_background_contrast, config),
-            color
-        );
-    }
 
     #[gpui::test]
     async fn test_basic_bracket_colorization(cx: &mut gpui::TestAppContext) {
@@ -1415,11 +309,11 @@ where
     2
 }1»
 
-1 hsla(207.80, 81.00%, 66.00%, 1.00)
-2 hsla(29.00, 54.00%, 61.00%, 1.00)
-3 hsla(286.00, 51.00%, 64.00%, 1.00)
-4 hsla(187.00, 47.00%, 55.00%, 1.00)
-5 hsla(355.00, 65.00%, 65.00%, 1.00)
+1 hsla(207.80, 16.20%, 69.19%, 1.00)
+2 hsla(29.00, 54.00%, 65.88%, 1.00)
+3 hsla(286.00, 51.00%, 75.25%, 1.00)
+4 hsla(187.00, 47.00%, 59.22%, 1.00)
+5 hsla(355.00, 65.00%, 75.94%, 1.00)
 6 hsla(95.00, 38.00%, 62.00%, 1.00)
 7 hsla(39.00, 67.00%, 69.00%, 1.00)
 "#,
@@ -1451,7 +345,7 @@ where
 
         assert_eq!(
             "fn main«1()1» «1{}1»
-1 hsla(207.80, 81.00%, 66.00%, 1.00)
+1 hsla(207.80, 16.20%, 69.19%, 1.00)
 ",
             editor
                 .update(cx, |editor, window, cx| {
@@ -1480,7 +374,7 @@ where
 
         assert_eq!(
             r#"«1[LLM-powered features]1»«1(./ai/overview.md)1», «1[bring and configure your own API keys]1»«1(./ai/llm-providers.md#use-your-own-keys)1»
-1 hsla(207.80, 81.00%, 66.00%, 1.00)
+1 hsla(207.80, 16.20%, 69.19%, 1.00)
 "#,
             &bracket_colors_markup(&mut cx),
             "All markdown brackets should be colored based on their depth"
@@ -1492,8 +386,8 @@ where
 
         assert_eq!(
             r#"«1{«2{}2»}1»
-1 hsla(207.80, 81.00%, 66.00%, 1.00)
-2 hsla(29.00, 54.00%, 61.00%, 1.00)
+1 hsla(207.80, 16.20%, 69.19%, 1.00)
+2 hsla(29.00, 54.00%, 65.88%, 1.00)
 "#,
             &bracket_colors_markup(&mut cx),
             "All markdown brackets should be colored based on their depth, again"
@@ -1513,7 +407,7 @@ where
         .await;
 
         let rows = 100;
-        let footer = "1 hsla(207.80, 81.00%, 66.00%, 1.00)\n";
+        let footer = "1 hsla(207.80, 16.20%, 69.19%, 1.00)\n";
 
         let simple_brackets = (0..rows).map(|_| "ˇ[]\n").collect::<String>();
         let simple_brackets_highlights = (0..rows).map(|_| "«1[]1»\n").collect::<String>();
@@ -1587,8 +481,8 @@ where
     let v: Vec<String> = vec!«2[]2»;
 }1»
 
-1 hsla(207.80, 81.00%, 66.00%, 1.00)
-2 hsla(29.00, 54.00%, 61.00%, 1.00)
+1 hsla(207.80, 16.20%, 69.19%, 1.00)
+2 hsla(29.00, 54.00%, 65.88%, 1.00)
 "#,
             &bracket_colors_markup(&mut cx),
             "Markdown does not colorize <> brackets"
@@ -1605,8 +499,8 @@ where
     let v: Vec«2<String>2» = vec!«2[]2»;
 }1»
 
-1 hsla(207.80, 81.00%, 66.00%, 1.00)
-2 hsla(29.00, 54.00%, 61.00%, 1.00)
+1 hsla(207.80, 16.20%, 69.19%, 1.00)
+2 hsla(29.00, 54.00%, 65.88%, 1.00)
 "#,
             &bracket_colors_markup(&mut cx),
             "After switching to Rust, <> brackets are now colorized"
@@ -1650,9 +544,9 @@ fn process_data«1()1» «1{
     let map: Result<
 }1»
 
-1 hsla(207.80, 81.00%, 66.00%, 1.00)
-2 hsla(29.00, 54.00%, 61.00%, 1.00)
-3 hsla(286.00, 51.00%, 64.00%, 1.00)
+1 hsla(207.80, 16.20%, 69.19%, 1.00)
+2 hsla(29.00, 54.00%, 65.88%, 1.00)
+3 hsla(286.00, 51.00%, 75.25%, 1.00)
 "#},
             &bracket_colors_markup(&mut cx),
             "Brackets without pairs should be ignored and not colored"
@@ -1673,9 +567,9 @@ fn process_data«1()1» «1{
     let map: Result<Option<Foo<'_, «2()2»
 }1»
 
-1 hsla(207.80, 81.00%, 66.00%, 1.00)
-2 hsla(29.00, 54.00%, 61.00%, 1.00)
-3 hsla(286.00, 51.00%, 64.00%, 1.00)
+1 hsla(207.80, 16.20%, 69.19%, 1.00)
+2 hsla(29.00, 54.00%, 65.88%, 1.00)
+3 hsla(286.00, 51.00%, 75.25%, 1.00)
 "#},
             &bracket_colors_markup(&mut cx),
         );
@@ -1695,9 +589,9 @@ fn process_data«1()1» «1{
     let map: Result<Option<Foo«2<'_, «3()3»>2»
 }1»
 
-1 hsla(207.80, 81.00%, 66.00%, 1.00)
-2 hsla(29.00, 54.00%, 61.00%, 1.00)
-3 hsla(286.00, 51.00%, 64.00%, 1.00)
+1 hsla(207.80, 16.20%, 69.19%, 1.00)
+2 hsla(29.00, 54.00%, 65.88%, 1.00)
+3 hsla(286.00, 51.00%, 75.25%, 1.00)
 "#},
             &bracket_colors_markup(&mut cx),
             "When brackets start to get closed, inner brackets are re-colored based on their depth"
@@ -1718,10 +612,10 @@ fn process_data«1()1» «1{
     let map: Result<Option«2<Foo«3<'_, «4()4»>3»>2»
 }1»
 
-1 hsla(207.80, 81.00%, 66.00%, 1.00)
-2 hsla(29.00, 54.00%, 61.00%, 1.00)
-3 hsla(286.00, 51.00%, 64.00%, 1.00)
-4 hsla(187.00, 47.00%, 55.00%, 1.00)
+1 hsla(207.80, 16.20%, 69.19%, 1.00)
+2 hsla(29.00, 54.00%, 65.88%, 1.00)
+3 hsla(286.00, 51.00%, 75.25%, 1.00)
+4 hsla(187.00, 47.00%, 59.22%, 1.00)
 "#},
             &bracket_colors_markup(&mut cx),
         );
@@ -1741,11 +635,11 @@ fn process_data«1()1» «1{
     let map: Result«2<Option«3<Foo«4<'_, «5()5»>4»>3», «3()3»>2» = unimplemented!«2()2»;
 }1»
 
-1 hsla(207.80, 81.00%, 66.00%, 1.00)
-2 hsla(29.00, 54.00%, 61.00%, 1.00)
-3 hsla(286.00, 51.00%, 64.00%, 1.00)
-4 hsla(187.00, 47.00%, 55.00%, 1.00)
-5 hsla(355.00, 65.00%, 65.00%, 1.00)
+1 hsla(207.80, 16.20%, 69.19%, 1.00)
+2 hsla(29.00, 54.00%, 65.88%, 1.00)
+3 hsla(286.00, 51.00%, 75.25%, 1.00)
+4 hsla(187.00, 47.00%, 59.22%, 1.00)
+5 hsla(355.00, 65.00%, 75.94%, 1.00)
 "#},
             &bracket_colors_markup(&mut cx),
         );
@@ -1797,11 +691,11 @@ mod foo «1{
     }
 }1»
 
-1 hsla(207.80, 81.00%, 66.00%, 1.00)
-2 hsla(29.00, 54.00%, 61.00%, 1.00)
-3 hsla(286.00, 51.00%, 64.00%, 1.00)
-4 hsla(187.00, 47.00%, 55.00%, 1.00)
-5 hsla(355.00, 65.00%, 65.00%, 1.00)
+1 hsla(207.80, 16.20%, 69.19%, 1.00)
+2 hsla(29.00, 54.00%, 65.88%, 1.00)
+3 hsla(286.00, 51.00%, 75.25%, 1.00)
+4 hsla(187.00, 47.00%, 59.22%, 1.00)
+5 hsla(355.00, 65.00%, 75.94%, 1.00)
 "#},
                 comment_lines,
             ),
@@ -1829,11 +723,11 @@ mod foo «1{
     }2»
 }1»
 
-1 hsla(207.80, 81.00%, 66.00%, 1.00)
-2 hsla(29.00, 54.00%, 61.00%, 1.00)
-3 hsla(286.00, 51.00%, 64.00%, 1.00)
-4 hsla(187.00, 47.00%, 55.00%, 1.00)
-5 hsla(355.00, 65.00%, 65.00%, 1.00)
+1 hsla(207.80, 16.20%, 69.19%, 1.00)
+2 hsla(29.00, 54.00%, 65.88%, 1.00)
+3 hsla(286.00, 51.00%, 75.25%, 1.00)
+4 hsla(187.00, 47.00%, 59.22%, 1.00)
+5 hsla(355.00, 65.00%, 75.94%, 1.00)
 "#},
                 comment_lines,
             ),
@@ -1860,11 +754,11 @@ mod foo «1{
     }
     «3{«4{}4»}3»}2»}1»
 
-1 hsla(207.80, 81.00%, 66.00%, 1.00)
-2 hsla(29.00, 54.00%, 61.00%, 1.00)
-3 hsla(286.00, 51.00%, 64.00%, 1.00)
-4 hsla(187.00, 47.00%, 55.00%, 1.00)
-5 hsla(355.00, 65.00%, 65.00%, 1.00)
+1 hsla(207.80, 16.20%, 69.19%, 1.00)
+2 hsla(29.00, 54.00%, 65.88%, 1.00)
+3 hsla(286.00, 51.00%, 75.25%, 1.00)
+4 hsla(187.00, 47.00%, 59.22%, 1.00)
+5 hsla(355.00, 65.00%, 75.94%, 1.00)
 "#},
                 comment_lines,
             ),
@@ -1891,11 +785,11 @@ mod foo «1{
     }
     «3{«4{}4»}3»}2»}1»
 
-1 hsla(207.80, 81.00%, 66.00%, 1.00)
-2 hsla(29.00, 54.00%, 61.00%, 1.00)
-3 hsla(286.00, 51.00%, 64.00%, 1.00)
-4 hsla(187.00, 47.00%, 55.00%, 1.00)
-5 hsla(355.00, 65.00%, 65.00%, 1.00)
+1 hsla(207.80, 16.20%, 69.19%, 1.00)
+2 hsla(29.00, 54.00%, 65.88%, 1.00)
+3 hsla(286.00, 51.00%, 75.25%, 1.00)
+4 hsla(187.00, 47.00%, 59.22%, 1.00)
+5 hsla(355.00, 65.00%, 75.94%, 1.00)
 "#},
                 comment_lines,
             ),
@@ -1952,11 +846,11 @@ mod foo «1{
     }
     {{}}}}1»
 
-1 hsla(207.80, 81.00%, 66.00%, 1.00)
-2 hsla(29.00, 54.00%, 61.00%, 1.00)
-3 hsla(286.00, 51.00%, 64.00%, 1.00)
-4 hsla(187.00, 47.00%, 55.00%, 1.00)
-5 hsla(355.00, 65.00%, 65.00%, 1.00)
+1 hsla(207.80, 16.20%, 69.19%, 1.00)
+2 hsla(29.00, 54.00%, 65.88%, 1.00)
+3 hsla(286.00, 51.00%, 75.25%, 1.00)
+4 hsla(187.00, 47.00%, 59.22%, 1.00)
+5 hsla(355.00, 65.00%, 75.94%, 1.00)
 "#,
                 comment_lines,
             ),
@@ -2463,11 +1357,11 @@ mod foo «1{
     }2»
 }1»
 
-1 hsla(207.80, 81.00%, 66.00%, 1.00)
-2 hsla(29.00, 54.00%, 61.00%, 1.00)
-3 hsla(286.00, 51.00%, 64.00%, 1.00)
-4 hsla(187.00, 47.00%, 55.00%, 1.00)
-5 hsla(355.00, 65.00%, 65.00%, 1.00)
+1 hsla(207.80, 16.20%, 69.19%, 1.00)
+2 hsla(29.00, 54.00%, 65.88%, 1.00)
+3 hsla(286.00, 51.00%, 75.25%, 1.00)
+4 hsla(187.00, 47.00%, 59.22%, 1.00)
+5 hsla(355.00, 65.00%, 75.94%, 1.00)
 "#,},
             &editor_bracket_colors_markup(&editor_snapshot),
             "Multi buffers should have their brackets colored even if no excerpts contain the bracket counterpart (after fn `process_data_2()`) \
@@ -2503,11 +1397,11 @@ mod foo «1{
     }2»
 }1»
 
-1 hsla(207.80, 81.00%, 66.00%, 1.00)
-2 hsla(29.00, 54.00%, 61.00%, 1.00)
-3 hsla(286.00, 51.00%, 64.00%, 1.00)
-4 hsla(187.00, 47.00%, 55.00%, 1.00)
-5 hsla(355.00, 65.00%, 65.00%, 1.00)
+1 hsla(207.80, 16.20%, 69.19%, 1.00)
+2 hsla(29.00, 54.00%, 65.88%, 1.00)
+3 hsla(286.00, 51.00%, 75.25%, 1.00)
+4 hsla(187.00, 47.00%, 59.22%, 1.00)
+5 hsla(355.00, 65.00%, 75.94%, 1.00)
 "#,},
             &editor_bracket_colors_markup(&editor_snapshot),
         );
@@ -2534,20 +1428,7 @@ mod foo «1{
         let editor_snapshot = editor
             .update(cx, |editor, window, cx| editor.snapshot(window, cx))
             .unwrap();
-        let adjusted_palette = cx.update(|cx| {
-            analyze_bracket_colorization_palette(
-                &[
-                    Hsla::from(Rgba::try_from("#ff0000").expect("valid override accent")),
-                    Hsla::from(Rgba::try_from("#0000ff").expect("valid override accent")),
-                ],
-                cx.theme().appearance,
-                cx.theme().colors().editor_background,
-                BracketColorizationMode::Auto,
-            )
-            .final_palette
-        });
-        let expected_markup = format!(
-            "{}\n1 {}\n2 {}\n",
+        assert_eq!(
             indoc! {r#"
 
 
@@ -2565,13 +1446,11 @@ mod foo «1{
         let other_map: Option«1<Vec«2<«1()1»>2»>1» = None;
     }2»
 }1»
+
+1 hsla(0.00, 100.00%, 78.12%, 1.00)
+2 hsla(240.00, 100.00%, 82.81%, 1.00)
 "#,},
-            adjusted_palette[0],
-            adjusted_palette[1],
-        );
-        assert_eq!(
-            expected_markup,
-            editor_bracket_colors_markup(&editor_snapshot),
+            &editor_bracket_colors_markup(&editor_snapshot),
             "After updating theme accents, the editor should update the bracket coloring"
         );
     }
@@ -2622,9 +1501,9 @@ fn small_function«1()1» «1{
     let x = «2(1, «3(2, 3)3»)2»;
 }1»
 
-1 hsla(207.80, 81.00%, 66.00%, 1.00)
-2 hsla(29.00, 54.00%, 61.00%, 1.00)
-3 hsla(286.00, 51.00%, 64.00%, 1.00)
+1 hsla(207.80, 16.20%, 69.19%, 1.00)
+2 hsla(29.00, 54.00%, 65.88%, 1.00)
+3 hsla(286.00, 51.00%, 75.25%, 1.00)
 "#,},
             bracket_colors_markup(&mut cx),
         );
@@ -2642,46 +1521,6 @@ fn small_function«1()1» «1{
         cx.update_editor(|editor, window, cx| {
             editor_bracket_colors_markup(&editor.snapshot(window, cx))
         })
-    }
-
-    #[gpui::test]
-    async fn test_demo_source_bracket_color_phase(cx: &mut gpui::TestAppContext) {
-        init_test(cx, |language_settings| {
-            language_settings.defaults.colorize_brackets = Some(true);
-            language_settings.defaults.bracket_colorization_mode =
-                Some(BracketColorizationMode::Theme);
-        });
-        let editor = cx.add_window(|window, cx| {
-            let multi_buffer = MultiBuffer::build_simple(
-                indoc! {r#"
-                    fn main() {
-                        // Direct adjacent brackets
-                        [[[[[[[[[[[]]]]]]]]]]]
-                    }
-                "#},
-                cx,
-            );
-            multi_buffer.update(cx, |multi_buffer, cx| {
-                multi_buffer
-                    .as_singleton()
-                    .unwrap()
-                    .update(cx, |buffer, cx| {
-                        buffer.set_language(Some(rust_lang()), cx);
-                    });
-            });
-            Editor::new(EditorMode::full(), multi_buffer, None, window, cx)
-        });
-
-        cx.executor().advance_clock(Duration::from_millis(100));
-        cx.executor().run_until_parked();
-
-        let markup = editor
-            .update(cx, |editor, window, cx| {
-                editor_bracket_colors_markup(&editor.snapshot(window, cx))
-            })
-            .expect("editor should still exist for markup inspection");
-
-        println!("{markup}");
     }
 
     fn editor_bracket_colors_markup(snapshot: &EditorSnapshot) -> String {

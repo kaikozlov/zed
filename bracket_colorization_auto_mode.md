@@ -58,7 +58,7 @@ This is the escape hatch for users who want rainbow brackets to follow the packa
 
 #### `auto`
 
-`auto` tries to improve bracket readability without replacing the theme palette outright.
+`auto` acts as a safety net for weak bracket palettes without replacing the theme palette outright.
 
 It does this by:
 
@@ -67,7 +67,7 @@ It does this by:
    - adjacent accent separation
    - contrast against the editor background
 3. Adjusting only the specific accents that fail the background contrast check
-4. Reordering the resulting palette only if adjacent separation is still weak
+4. Reordering the resulting palette only if adjacent separation is still materially weak and reordering can actually make it pass
 5. Falling back to the original order when no treatment is needed
 
 ## How Auto Mode Works
@@ -86,6 +86,8 @@ Auto mode uses:
 - OKLCH lightness-only adjustment for failing accents
 
 It does not replace the palette wholesale. It starts from the theme accents and only adjusts the accents that fail the background check.
+
+`auto` is intentionally not a full theme-repair system. It makes a best effort to rescue weak bracket colors while preserving hue, chroma, and the original accent order whenever possible.
 
 ### Scoring
 
@@ -121,6 +123,8 @@ Auto mode uses different minimum thresholds for light and dark themes:
 
 These values were chosen from capture sweeps across bundled `One`, `Ayu`, and `Gruvbox` themes. Higher APCA floors preserved less of the original palette than necessary, especially in light themes.
 
+Auto mode does not use an APCA "abandon ceiling". If a bracket color starts far below the floor but can still be rescued with a lightness-only adjustment inside the clamp range, auto mode still rescues it.
+
 ### Reordering
 
 Auto mode now applies treatments in this order:
@@ -139,7 +143,7 @@ The current approach:
 - greedily picks the next unused accent that best separates from the previous one
 - compares candidate orders by minimum adjacent distance first, then average adjacent distance
 
-The reordered palette is only used if it meaningfully improves the weakest neighboring pair.
+The reordered palette is only used if it turns a materially failing adjacent-separation result into a passing one. In light themes, the auto mode includes a narrow tolerance band below the `0.10` target so a `0.099` near miss does not force a full palette reorder.
 
 At the palette level, the implementation currently distinguishes these auto strategies:
 

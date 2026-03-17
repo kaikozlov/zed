@@ -1146,7 +1146,7 @@ fn strategy_label(strategy: BracketColorizationPaletteStrategy) -> &'static str 
         BracketColorizationPaletteStrategy::PreservedSmallPalette => "palette too small to reorder",
         BracketColorizationPaletteStrategy::PreservedStrongPalette => "contrast already sufficient",
         BracketColorizationPaletteStrategy::PreservedWeakPalette => {
-            "weak palette kept because reorder was not meaningfully better"
+            "weak palette kept in theme order"
         }
         BracketColorizationPaletteStrategy::AdjustedBackgroundPalette => {
             "adjusted only the background-failing accents"
