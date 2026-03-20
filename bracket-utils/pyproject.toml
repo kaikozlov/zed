@@ -1,0 +1,8 @@
+[project]
+name = "bracket-utils"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "coloraide==8.7",
+    "json5>=0.13.0",
+]

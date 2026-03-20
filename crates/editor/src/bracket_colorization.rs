@@ -198,11 +198,15 @@ pub(crate) fn bracket_colorization_accents(
         };
     }
 
-    let reordered = maximize_adjacent_separation(&background_adjusted, background);
-    let reordered_min_adj = min_adjacent_oklab_distance(&reordered, background);
-
-    if reordered_min_adj >= intervention_distance {
-        Arc::from(reordered)
+    if let Some(reordered_order) =
+        best_passing_reorder_order(&background_adjusted, background, intervention_distance)
+    {
+        Arc::from(
+            reordered_order
+                .into_iter()
+                .map(|index| background_adjusted[index])
+                .collect::<Vec<_>>(),
+        )
     } else if background_adjusted_changed {
         Arc::from(background_adjusted)
     } else {
@@ -210,74 +214,191 @@ pub(crate) fn bracket_colorization_accents(
     }
 }
 
-fn maximize_adjacent_separation(accents: &[Hsla], background: Hsla) -> Vec<Hsla> {
-    let original_min_adj = min_adjacent_oklab_distance(accents, background);
-
-    let mut used = vec![false; accents.len()];
-    let mut order = Vec::with_capacity(accents.len());
-    order.push(0);
-    used[0] = true;
-
-    while order.len() < accents.len() {
-        let last = *order
-            .last()
-            .expect("adjacent-separation order is initialized with a starting accent");
-        let first = order[0];
-        let next = (0..accents.len())
-            .filter(|&index| !used[index])
-            .max_by(|&left, &right| {
-                compare_candidates(accents, background, last, first, left, right)
-            })
-            .expect(
-                "adjacent-separation selection must find an unused accent while building the order",
-            );
-        used[next] = true;
-        order.push(next);
-    }
-
-    let reordered = order
-        .into_iter()
-        .map(|index| accents[index])
-        .collect::<Vec<_>>();
-    if min_adjacent_oklab_distance(&reordered, background) > original_min_adj {
-        reordered
-    } else {
-        accents.to_vec()
-    }
-}
-
-fn compare_candidates(
+fn best_passing_reorder_order(
     accents: &[Hsla],
     background: Hsla,
-    last: usize,
-    first: usize,
-    left: usize,
-    right: usize,
-) -> Ordering {
-    let left_last = adjacent_distance(accents[last], accents[left], background);
-    let right_last = adjacent_distance(accents[last], accents[right], background);
-    left_last
-        .partial_cmp(&right_last)
-        .unwrap_or(Ordering::Equal)
-        .then_with(|| {
-            let left_first = adjacent_distance(accents[first], accents[left], background);
-            let right_first = adjacent_distance(accents[first], accents[right], background);
-            left_first
-                .partial_cmp(&right_first)
-                .unwrap_or(Ordering::Equal)
-        })
+    threshold: f32,
+) -> Option<Vec<usize>> {
+    let mut best_order = None;
+    let mut best_displacement = usize::MAX;
+    let mut best_moved = usize::MAX;
+    let mut best_inversions = usize::MAX;
+    let mut best_min_adjacent = f32::MIN;
+    let mut seen_orders = HashSet::default();
+
+    for cut_order in cut_interleave_orders(accents.len()) {
+        for maybe_move in std::iter::once(None).chain((1..accents.len()).flat_map(|source| {
+            (1..accents.len())
+                .filter(move |&destination| destination != source)
+                .map(move |destination| Some((source, destination)))
+        })) {
+            let mut order = cut_order.clone();
+            if let Some((source, destination)) = maybe_move {
+                let value = order.remove(source);
+                order.insert(destination, value);
+            }
+
+            if !seen_orders.insert(order.clone()) {
+                continue;
+            }
+
+            let min_adjacent_distance =
+                min_adjacent_oklab_distance_for_order(accents, &order, background);
+            if min_adjacent_distance < threshold {
+                continue;
+            }
+
+            let candidate_displacement = displacement_cost(&order);
+            let candidate_moved = moved_count(&order);
+            let candidate_inversions = inversion_count(&order);
+            if best_order.is_none()
+                || reorder_candidate_is_better(
+                    candidate_displacement,
+                    candidate_moved,
+                    candidate_inversions,
+                    min_adjacent_distance,
+                    best_displacement,
+                    best_moved,
+                    best_inversions,
+                    best_min_adjacent,
+                )
+            {
+                best_displacement = candidate_displacement;
+                best_moved = candidate_moved;
+                best_inversions = candidate_inversions;
+                best_min_adjacent = min_adjacent_distance;
+                best_order = Some(order);
+            }
+        }
+    }
+
+    best_order
+}
+
+fn reorder_candidate_is_better(
+    left_displacement: usize,
+    left_moved: usize,
+    left_inversions: usize,
+    left_min_adjacent: f32,
+    right_displacement: usize,
+    right_moved: usize,
+    right_inversions: usize,
+    right_min_adjacent: f32,
+) -> bool {
+    match left_displacement.cmp(&right_displacement) {
+        Ordering::Less => return true,
+        Ordering::Greater => return false,
+        Ordering::Equal => {}
+    }
+
+    match left_moved.cmp(&right_moved) {
+        Ordering::Less => return true,
+        Ordering::Greater => return false,
+        Ordering::Equal => {}
+    }
+
+    match left_inversions.cmp(&right_inversions) {
+        Ordering::Less => return true,
+        Ordering::Greater => return false,
+        Ordering::Equal => {}
+    }
+
+    left_min_adjacent > right_min_adjacent
+}
+
+fn cut_interleave_orders(length: usize) -> Vec<Vec<usize>> {
+    if length < 4 {
+        return vec![(0..length).collect()];
+    }
+
+    let mut orders = vec![(0..length).collect()];
+    for cut in 2..length {
+        let left = (1..cut).collect::<Vec<_>>();
+        let right = (cut..length).collect::<Vec<_>>();
+
+        let mut right_first = vec![0];
+        for index in 0..left.len().max(right.len()) {
+            if let Some(&value) = right.get(index) {
+                right_first.push(value);
+            }
+            if let Some(&value) = left.get(index) {
+                right_first.push(value);
+            }
+        }
+        orders.push(right_first);
+
+        let mut left_first = vec![0];
+        for index in 0..left.len().max(right.len()) {
+            if let Some(&value) = left.get(index) {
+                left_first.push(value);
+            }
+            if let Some(&value) = right.get(index) {
+                left_first.push(value);
+            }
+        }
+        orders.push(left_first);
+    }
+
+    orders
+}
+
+fn inversion_count(order: &[usize]) -> usize {
+    let mut total = 0;
+    for (left_index, &left) in order.iter().enumerate() {
+        for &right in &order[left_index + 1..] {
+            if left > right {
+                total += 1;
+            }
+        }
+    }
+    total
+}
+
+fn displacement_cost(order: &[usize]) -> usize {
+    order
+        .iter()
+        .enumerate()
+        .map(|(position, &value)| position.abs_diff(value))
+        .sum()
+}
+
+fn moved_count(order: &[usize]) -> usize {
+    order
+        .iter()
+        .enumerate()
+        .filter(|(position, value)| *position != **value)
+        .count()
 }
 
 fn min_adjacent_oklab_distance(accents: &[Hsla], background: Hsla) -> f32 {
     if accents.len() < 2 {
         return f32::MAX;
     }
+
     accents
         .iter()
         .copied()
         .zip(accents.iter().copied().cycle().skip(1))
         .take(accents.len())
         .map(|(left, right)| adjacent_distance(left, right, background))
+        .fold(f32::MAX, f32::min)
+}
+
+fn min_adjacent_oklab_distance_for_order(
+    accents: &[Hsla],
+    order: &[usize],
+    background: Hsla,
+) -> f32 {
+    if accents.len() < 2 {
+        return f32::MAX;
+    }
+
+    order
+        .iter()
+        .copied()
+        .zip(order.iter().copied().cycle().skip(1))
+        .take(order.len())
+        .map(|(left, right)| adjacent_distance(accents[left], accents[right], background))
         .fold(f32::MAX, f32::min)
 }
 
@@ -492,7 +613,7 @@ mod tests {
     }
 
     #[test]
-    fn test_auto_bracket_colorization_mode_reorders_weak_palette() {
+    fn test_auto_bracket_colorization_reorders_weak_palette_with_structured_search() {
         let accents = vec![
             hsla(0.0, 1.0, 0.68, 1.0),
             hsla(0.02, 1.0, 0.68, 1.0),
@@ -501,11 +622,43 @@ mod tests {
         ];
 
         let original_min_adj = min_adjacent_oklab_distance(&accents, dark_editor_background());
-        let reordered = maximize_adjacent_separation(&accents, dark_editor_background());
-        let reordered_min_adj = min_adjacent_oklab_distance(&reordered, dark_editor_background());
+        let reordered =
+            best_passing_reorder_order(&accents, dark_editor_background(), ADJACENT_OKLAB_DARK)
+                .expect("weak palette should have a passing structured reorder");
+        let reordered_min_adj =
+            min_adjacent_oklab_distance_for_order(&accents, &reordered, dark_editor_background());
 
-        assert_ne!(reordered.as_slice(), accents.as_slice());
+        assert_ne!(reordered, (0..accents.len()).collect::<Vec<_>>());
+        assert_eq!(reordered[0], 0);
         assert!(reordered_min_adj > original_min_adj);
+        assert!(reordered_min_adj >= ADJACENT_OKLAB_DARK);
+    }
+
+    #[test]
+    fn test_auto_bracket_colorization_prefers_cheapest_passing_structured_reorder() {
+        let accents = vec![
+            Hsla::from(Rgba::try_from("#8651AF").expect("valid color")),
+            Hsla::from(Rgba::try_from("#A94AC0").expect("valid color")),
+            Hsla::from(Rgba::try_from("#9C78C1").expect("valid color")),
+            Hsla::from(Rgba::try_from("#B1C7F1").expect("valid color")),
+            Hsla::from(Rgba::try_from("#9CD1D0").expect("valid color")),
+        ];
+
+        let order =
+            best_passing_reorder_order(&accents, dark_editor_background(), ADJACENT_OKLAB_DARK)
+                .expect("palette should have a passing structured reorder");
+
+        assert_eq!(order, vec![0, 3, 2, 1, 4]);
+        assert_ne!(order, (0..accents.len()).collect::<Vec<_>>());
+        assert_ne!(order, vec![0, 2, 3, 1, 4]);
+        assert_ne!(order, vec![0, 3, 1, 4, 2]);
+        assert_eq!(displacement_cost(&order), 4);
+        assert_eq!(moved_count(&order), 2);
+        assert_eq!(inversion_count(&order), 3);
+        assert!(
+            min_adjacent_oklab_distance_for_order(&accents, &order, dark_editor_background())
+                >= ADJACENT_OKLAB_DARK
+        );
     }
 
     #[test]
