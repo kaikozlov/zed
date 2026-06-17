@@ -44,6 +44,7 @@ foreign-types = "0.5"
 futures.workspace = true
 gpui_util.workspace = true
 image.workspace = true
+io-surface = "0.16.1"
 itertools.workspace = true
 libc.workspace = true
 log.workspace = true

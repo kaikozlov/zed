@@ -1628,7 +1628,13 @@ impl PlatformWindow for MacWindow {
     }
 
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
-        self.0.as_ref().lock().request_frame_callback = Some(callback);
+        let window_state = Arc::downgrade(&self.0);
+        let mut lock = self.0.as_ref().lock();
+        lock.request_frame_callback = Some(callback);
+        lock.renderer
+            .set_deferred_frame_callback(Some(Arc::new(move || {
+                request_deferred_frame(window_state.clone());
+            })));
     }
 
     fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>) {
@@ -2441,15 +2447,7 @@ fn update_window_scale_factor(window_state: &Arc<Mutex<MacWindowState>>) {
     let scale_factor = lock.scale_factor();
     let size = lock.content_size();
     let drawable_size = size.to_device_pixels(scale_factor);
-    if let Some(layer) = lock.renderer.layer() {
-        unsafe {
-            let _: () = msg_send![
-                layer,
-                setContentsScale: scale_factor as f64
-            ];
-        }
-    }
-
+    lock.renderer.set_contents_scale(scale_factor as f64);
     lock.renderer.update_drawable_size(drawable_size);
 
     if let Some(mut callback) = lock.resize_callback.take() {
@@ -2584,7 +2582,7 @@ extern "C" fn close_window(this: &Object, _: Sel) {
 extern "C" fn make_backing_layer(this: &Object, _: Sel) -> id {
     let window_state = unsafe { get_window_state(this) };
     let window_state = window_state.as_ref().lock();
-    window_state.renderer.layer_ptr() as id
+    window_state.renderer.backing_layer_ptr()
 }
 
 extern "C" fn view_did_change_backing_properties(this: &Object, _: Sel) {
@@ -2656,6 +2654,25 @@ extern "C" fn step(view: *mut c_void) {
         callback(Default::default());
         window_state.lock().request_frame_callback = Some(callback);
     }
+}
+
+fn request_deferred_frame(window_state: Weak<Mutex<MacWindowState>>) {
+    let Some(window_state) = window_state.upgrade() else {
+        return;
+    };
+
+    let mut lock = window_state.lock();
+    let Some(mut callback) = lock.request_frame_callback.take() else {
+        return;
+    };
+    drop(lock);
+
+    callback(RequestFrameOptions {
+        require_presentation: true,
+        force_render: true,
+    });
+
+    window_state.lock().request_frame_callback = Some(callback);
 }
 
 extern "C" fn valid_attributes_for_marked_text(_: &Object, _: Sel) -> id {

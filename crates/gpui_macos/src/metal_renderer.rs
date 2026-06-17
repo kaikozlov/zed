@@ -2,7 +2,7 @@ use crate::metal_atlas::MetalAtlas;
 use anyhow::Result;
 use block::ConcreteBlock;
 use cocoa::{
-    base::{NO, YES},
+    base::{NO, YES, id},
     foundation::{NSSize, NSUInteger},
     quartzcore::AutoresizingMask,
 };
@@ -14,20 +14,33 @@ use gpui::{
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
 
-use core_foundation::base::TCFType;
+use core_foundation::{
+    base::{CFType, TCFType},
+    dictionary::CFDictionary,
+    number::CFNumber,
+    string::{CFString, CFStringRef},
+};
 use core_video::{
     metal_texture::CVMetalTextureGetTexture, metal_texture_cache::CVMetalTextureCache,
     pixel_buffer::kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
 };
 use foreign_types::{ForeignType, ForeignTypeRef};
 use metal::{
-    CAMetalLayer, CommandQueue, MTLGPUFamily, MTLPixelFormat, MTLResourceOptions, NSRange,
+    CommandQueue, MTLGPUFamily, MTLPixelFormat, MTLResourceOptions, NSRange,
     RenderPassColorAttachmentDescriptorRef,
 };
-use objc::{self, msg_send, sel, sel_impl};
+use objc::{self, class, msg_send, sel, sel_impl};
 use parking_lot::Mutex;
 
-use std::{cell::Cell, ffi::c_void, mem, ptr, sync::Arc};
+use std::{
+    cell::Cell,
+    ffi::c_void,
+    mem, ptr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+};
 
 // Exported to metal
 pub(crate) type PointF = gpui::Point<f32>;
@@ -39,6 +52,11 @@ const SHADERS_SOURCE_FILE: &str = include_str!(concat!(env!("OUT_DIR"), "/stitch
 // Use 4x MSAA, all devices support it.
 // https://developer.apple.com/documentation/metal/mtldevice/1433355-supportstexturesamplecount
 const PATH_SAMPLE_COUNT: u32 = 4;
+const CHROMIUM_PIPELINE_ENV: &str = "ZED_MACOS_CHROMIUM_PIPELINE";
+const IOSURFACE_BUFFER_COUNT: usize = 3;
+const IOSURFACE_MAX_PENDING_SWAPS: usize = IOSURFACE_BUFFER_COUNT - 1;
+const NO_CURRENT_BUFFER: usize = usize::MAX;
+const BGRA_IOSURFACE_PIXEL_FORMAT: i32 = i32::from_be_bytes(*b"BGRA");
 
 pub(crate) type Context = Arc<Mutex<InstanceBufferPool>>;
 pub(crate) type Renderer = MetalRenderer;
@@ -50,7 +68,11 @@ pub(crate) unsafe fn new_renderer(
     _bounds: gpui::Size<f32>,
     transparent: bool,
 ) -> Renderer {
-    MetalRenderer::new(context, transparent)
+    if std::env::var_os(CHROMIUM_PIPELINE_ENV).is_some() {
+        MetalRenderer::new_chromium_pipeline(context, transparent, _bounds)
+    } else {
+        MetalRenderer::new(context, transparent)
+    }
 }
 
 pub(crate) struct InstanceBufferPool {
@@ -70,6 +92,51 @@ impl Default for InstanceBufferPool {
 pub(crate) struct InstanceBuffer {
     metal_buffer: metal::Buffer,
     size: usize,
+}
+
+struct CoreAnimationPresenter {
+    layer: id,
+    drawable_size: Size<DevicePixels>,
+    buffers: Vec<IosurfaceFrameBuffer>,
+    pending_swap_count: Arc<AtomicUsize>,
+    current_buffer_index: Arc<AtomicUsize>,
+    deferred_frame_requested: Arc<AtomicBool>,
+    deferred_frame_callback: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+#[allow(deprecated)]
+struct IosurfaceFrameBuffer {
+    surface: io_surface::IOSurface,
+    texture: metal::Texture,
+    pending: Arc<AtomicBool>,
+}
+
+#[allow(deprecated)]
+struct PresentedIosurfaceFrame {
+    layer: id,
+    surface: io_surface::IOSurface,
+    buffer_pending: Arc<AtomicBool>,
+    pending_swap_count: Arc<AtomicUsize>,
+    current_buffer_index: Arc<AtomicUsize>,
+    deferred_frame_requested: Arc<AtomicBool>,
+    deferred_frame_callback: Option<Arc<dyn Fn() + Send + Sync>>,
+    buffer_index: usize,
+}
+
+impl Drop for PresentedIosurfaceFrame {
+    fn drop(&mut self) {
+        unsafe {
+            let _: () = msg_send![self.layer, release];
+        }
+    }
+}
+
+impl Drop for CoreAnimationPresenter {
+    fn drop(&mut self) {
+        unsafe {
+            let _: () = msg_send![self.layer, release];
+        }
+    }
 }
 
 impl InstanceBufferPool {
@@ -108,9 +175,217 @@ impl InstanceBufferPool {
     }
 }
 
+#[allow(deprecated)]
+impl CoreAnimationPresenter {
+    fn new(
+        device: &metal::Device,
+        transparent: bool,
+        initial_size: Size<DevicePixels>,
+    ) -> Result<Self> {
+        let layer: id = unsafe { msg_send![class!(CALayer), new] };
+        unsafe {
+            let _: () = msg_send![layer, setOpaque: if transparent { NO } else { YES }];
+            let _: () = msg_send![layer, setNeedsDisplayOnBoundsChange: YES];
+            let _: () = msg_send![
+                layer,
+                setAutoresizingMask: AutoresizingMask::WIDTH_SIZABLE
+                    | AutoresizingMask::HEIGHT_SIZABLE
+            ];
+        }
+
+        let mut presenter = Self {
+            layer,
+            drawable_size: size(0.into(), 0.into()),
+            buffers: Vec::new(),
+            pending_swap_count: Arc::new(AtomicUsize::new(0)),
+            current_buffer_index: Arc::new(AtomicUsize::new(NO_CURRENT_BUFFER)),
+            deferred_frame_requested: Arc::new(AtomicBool::new(false)),
+            deferred_frame_callback: None,
+        };
+        presenter.update_drawable_size(device, initial_size)?;
+        Ok(presenter)
+    }
+
+    fn update_drawable_size(
+        &mut self,
+        device: &metal::Device,
+        drawable_size: Size<DevicePixels>,
+    ) -> Result<()> {
+        if self.drawable_size == drawable_size {
+            return Ok(());
+        }
+
+        self.drawable_size = drawable_size;
+        self.pending_swap_count.store(0, Ordering::Release);
+        self.current_buffer_index
+            .store(NO_CURRENT_BUFFER, Ordering::Release);
+        self.buffers.clear();
+
+        if drawable_size.width.0 <= 0 || drawable_size.height.0 <= 0 {
+            return Ok(());
+        }
+
+        for _ in 0..IOSURFACE_BUFFER_COUNT {
+            self.buffers
+                .push(IosurfaceFrameBuffer::new(device, drawable_size)?);
+        }
+
+        Ok(())
+    }
+
+    fn set_contents_scale(&self, scale_factor: f64) {
+        unsafe {
+            let _: () = msg_send![self.layer, setContentsScale: scale_factor];
+        }
+    }
+
+    fn set_opaque(&self, opaque: bool) {
+        unsafe {
+            let _: () = msg_send![self.layer, setOpaque: if opaque { YES } else { NO }];
+        }
+    }
+
+    fn layer_ptr(&self) -> id {
+        self.layer
+    }
+
+    fn next_buffer_index(&self) -> Option<usize> {
+        if self.pending_swap_count.load(Ordering::Acquire) >= IOSURFACE_MAX_PENDING_SWAPS {
+            self.deferred_frame_requested.store(true, Ordering::Release);
+            return None;
+        }
+
+        let current_buffer_index = self.current_buffer_index.load(Ordering::Acquire);
+        let next_buffer_index = self
+            .buffers
+            .iter()
+            .enumerate()
+            .find(|(index, buffer)| {
+                *index != current_buffer_index
+                    && !buffer.pending.load(Ordering::Acquire)
+                    && unsafe {
+                        !io_surface::IOSurfaceIsInUse(buffer.surface.as_concrete_TypeRef())
+                    }
+            })
+            .map(|(index, _)| index);
+
+        if next_buffer_index.is_none() {
+            self.deferred_frame_requested.store(true, Ordering::Release);
+        }
+
+        next_buffer_index
+    }
+
+    fn mark_buffer_pending(&self, buffer_index: usize) {
+        if let Some(buffer) = self.buffers.get(buffer_index) {
+            buffer.pending.store(true, Ordering::Release);
+            self.pending_swap_count.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn set_deferred_frame_callback(&mut self, callback: Option<Arc<dyn Fn() + Send + Sync>>) {
+        self.deferred_frame_callback = callback;
+    }
+}
+
+#[allow(deprecated)]
+impl IosurfaceFrameBuffer {
+    fn new(device: &metal::Device, size: Size<DevicePixels>) -> Result<Self> {
+        let surface = new_iosurface(size);
+        let texture = new_iosurface_texture(device, &surface, size);
+
+        Ok(Self {
+            surface,
+            texture,
+            pending: Arc::new(AtomicBool::new(false)),
+        })
+    }
+}
+
+fn iosurface_key(reference: CFStringRef) -> CFString {
+    unsafe { TCFType::wrap_under_get_rule(reference) }
+}
+
+#[allow(deprecated)]
+fn new_iosurface(size: Size<DevicePixels>) -> io_surface::IOSurface {
+    let width = size.width.0.max(1);
+    let height = size.height.0.max(1);
+    let bytes_per_row = align_to(width as usize * 4, 256);
+
+    let width_key = iosurface_key(unsafe { io_surface::kIOSurfaceWidth });
+    let height_key = iosurface_key(unsafe { io_surface::kIOSurfaceHeight });
+    let bytes_per_row_key = iosurface_key(unsafe { io_surface::kIOSurfaceBytesPerRow });
+    let bytes_per_element_key = iosurface_key(unsafe { io_surface::kIOSurfaceBytesPerElement });
+    let pixel_format_key = iosurface_key(unsafe { io_surface::kIOSurfacePixelFormat });
+
+    let width = CFNumber::from(width);
+    let height = CFNumber::from(height);
+    let bytes_per_row = CFNumber::from(bytes_per_row as i32);
+    let bytes_per_element = CFNumber::from(4);
+    let pixel_format = CFNumber::from(BGRA_IOSURFACE_PIXEL_FORMAT);
+
+    let properties = CFDictionary::<CFString, CFType>::from_CFType_pairs(&[
+        (width_key, width.as_CFType()),
+        (height_key, height.as_CFType()),
+        (bytes_per_row_key, bytes_per_row.as_CFType()),
+        (bytes_per_element_key, bytes_per_element.as_CFType()),
+        (pixel_format_key, pixel_format.as_CFType()),
+    ]);
+
+    io_surface::new(&properties)
+}
+
+#[allow(deprecated)]
+fn new_iosurface_texture(
+    device: &metal::Device,
+    surface: &io_surface::IOSurface,
+    size: Size<DevicePixels>,
+) -> metal::Texture {
+    let texture_descriptor = metal::TextureDescriptor::new();
+    texture_descriptor.set_texture_type(metal::MTLTextureType::D2);
+    texture_descriptor.set_width(size.width.0.max(1) as u64);
+    texture_descriptor.set_height(size.height.0.max(1) as u64);
+    texture_descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+    texture_descriptor.set_storage_mode(metal::MTLStorageMode::Shared);
+    texture_descriptor
+        .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
+
+    unsafe {
+        msg_send![
+            device.as_ref(),
+            newTextureWithDescriptor: texture_descriptor.as_ref()
+            iosurface: surface.as_concrete_TypeRef()
+            plane: 0usize
+        ]
+    }
+}
+
+fn align_to(value: usize, alignment: usize) -> usize {
+    value.div_ceil(alignment) * alignment
+}
+
+extern "C" fn present_iosurface_frame(context: *mut c_void) {
+    let frame = unsafe { Box::from_raw(context as *mut PresentedIosurfaceFrame) };
+    unsafe {
+        let _: () = msg_send![frame.layer, setContents: frame.surface.as_concrete_TypeRef() as id];
+        let _: () = msg_send![frame.layer, setNeedsDisplay];
+    }
+    frame
+        .current_buffer_index
+        .store(frame.buffer_index, Ordering::Release);
+    frame.buffer_pending.store(false, Ordering::Release);
+    frame.pending_swap_count.fetch_sub(1, Ordering::AcqRel);
+    if frame.deferred_frame_requested.swap(false, Ordering::AcqRel)
+        && let Some(callback) = &frame.deferred_frame_callback
+    {
+        callback();
+    }
+}
+
 pub(crate) struct MetalRenderer {
     device: metal::Device,
     layer: Option<metal::MetalLayer>,
+    core_animation_presenter: Option<CoreAnimationPresenter>,
     is_apple_gpu: bool,
     is_unified_memory: bool,
     presents_with_transaction: bool,
@@ -173,6 +448,33 @@ impl MetalRenderer {
         }
 
         Self::new_internal(device, Some(layer), !transparent, instance_buffer_pool)
+    }
+
+    pub fn new_chromium_pipeline(
+        instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
+        transparent: bool,
+        initial_bounds: gpui::Size<f32>,
+    ) -> Self {
+        let device = Self::create_device();
+        let initial_size = size(
+            (initial_bounds.width.ceil() as i32).into(),
+            (initial_bounds.height.ceil() as i32).into(),
+        );
+        let mut renderer = Self::new_internal(device, None, !transparent, instance_buffer_pool);
+        match CoreAnimationPresenter::new(&renderer.device, transparent, initial_size) {
+            Ok(presenter) => {
+                renderer.core_animation_presenter = Some(presenter);
+                log::info!("using experimental Chromium-style CA/IOSurface renderer");
+            }
+            Err(error) => {
+                log::error!(
+                    "failed to initialize experimental CA/IOSurface renderer: {error}; falling back to CAMetalLayer"
+                );
+                let fallback = Self::new(renderer.instance_buffer_pool.clone(), transparent);
+                return fallback;
+            }
+        }
+        renderer
     }
 
     /// Creates a new headless MetalRenderer for offscreen rendering without a window.
@@ -331,6 +633,7 @@ impl MetalRenderer {
         Self {
             device,
             layer,
+            core_animation_presenter: None,
             presents_with_transaction: false,
             is_apple_gpu,
             is_unified_memory,
@@ -356,15 +659,15 @@ impl MetalRenderer {
         }
     }
 
-    pub fn layer(&self) -> Option<&metal::MetalLayerRef> {
-        self.layer.as_ref().map(|l| l.as_ref())
-    }
-
-    pub fn layer_ptr(&self) -> *mut CAMetalLayer {
-        self.layer
-            .as_ref()
-            .map(|l| l.as_ptr())
-            .unwrap_or(ptr::null_mut())
+    pub fn backing_layer_ptr(&self) -> id {
+        if let Some(presenter) = &self.core_animation_presenter {
+            presenter.layer_ptr()
+        } else {
+            self.layer
+                .as_ref()
+                .map(|layer| layer.as_ptr() as id)
+                .unwrap_or(ptr::null_mut())
+        }
     }
 
     pub fn sprite_atlas(&self) -> &Arc<MetalAtlas> {
@@ -375,6 +678,26 @@ impl MetalRenderer {
         self.presents_with_transaction = presents_with_transaction;
         if let Some(layer) = &self.layer {
             layer.set_presents_with_transaction(presents_with_transaction);
+        }
+    }
+
+    pub fn set_contents_scale(&mut self, scale_factor: f64) {
+        if let Some(layer) = &self.layer {
+            unsafe {
+                let _: () = msg_send![
+                    layer.as_ref(),
+                    setContentsScale: scale_factor
+                ];
+            }
+        }
+        if let Some(presenter) = &self.core_animation_presenter {
+            presenter.set_contents_scale(scale_factor);
+        }
+    }
+
+    pub fn set_deferred_frame_callback(&mut self, callback: Option<Arc<dyn Fn() + Send + Sync>>) {
+        if let Some(presenter) = &mut self.core_animation_presenter {
+            presenter.set_deferred_frame_callback(callback);
         }
     }
 
@@ -390,6 +713,11 @@ impl MetalRenderer {
                     setDrawableSize: ns_size
                 ];
             }
+        }
+        if let Some(presenter) = &mut self.core_animation_presenter
+            && let Err(error) = presenter.update_drawable_size(&self.device, size)
+        {
+            log::error!("failed to resize CA/IOSurface buffers: {error}");
         }
         self.update_path_intermediate_textures(size);
     }
@@ -437,6 +765,9 @@ impl MetalRenderer {
         if let Some(layer) = &self.layer {
             layer.set_opaque(!transparent);
         }
+        if let Some(presenter) = &self.core_animation_presenter {
+            presenter.set_opaque(!transparent);
+        }
     }
 
     pub fn destroy(&self) {
@@ -444,6 +775,11 @@ impl MetalRenderer {
     }
 
     pub fn draw(&mut self, scene: &Scene) {
+        if self.core_animation_presenter.is_some() {
+            self.draw_chromium_pipeline(scene);
+            return;
+        }
+
         let layer = match &self.layer {
             Some(l) => l.clone(),
             None => {
@@ -497,6 +833,106 @@ impl MetalRenderer {
                         command_buffer.present_drawable(drawable);
                         command_buffer.commit();
                     }
+                    return;
+                }
+                Err(err) => {
+                    log::error!(
+                        "failed to render: {}. retrying with larger instance buffer size",
+                        err
+                    );
+                    let mut instance_buffer_pool = self.instance_buffer_pool.lock();
+                    let buffer_size = instance_buffer_pool.buffer_size;
+                    if buffer_size >= 256 * 1024 * 1024 {
+                        log::error!("instance buffer size grew too large: {}", buffer_size);
+                        break;
+                    }
+                    instance_buffer_pool.reset(buffer_size * 2);
+                    log::info!(
+                        "increased instance buffer size to {}",
+                        instance_buffer_pool.buffer_size
+                    );
+                }
+            }
+        }
+    }
+
+    fn draw_chromium_pipeline(&mut self, scene: &Scene) {
+        let (viewport_size, buffer_index) = {
+            let Some(presenter) = &self.core_animation_presenter else {
+                return;
+            };
+            let viewport_size = presenter.drawable_size;
+            if viewport_size.width.0 <= 0 || viewport_size.height.0 <= 0 {
+                return;
+            }
+
+            let Some(buffer_index) = presenter.next_buffer_index() else {
+                log::debug!(
+                    "skipping frame because the CA/IOSurface presenter has no available buffer"
+                );
+                return;
+            };
+            (viewport_size, buffer_index)
+        };
+
+        loop {
+            let mut instance_buffer = self
+                .instance_buffer_pool
+                .lock()
+                .acquire(&self.device, self.is_unified_memory);
+
+            let command_buffer = {
+                let texture = &self
+                    .core_animation_presenter
+                    .as_ref()
+                    .expect("checked above")
+                    .buffers[buffer_index]
+                    .texture
+                    .clone();
+                self.draw_primitives_to_texture(scene, &mut instance_buffer, texture, viewport_size)
+            };
+
+            match command_buffer {
+                Ok(command_buffer) => {
+                    let instance_buffer_pool = self.instance_buffer_pool.clone();
+                    let presenter = self
+                        .core_animation_presenter
+                        .as_ref()
+                        .expect("checked above");
+                    presenter.mark_buffer_pending(buffer_index);
+
+                    let buffer = &presenter.buffers[buffer_index];
+                    let presented_frame = PresentedIosurfaceFrame {
+                        layer: unsafe {
+                            let retained_layer: id = msg_send![presenter.layer_ptr(), retain];
+                            retained_layer
+                        },
+                        surface: buffer.surface.clone(),
+                        buffer_pending: buffer.pending.clone(),
+                        pending_swap_count: presenter.pending_swap_count.clone(),
+                        current_buffer_index: presenter.current_buffer_index.clone(),
+                        deferred_frame_requested: presenter.deferred_frame_requested.clone(),
+                        deferred_frame_callback: presenter.deferred_frame_callback.clone(),
+                        buffer_index,
+                    };
+                    let instance_buffer = Cell::new(Some(instance_buffer));
+                    let presented_frame = Cell::new(Some(presented_frame));
+                    let block = ConcreteBlock::new(move |_| {
+                        if let Some(instance_buffer) = instance_buffer.take() {
+                            instance_buffer_pool.lock().release(instance_buffer);
+                        }
+
+                        if let Some(presented_frame) = presented_frame.take() {
+                            let context = Box::into_raw(Box::new(presented_frame)) as *mut c_void;
+                            unsafe {
+                                dispatch2::DispatchQueue::main()
+                                    .exec_async_f(context, present_iosurface_frame);
+                            }
+                        }
+                    });
+                    let block = block.copy();
+                    command_buffer.add_completed_handler(&block);
+                    command_buffer.commit();
                     return;
                 }
                 Err(err) => {
