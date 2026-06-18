@@ -168,6 +168,279 @@ close the gap to VS Code.
 
 ---
 
+## Current implementation in this branch
+
+This branch now uses a macOS renderer path that implements the
+Chromium-style resource/presentation model inside Zed's existing single-process
+renderer:
+
+```sh
+cargo run -p zed
+```
+
+The legacy app-owned `CAMetalLayer` path remains available as an escape hatch:
+
+```sh
+ZED_MACOS_LEGACY_METAL_LAYER=1 cargo run -p zed
+```
+
+### What this changes
+
+**Backing layer selection** — `crates/gpui_macos/src/metal_renderer.rs`
+
+- Default path: Chromium-style CoreAnimation layer tree. When CA/IOSurface
+  initialization fails, Zed falls back to the legacy `CAMetalLayer` path.
+- Legacy escape hatch: `ZED_MACOS_LEGACY_METAL_LAYER=1` restores app-driven
+  `CAMetalLayer` `present_drawable`.
+- The Chromium pipeline path creates a Chromium-style CoreAnimation layer tree.
+  When the private API is available, this is a `CAContext` with a root content
+  `CALayer`, exposed to the NSView via a `CALayerHost`. If those runtime
+  interfaces are unavailable, it falls back to the direct local `CALayer`
+  IOSurface path.
+- `window.rs` now asks the renderer for a generic backing layer and routes
+  contents-scale updates through the renderer, so Retina scale handling works
+  for `CAMetalLayer`, direct `CALayer`, and `CALayerHost`.
+
+**IOSurface-backed render targets**
+
+- Allocates a 3-buffer IOSurface queue, matching Chromium's default
+  `SkiaOutputDeviceBufferQueue` resource shape.
+- Each buffer is BGRA and has a Metal render-target texture created directly
+  from the IOSurface via `newTextureWithDescriptor:iosurface:plane:`.
+- Rendering still uses GPUI's existing primitive encoder; the target texture is
+  swapped from a `CAMetalDrawable` texture to an IOSurface-backed Metal texture.
+  There is no CPU readback and no texture copy in the intended path.
+
+**Pending swap cap / backpressure**
+
+- The queue allows at most 2 pending swaps over 3 buffers, matching Chromium's
+  "number of buffers minus one" behavior.
+- If both pending slots are full, the renderer defers the frame instead of
+  taking a third buffer.
+- When a pending IOSurface frame completes GPU work and is handed to the
+  `CALayer`, the renderer asks GPUI for a forced replacement frame if one was
+  deferred.
+- GPUI now has a distinct `SwapCompletionFeedback` platform callback, separate
+  from `PresentationFeedback`. The macOS IOSurface path emits it immediately
+  after the `CALayer.contents` transaction commits, matching Chromium's
+  `DidReceiveSwapBuffersAck()` boundary. GPUI reserves pending platform swap
+  state before calling platform draw, matching Chromium's `DidSwapBuffers()`
+  before `SwapBuffers()` ordering for synchronous-ack safety, and rolls that
+  reservation back when the platform reports `Deferred` or `Skipped`. The ack
+  decrements submitted swaps. `PlatformDrawResult::Deferred` preserves
+  `needs_present` when the IOSurface queue has no available buffer, so a
+  backpressured draw does not masquerade as a completed swap.
+- GPUI now also mirrors Chromium's GPU-busy gate: the macOS IOSurface presenter
+  exposes its max pending swaps (`IOSURFACE_BUFFER_COUNT - 1`), and the
+  scheduler blocks dirty/present work while submitted swaps are at that limit,
+  but it no longer unsubscribes the platform BeginFrame source while blocked.
+  This matches Chromium's split between `SetNeedsBeginFrame` and
+  `SetIsGpuBusy`: the source stays active while GPU-busy, incoming BeginFrames
+  are throttled, and GPU availability replays the stored pending BeginFrame.
+  This gate is checked both when a BeginFrame arrives and when a delayed
+  regular/scroll deadline actually fires, matching Chromium's
+  `AttemptDrawAndSwap()` check before `DrawAndSwap()`. A swap ack lowers the
+  pending count, re-evaluates BeginFrame subscription, and if it clears a
+  backpressured state with work still pending, GPUI replays the exact
+  `RequestFrameOptions` that were blocked by GPU-busy backpressure. This mirrors
+  Chromium's `pending_begin_frame_args_` / `OnGpuNoLongerBusy()` path after
+  `DidReceiveSwapBuffersAck()`.
+- Important runtime finding: do **not** use `IOSurfaceIsInUse` as the hot-path
+  reuse gate in this local process. Without Chromium's full CA/viz presentation
+  feedback, that check can report surfaces unavailable long after the local
+  renderer can safely rotate to them, starving the 3-buffer queue and producing
+  visibly low FPS/choppy presentation. This path now relies on its local
+  pending/current-buffer tracking instead.
+
+**Buffer damage tracking**
+
+- The IOSurface queue now tracks accumulated damage per buffer, matching
+  Chromium's `BufferQueue` invariant: a buffer starts fully damaged, new frame
+  damage is unioned into every non-current buffer, the selected buffer exposes
+  its accumulated damage for the draw, and that damage is cleared once the swap
+  is queued.
+- The Metal pass is ready for partial damage: full damage keeps the previous
+  clear-and-redraw behavior, while non-full damage loads existing IOSurface
+  contents and applies a Metal scissor rect for the damaged area.
+- `Scene` now carries a damage region. Global refreshes and uncertain view
+  invalidations remain conservative/full-frame, but cached dirty views damage
+  the union of their previous clipped bounds and current clipped bounds.
+  Newly painted primitives also contribute their clipped primitive bounds to
+  scene damage. Cached paint replay suppresses primitive damage so reused
+  content does not spuriously dirty the frame. The macOS IOSurface path encloses
+  fractional scaled-pixel damage with floor-origin/ceil-max device-pixel bounds
+  before feeding the presenter, so partial redraw scissoring never under-covers
+  changed content at Retina scale boundaries.
+
+**Presentation handoff**
+
+- GPU completion dispatches back to the main queue.
+- The completed IOSurface is assigned to the content layer's
+  `CALayer.contents`. In the CAContext path, that content layer is the root
+  layer attached to the `CAContext`; the NSView displays it through
+  `CALayerHost.contextId`, matching Chromium's remote-layer topology.
+- The IOSurface handoff now checks the completed Metal command buffer status
+  before touching CoreAnimation. Failed GPU work produces failed swap and
+  presentation feedback, releases backpressure, and requests a replacement
+  forced frame instead of latching a stale or partially rendered IOSurface.
+- When the drawable size changes, the CAContext/CALayerHost path now marks the
+  context as resized and recreates the CAContext immediately before the next
+  IOSurface frame handoff. This mirrors Chromium's resize-time CAContext
+  replacement so the new-size frame and host context id update are committed
+  together. When the private fence-port selectors are available, the old
+  CAContext now creates and installs a fence mach port before replacement, and
+  Zed retains a small queue of recent ports using Chromium's default cap of
+  four. Unlike Chromium's browser/GPU split, the port is retained locally rather
+  than sent across a process boundary to a browser-side `DisplayCALayerTree`.
+- Resize no longer resets the IOSurface pending-swap count while older GPU
+  completions may still be in flight. The presenter now generations each
+  IOSurface queue allocation; stale pre-resize completions still acknowledge
+  their swap so GPUI backpressure clears, but they do not update the current
+  buffer index or overwrite the resized layer contents.
+- The contents swap is wrapped in a `CATransaction` with actions disabled so
+  CoreAnimation does not implicitly animate or otherwise delay the frame update.
+- This moves Zed off the app-owned `CAMetalLayer` drawable queue in the
+  Chromium pipeline path, which is the key Chromium-vs-Zed gap identified above.
+
+**Scheduler-visible presentation feedback**
+
+- GPUI now has a `PresentationFeedback` platform callback with Chromium-like
+  fields: `ready_time`, `latch_time`, `display_time`, `interval`, `presented`,
+  `vsync`, and `hardware_completion`.
+- The macOS renderer reports feedback from both paths:
+  - legacy `CAMetalLayer`: via `MTLDrawable.addPresentedHandler`, converting
+    the drawable's CoreAnimation `presentedTime` into `scheduler::Instant`;
+  - Chromium pipeline `CALayer`/IOSurface path: records GPU-ready time when the
+    Metal command buffer completes, uses the main-thread `CALayer.contents`
+    transaction as latch time, and estimates display time from the latest
+    display-link target timestamp using Chromium's 1.5 ms latch-buffer model.
+- The IOSurface path now preserves Chromium's callback ordering at the local
+  CA layer-tree commit point: swap completion is delivered first, then
+  presentation feedback is delivered with ready/latch/display timestamps. This
+  matches Chromium's `CALayerTreeCoordinator::CommitPresentedFrameToCA()`
+  boundary, where `SwapCompletionCallback` runs after the CALayer tree is
+  committed. Holding GPUI backpressure until a later `CATransaction` completion
+  block produced visibly choppy pacing because the two-pending-swap gate could
+  remain closed after the layer contents had already been committed.
+- When the private macOS `+[CATransaction addCommitHandler:forPhase:]` API is
+  present, the local IOSurface path now uses the post-commit phase for the
+  swap/presentation callbacks. This mirrors Chromium's
+  `CATransactionCoordinator` post-commit timing. The implementation keeps an
+  immediate fallback after `CATransaction::commit` if the private handler is not
+  available or does not consume the frame during commit, so a private-API miss
+  cannot leave the IOSurface queue permanently backpressured.
+- GPUI frame pacing now switches `last_frame_time` from frame-callback start
+  time to presentation feedback time once feedback starts arriving. This is the
+  first scheduler-level replacement for Zed's old "draw submitted means frame
+  complete" model.
+
+**BeginFrame input and lifecycle**
+
+- `RequestFrameOptions` now carries a Chromium-shaped `BeginFrameArgs` object:
+  `source_id`, `sequence_number`, `frame_time`, `deadline`, `interval`, and a
+  `missed` bit. The older `predicted_display_time`, `frame_interval`, and
+  `frame_deadline` fields remain during the transition.
+- The macOS `DisplayLink` wrapper preserves the `CVDisplayLink` `output_time`
+  host timestamp, converts it to GPUI's `scheduler::Instant`, assigns a
+  per-display source id and monotonically increasing sequence number, and
+  passes that through `step()` as the current BeginFrame.
+- GPUI tracks the current BeginFrame id and suppresses duplicate draw attempts
+  for the same BeginFrame. This adds the first real scheduler lifecycle rule
+  from Chromium's `SchedulerStateMachine`: one draw per BeginImplFrame.
+- The macOS BeginFrame source keeps its sequence number monotonic across
+  demand-driven `CVDisplayLink` stop/start cycles. This is required because the
+  source id is the display id; if each recreated `CVDisplayLink` starts at
+  sequence zero, GPUI sees new ticks as duplicate/older BeginFrames and blocks
+  them, producing visibly choppy low-FPS presentation.
+- The macOS BeginFrame source now keeps the `CVDisplayLink` object allocated
+  while idle and toggles `CVDisplayLinkStart`/`CVDisplayLinkStop`, recreating it
+  only when the window moves to another display. This matches Chromium's
+  `CADisplayLink` lifecycle shape more closely (`paused`/`enabled` instead of
+  destroy/recreate), preserves source continuity, and avoids repeatedly hitting
+  the existing `DisplayLink::Drop` leak workaround during normal frame-idle
+  transitions.
+- GPUI filters older BeginFrames before they can replace the current scheduler
+  state, matching Chromium's `BeginFrameSource` continuity rule that observers
+  should only see forward-moving frame times/sequences. This matters when an
+  async missed BeginFrame races a normal display-link tick.
+- If a newer BeginFrame arrives before a previously scheduled regular/scroll
+  deadline fires, GPUI now synchronously flushes the previous deadline before
+  accepting the newer BeginFrame. This mirrors Chromium's
+  `OnBeginFrameContinuation()` behavior, where the old
+  `OnBeginFrameDeadline()` runs before `current_begin_frame_args_` is advanced.
+- macOS now retains the latest display-link timing when the BeginFrame source
+  goes idle. When frame production is re-enabled after at least one display
+  interval has elapsed, it posts an immediate missed BeginFrame using an
+  advanced sequence number and `missed = true`, mirroring Chromium's
+  `BeginFrameSource::AddObserver()` missed-frame delivery without duplicating
+  the last normal BeginFrame.
+- GPUI now subtracts a moving draw-duration estimate plus a 1 ms fudge factor
+  from the BeginFrame display deadline to produce a draw-start deadline,
+  mirroring Chromium's adjusted deadline behavior. It records whether the draw
+  missed the original presentation deadline, keeping the "when should drawing
+  start?" and "did this frame miss vsync?" decisions separate.
+- GPUI also implements a first WAIT_FOR_SCROLL-style deadline mode. During
+  active scroll input, if no scroll event has arrived for the current
+  BeginFrame, a dirty draw is delayed until `frame_time + interval / 3`,
+  matching Chromium's default `scroll_deadline_ratio`. If scroll input arrives
+  before then, the delayed draw still uses the same BeginFrame id and the
+  one-draw-per-frame guard remains in effect.
+- GPUI now routes BeginFrame production through explicit deadline-mode state:
+  `NONE`, `BLOCKED`, `IMMEDIATE`, `REGULAR`, `LATE`, and `WAIT_FOR_SCROLL`.
+  `REGULAR` dirty frames schedule at the adjusted draw deadline, `IMMEDIATE`
+  handles forced or previously-missed frames, `LATE` covers presentation without
+  redraw, and `BLOCKED` covers duplicate draw attempts for the same BeginFrame.
+- GPUI uses the BeginFrame deadline/frame time as its fallback frame time until
+  real presentation feedback arrives. This moves frame pacing closer to
+  Chromium's model, where frame production is tied to an intended display
+  deadline rather than merely "the main queue woke up."
+- GPUI now has an explicit platform `set_needs_begin_frame` subscription hook.
+  Dirty windows, pending `on_next_frame` callbacks, pending presentation, and
+  sustained high-rate input subscribe to BeginFrames; `complete_frame()` drops
+  the subscription once there is no remaining work. On macOS this starts/stops
+  `CVDisplayLink` instead of running it continuously just because the window is
+  visible. Visibility changes, display changes, activation, and AppKit
+  `displayLayer:` callbacks now reapply that subscription state rather than
+  forcing the display link on unconditionally.
+- Runtime finding from the first built app: dropping the BeginFrame source
+  immediately after each input-driven frame made editing feel low-FPS/choppy,
+  because bursty invalidations had to restart `CVDisplayLink` one tick at a
+  time. GPUI now keeps the BeginFrame source warm briefly after input that
+  actually dirties the window, without forcing redraws, so the next invalidation
+  has fresh display timing available.
+
+### What this still is not
+
+This is not a full Chromium architecture clone. It does **not** add:
+
+- A separate GPU process.
+- A browser-process/GPU-process split. The branch now uses
+  `CAContext`/`CALayerHost` when available, but both sides still live in Zed's
+  process.
+- Full viz `BeginFrame` scheduling. Zed now carries BeginFrame ids, frame time,
+  interval, adjusted deadline, one-draw-per-frame enforcement,
+  missed-deadline state, explicit deadline-mode outputs, platform BeginFrame
+  subscription control, swap-ack backpressure, and a Chromium-style GPU-busy
+  gate for the IOSurface queue, but does not yet have Chromium's full
+  BeginFrame observer graph or scheduler state machine.
+- Remote/cross-process CoreAnimation feedback. The local `CALayer`/IOSurface
+  path now reports Chromium-shaped ready/latch/display feedback, but it is still
+  estimated from local Metal completion, CAContext/CALayer handoff, and
+  display-link timing rather than coming from a browser-process handoff.
+- Complete GPUI damage-region submission. The IOSurface presenter now has
+  Chromium-style per-buffer damage accumulation and a partial-damage render-pass
+  path. GPUI feeds precise old/new clipped bounds for cached dirty views and
+  clipped primitive bounds for newly painted content, while cached paint replay
+  stays damage-free. Global refreshes and invalidations without reliable
+  previous bounds still intentionally submit full-frame damage.
+
+The important practical point: the resource handoff and the scheduler feedback
+surface now both exist. The remaining work is tightening timestamp quality and
+aligning frame production with that feedback, not just swapping the present
+resource.
+
+---
+
 ## Where the latency lives (revised picture)
 
 | Stage | Zed | Chromium/VS Code |
@@ -181,31 +454,65 @@ The extra frame(s) in Zed live in: (1) the app-driven swap queue, and (2)
 the decoupling of "input landed" from "next frame incorporates it" via the
 display-link-tick + dispatch hop.
 
+In the current branch, item (1) is replaced by a CALayer/IOSurface handoff by
+default. Item (2) is partially addressed by both
+`PresentationFeedback` and BeginFrame timing: GPUI now consumes renderer
+feedback for frame pacing, carries the display link's intended output time,
+refresh interval, frame deadline, and BeginFrame id through the request-frame
+callback, prevents duplicate draws for a single BeginFrame, and subscribes the
+platform BeginFrame source only while frame production is needed. It still does
+not have Chromium's full `BeginFrame` scheduler.
+
 ---
 
 ## Open questions / next steps
 
-- **Measure.** Run `typometer` on patched Zed vs VS Code at 60Hz + LPM.
-  A number beats every theory; attach to #26900.
-- **Drawable-count A/B.** Local one-line patch `metal_renderer.rs:161`
-  (`3` → `2`), debug build, measure. Expect a small win, not parity —
-  validates the "not the parity lever" claim with data.
-- **Input coupling.** Trace `cx.notify()` → frame-request in
-  `crates/gpui/src/window.rs` / the scheduler to see whether input arrival
-  is already on the critical path to the next frame, or whether there's an
-  explicit vsync wait that's the real culprit.
-- **Optional: pull `cc/scheduler` (BeginFrame) + `viz/`** from the Chromium
-  reference to ground the input-coupling side as firmly as the present side
-  is now.
+- **Measure the default Chromium-style path.** Run `typometer` on:
+  1. patched/default Zed,
+  2. `ZED_MACOS_LEGACY_METAL_LAYER=1` Zed,
+  3. VS Code.
+  Run at 60Hz + LPM if possible. This is the test that determines whether the
+  present-resource model plus BeginFrame scheduler work is enough to explain
+  the gap.
+- **Runtime QA.** Exercise resize, fullscreen, tabbing, activation, multiple
+  windows, transparent titlebar, and moving between displays with different
+  scale factors. Those are the highest-risk CALayer integration edges.
+- **Presentation feedback accuracy.** The legacy `CAMetalLayer` path now uses
+  `MTLDrawable.presentedTime`, and the CAContext/CALayerHost IOSurface path now
+  reports ready/latch/display/interval feedback using Chromium's display-link
+  latch estimate. The remaining gap is cross-process feedback semantics, not
+  simply adding a callback field.
+- **BeginFrame alignment.** GPUI now has BeginFrame ids, one-draw-per-frame
+  tracking, adjusted draw deadlines, missed-deadline state, a
+  WAIT_FOR_SCROLL-style scroll deadline, and demand-driven platform BeginFrame
+  subscription. It now routes frame production through explicit `NONE` /
+  `BLOCKED` / `IMMEDIATE` / `REGULAR` / `LATE` / `WAIT_FOR_SCROLL` modes, but
+  still needs Chromium-style observer orchestration and richer scheduler state.
+- **Damage regions.** The IOSurface queue now carries Chromium-style per-buffer
+  accumulated damage and the Metal pass can load/scissor for partial redraws.
+  GPUI now submits precise old/new clipped bounds for cached dirty views and
+  primitive bounds for newly painted content, while suppressing damage from
+  cached paint replay. The remaining work is reducing conservative full-frame
+  fallbacks where no previous bounds are available.
+- **Process split.** Chromium uses CAContext/CALayerHost across its GPU/browser
+  process boundary. Zed now has the layer topology locally; a true process split
+  would be a much larger platform architecture change.
 
 ---
 
 ## Key references
 
 **Zed (this repo):**
-- `crates/gpui_macos/src/metal_renderer.rs:161` — `set_maximum_drawable_count(3)`
-- `crates/gpui_macos/src/metal_renderer.rs:461, 491-498` — drawable acquire + present path
+- `crates/gpui_macos/src/metal_renderer.rs` — default Chromium-style CA/IOSurface path and legacy `ZED_MACOS_LEGACY_METAL_LAYER` fallback
+- `crates/gpui_macos/src/remote_layer.rs` — local CAContext/CALayerHost layer tree with direct-CALayer fallback
+- `crates/gpui_macos/src/metal_renderer.rs` — IOSurface allocation, IOSurface-backed Metal textures, 3-buffer/2-pending queue, per-buffer damage accumulation
+- `crates/gpui/src/scene.rs`, `crates/gpui/src/view.rs`, and
+  `crates/gpui/src/window.rs` — scene damage transport and cached-view damage
+  source
+- `crates/gpui_macos/src/window.rs` — generic backing-layer hook and deferred-frame retry callback
 - `crates/gpui_macos/src/display_link.rs` — `CVDisplayLink` → dispatch_source
+- `crates/gpui/src/window.rs` and `crates/gpui_macos/src/window.rs` —
+  demand-driven BeginFrame subscription via `set_needs_begin_frame`
 - `crates/gpui_macos/src/window.rs:2648` — `step()` frame callback
 - `crates/gpui_macos/src/window.rs:2528-2531, 2636-2645` — transient `presents_with_transaction`
 - `crates/zed/resources/zed.entitlements` — entitlements used by the patch script

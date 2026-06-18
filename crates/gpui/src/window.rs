@@ -1031,6 +1031,10 @@ pub struct Window {
     active: Rc<Cell<bool>>,
     hovered: Rc<Cell<bool>>,
     pub(crate) needs_present: Rc<Cell<bool>>,
+    uses_platform_swap_completion: bool,
+    max_pending_platform_swaps: Option<u32>,
+    pending_platform_swaps: u32,
+    pending_gpu_available_frame: Option<crate::RequestFrameOptions>,
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
     /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
     pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
@@ -1069,6 +1073,11 @@ pub(crate) struct InputRateTracker {
     inputs_per_second: u32,
     sustain_until: Instant,
     sustain_duration: Duration,
+    last_scroll_input_at: Option<Instant>,
+    scroll_sustain_until: Instant,
+    scroll_sustain_duration: Duration,
+    frame_source_sustain_until: Instant,
+    frame_source_sustain_duration: Duration,
 }
 
 impl Default for InputRateTracker {
@@ -1079,6 +1088,11 @@ impl Default for InputRateTracker {
             inputs_per_second: 60,
             sustain_until: Instant::now(),
             sustain_duration: Duration::from_secs(1),
+            last_scroll_input_at: None,
+            scroll_sustain_until: Instant::now(),
+            scroll_sustain_duration: Duration::from_millis(250),
+            frame_source_sustain_until: Instant::now(),
+            frame_source_sustain_duration: Duration::from_millis(250),
         }
     }
 }
@@ -1088,6 +1102,7 @@ impl InputRateTracker {
         let now = Instant::now();
         self.timestamps.push(now);
         self.prune_old_timestamps(now);
+        self.frame_source_sustain_until = now + self.frame_source_sustain_duration;
 
         let min_events = self.inputs_per_second as u128 * self.window.as_millis() / 1000;
         if self.timestamps.len() as u128 >= min_events {
@@ -1099,10 +1114,104 @@ impl InputRateTracker {
         Instant::now() < self.sustain_until
     }
 
+    pub fn should_keep_frame_source_active(&self) -> bool {
+        Instant::now() < self.frame_source_sustain_until
+    }
+
+    pub fn record_scroll_input(&mut self) {
+        let now = Instant::now();
+        self.last_scroll_input_at = Some(now);
+        self.scroll_sustain_until = now + self.scroll_sustain_duration;
+    }
+
+    pub fn should_wait_for_scroll(&self, begin_frame: crate::BeginFrameArgs) -> bool {
+        Instant::now() < self.scroll_sustain_until
+            && self
+                .last_scroll_input_at
+                .is_some_and(|last_scroll_input_at| last_scroll_input_at < begin_frame.frame_time)
+    }
+
     fn prune_old_timestamps(&mut self, now: Instant) {
         self.timestamps
             .retain(|&t| now.duration_since(t) <= self.window);
     }
+}
+
+fn duration_div(duration: Duration, divisor: u32) -> Duration {
+    Duration::from_nanos(
+        (duration.as_nanos() / u128::from(divisor)).min(u128::from(u64::MAX)) as u64,
+    )
+}
+
+fn update_draw_duration_estimate(draw_duration_estimate: &Cell<Duration>, draw_duration: Duration) {
+    let previous_estimate = draw_duration_estimate.get();
+    let estimated_nanos = (previous_estimate.as_nanos() * 7 + draw_duration.as_nanos()) / 8;
+    draw_duration_estimate.set(Duration::from_nanos(
+        estimated_nanos.min(u128::from(u64::MAX)) as u64,
+    ));
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BeginFrameDeadlineMode {
+    None,
+    Blocked,
+    Immediate,
+    Regular,
+    Late,
+    WaitForScroll,
+}
+
+fn begin_frame_deadline_mode(
+    begin_frame: Option<crate::BeginFrameArgs>,
+    should_draw: bool,
+    force_render: bool,
+    needs_present: bool,
+    active: bool,
+    deadline_was_missed: bool,
+    swap_backpressured: bool,
+    should_wait_for_scroll: bool,
+    draw_already_performed: bool,
+) -> BeginFrameDeadlineMode {
+    if begin_frame.is_none() {
+        return BeginFrameDeadlineMode::None;
+    }
+
+    if should_draw && draw_already_performed {
+        return BeginFrameDeadlineMode::Blocked;
+    }
+
+    if swap_backpressured && (should_draw || needs_present) {
+        return BeginFrameDeadlineMode::Blocked;
+    }
+
+    if !should_draw {
+        return if needs_present {
+            BeginFrameDeadlineMode::Late
+        } else {
+            BeginFrameDeadlineMode::None
+        };
+    }
+
+    if force_render || deadline_was_missed {
+        return BeginFrameDeadlineMode::Immediate;
+    }
+
+    if active && should_wait_for_scroll {
+        return BeginFrameDeadlineMode::WaitForScroll;
+    }
+
+    BeginFrameDeadlineMode::Regular
+}
+
+fn begin_frame_is_older(
+    current: Option<crate::BeginFrameArgs>,
+    incoming: crate::BeginFrameArgs,
+) -> bool {
+    current.is_some_and(|current| {
+        incoming.frame_time < current.frame_time
+            || (incoming.id.source_id == current.id.source_id
+                && incoming.id.sequence_number < current.id.sequence_number)
+    })
 }
 
 /// A point-in-time snapshot of the input-latency histograms for a window,
@@ -1345,10 +1454,52 @@ impl Window {
         let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
         let input_rate_tracker = Rc::new(RefCell::new(InputRateTracker::default()));
         let last_frame_time = Rc::new(Cell::new(None));
+        let has_presentation_feedback = Rc::new(Cell::new(false));
+        let current_begin_frame_id = Rc::new(Cell::new(None::<crate::BeginFrameId>));
+        let current_begin_frame_args = Rc::new(Cell::new(None::<crate::BeginFrameArgs>));
+        let drew_current_begin_frame = Rc::new(Cell::new(false));
+        let scheduled_begin_frame_deadline_id = Rc::new(Cell::new(None::<crate::BeginFrameId>));
+        let scheduled_begin_frame_options = Rc::new(Cell::new(None::<crate::RequestFrameOptions>));
+        let main_thread_missed_last_deadline = Rc::new(Cell::new(false));
+        let draw_duration_estimate = Rc::new(Cell::new(Duration::from_micros(1000)));
 
         platform_window
             .request_decorations(window_decorations.unwrap_or(WindowDecorations::Server));
         platform_window.set_background_appearance(window_background);
+        let uses_platform_swap_completion = platform_window.supports_swap_completion_feedback();
+        let max_pending_platform_swaps = platform_window.max_pending_swaps();
+        if uses_platform_swap_completion {
+            platform_window.on_swap_completion(Box::new({
+                let mut cx = cx.to_async();
+                move |_feedback| {
+                    handle
+                        .update(&mut cx, |_, window, _| {
+                            let was_backpressured = window.platform_swap_backpressured();
+                            window.pending_platform_swaps =
+                                window.pending_platform_swaps.saturating_sub(1);
+                            window.update_begin_frame_subscription();
+                            if was_backpressured && window.has_frame_work() {
+                                if let Some(options) = window.pending_gpu_available_frame.take() {
+                                    window.platform_window.request_frame(options);
+                                } else {
+                                    window.platform_window.request_begin_frame();
+                                }
+                            }
+                        })
+                        .log_err();
+                }
+            }));
+        }
+        platform_window.on_presentation_feedback(Box::new({
+            let last_frame_time = last_frame_time.clone();
+            let has_presentation_feedback = has_presentation_feedback.clone();
+            move |feedback| {
+                if feedback.presented {
+                    has_presentation_feedback.set(true);
+                    last_frame_time.set(Some(feedback.display_time));
+                }
+            }
+        }));
 
         match window_bounds {
             WindowBounds::Fullscreen(_) => platform_window.toggle_fullscreen(),
@@ -1453,31 +1604,149 @@ impl Window {
             let needs_present = needs_present.clone();
             let next_frame_callbacks = next_frame_callbacks.clone();
             let input_rate_tracker = input_rate_tracker.clone();
+            let has_presentation_feedback = has_presentation_feedback.clone();
+            let current_begin_frame_id = current_begin_frame_id.clone();
+            let current_begin_frame_args = current_begin_frame_args.clone();
+            let drew_current_begin_frame = drew_current_begin_frame.clone();
+            let scheduled_begin_frame_deadline_id = scheduled_begin_frame_deadline_id.clone();
+            let scheduled_begin_frame_options = scheduled_begin_frame_options.clone();
+            let main_thread_missed_last_deadline = main_thread_missed_last_deadline.clone();
+            let draw_duration_estimate = draw_duration_estimate.clone();
             move |request_frame_options| {
+                if let Some(begin_frame) = request_frame_options.begin_frame {
+                    if begin_frame_is_older(current_begin_frame_args.get(), begin_frame) {
+                        handle
+                            .update(&mut cx, |_, window, _| window.complete_frame())
+                            .log_err();
+                        return;
+                    }
+
+                    if current_begin_frame_id.get() != Some(begin_frame.id) {
+                        if scheduled_begin_frame_deadline_id.get().is_some()
+                            && !drew_current_begin_frame.get()
+                        {
+                            if let Some(scheduled_options) = scheduled_begin_frame_options.get() {
+                                let swap_backpressured = handle
+                                    .update(&mut cx, |_, window, _| {
+                                        window.platform_swap_backpressured()
+                                    })
+                                    .unwrap_or(false);
+                                if swap_backpressured {
+                                    handle
+                                        .update(&mut cx, |_, window, _| {
+                                            window.pending_gpu_available_frame =
+                                                Some(scheduled_options);
+                                            window.complete_frame();
+                                        })
+                                        .log_err();
+                                } else if invalidator.is_dirty() || scheduled_options.force_render {
+                                    let scheduled_presentation_deadline = scheduled_options
+                                        .begin_frame
+                                        .map(|begin_frame| begin_frame.deadline)
+                                        .or(scheduled_options.frame_deadline);
+                                    let draw_started_at = Instant::now();
+                                    measure("frame duration", || {
+                                        handle
+                                            .update(&mut cx, |_, window, cx| {
+                                                if scheduled_options.force_render {
+                                                    window.refresh();
+                                                }
+                                                let arena_clear_needed = window.draw(cx);
+                                                window.present();
+                                                arena_clear_needed.clear();
+                                            })
+                                            .log_err();
+                                    });
+                                    let draw_finished_at = Instant::now();
+                                    let draw_duration =
+                                        draw_finished_at.saturating_duration_since(draw_started_at);
+                                    update_draw_duration_estimate(
+                                        &draw_duration_estimate,
+                                        draw_duration,
+                                    );
+                                    drew_current_begin_frame.set(true);
+                                    if let Some(presentation_deadline) =
+                                        scheduled_presentation_deadline
+                                    {
+                                        main_thread_missed_last_deadline
+                                            .set(draw_finished_at > presentation_deadline);
+                                    }
+                                    handle
+                                        .update(&mut cx, |_, window, _| window.complete_frame())
+                                        .log_err();
+                                } else {
+                                    main_thread_missed_last_deadline.set(false);
+                                    handle
+                                        .update(&mut cx, |_, window, _| window.complete_frame())
+                                        .log_err();
+                                }
+                            } else {
+                                main_thread_missed_last_deadline.set(true);
+                            }
+                        }
+                        current_begin_frame_id.set(Some(begin_frame.id));
+                        current_begin_frame_args.set(Some(begin_frame));
+                        drew_current_begin_frame.set(false);
+                        scheduled_begin_frame_deadline_id.set(None);
+                        scheduled_begin_frame_options.set(None);
+                    }
+                }
+
                 let thermal_state = handle
                     .update(&mut cx, |_, _, cx| cx.thermal_state())
                     .log_err();
+                let frame_interval = request_frame_options
+                    .begin_frame
+                    .map(|begin_frame| begin_frame.interval)
+                    .or(request_frame_options.frame_interval)
+                    .unwrap_or(Duration::from_micros(16667));
+
+                let presentation_deadline = request_frame_options
+                    .begin_frame
+                    .map(|begin_frame| begin_frame.deadline)
+                    .or(request_frame_options.frame_deadline);
+                let draw_start_deadline = request_frame_options
+                    .begin_frame
+                    .map(|begin_frame| {
+                        let deadline_padding =
+                            draw_duration_estimate.get() + Duration::from_micros(1000);
+                        begin_frame
+                            .deadline
+                            .checked_sub(deadline_padding)
+                            .unwrap_or(begin_frame.deadline)
+                    })
+                    .or(request_frame_options.frame_deadline);
+                let predicted_display_time = request_frame_options
+                    .begin_frame
+                    .map(|begin_frame| begin_frame.deadline)
+                    .or(request_frame_options.predicted_display_time);
 
                 // Throttle frame rate based on conditions:
                 // - Thermal pressure (Serious/Critical): cap to ~60fps
                 // - Inactive window (not focused): cap to ~30fps to save energy
-                let min_frame_interval = if !request_frame_options.force_render
+                let deadline_was_missed = main_thread_missed_last_deadline.get();
+                let min_frame_interval = if deadline_was_missed {
+                    None
+                } else if !request_frame_options.force_render
                     && !request_frame_options.require_presentation
                     && next_frame_callbacks.borrow().is_empty()
                 {
                     None
                 } else if !active.get() {
-                    Some(Duration::from_micros(33333))
+                    Some(frame_interval.max(Duration::from_micros(33333)))
                 } else if let Some(ThermalState::Critical | ThermalState::Serious) = thermal_state {
-                    Some(Duration::from_micros(16667))
+                    Some(frame_interval.max(Duration::from_micros(16667)))
                 } else {
                     None
                 };
 
                 let now = Instant::now();
+                let frame_time = presentation_deadline
+                    .or(predicted_display_time)
+                    .unwrap_or(now);
                 if let Some(min_interval) = min_frame_interval {
                     if let Some(last_frame) = last_frame_time.get()
-                        && now.duration_since(last_frame) < min_interval
+                        && frame_time.saturating_duration_since(last_frame) < min_interval
                     {
                         // Must still complete the frame on platforms that require it.
                         // On Wayland, `surface.frame()` was already called to request the
@@ -1489,7 +1758,9 @@ impl Window {
                         return;
                     }
                 }
-                last_frame_time.set(Some(now));
+                if !has_presentation_feedback.get() {
+                    last_frame_time.set(Some(frame_time));
+                }
 
                 let next_frame_callbacks = next_frame_callbacks.take();
                 if !next_frame_callbacks.is_empty() {
@@ -1509,7 +1780,148 @@ impl Window {
                     || needs_present.get()
                     || (active.get() && input_rate_tracker.borrow_mut().is_high_rate());
 
-                if invalidator.is_dirty() || request_frame_options.force_render {
+                let should_draw = invalidator.is_dirty() || request_frame_options.force_render;
+                let swap_backpressured = handle
+                    .update(&mut cx, |_, window, _| window.platform_swap_backpressured())
+                    .unwrap_or(false);
+                let should_wait_for_scroll =
+                    request_frame_options
+                        .begin_frame
+                        .is_some_and(|begin_frame| {
+                            input_rate_tracker
+                                .borrow()
+                                .should_wait_for_scroll(begin_frame)
+                        });
+                let deadline_mode = begin_frame_deadline_mode(
+                    request_frame_options.begin_frame,
+                    should_draw,
+                    request_frame_options.force_render,
+                    needs_present,
+                    active.get(),
+                    deadline_was_missed,
+                    swap_backpressured,
+                    should_wait_for_scroll,
+                    drew_current_begin_frame.get(),
+                );
+                if deadline_mode == BeginFrameDeadlineMode::Blocked {
+                    handle
+                        .update(&mut cx, |_, window, _| {
+                            if swap_backpressured {
+                                window.pending_gpu_available_frame = Some(request_frame_options);
+                            }
+                            window.complete_frame();
+                        })
+                        .log_err();
+                    return;
+                }
+                if !swap_backpressured {
+                    handle
+                        .update(&mut cx, |_, window, _| {
+                            window.pending_gpu_available_frame = None;
+                        })
+                        .log_err();
+                }
+
+                if let Some(begin_frame) = request_frame_options.begin_frame {
+                    let scheduled_deadline = match deadline_mode {
+                        BeginFrameDeadlineMode::WaitForScroll => {
+                            Some(begin_frame.frame_time + duration_div(begin_frame.interval, 3))
+                        }
+                        BeginFrameDeadlineMode::Regular => draw_start_deadline,
+                        BeginFrameDeadlineMode::None
+                        | BeginFrameDeadlineMode::Blocked
+                        | BeginFrameDeadlineMode::Immediate
+                        | BeginFrameDeadlineMode::Late => None,
+                    };
+
+                    if let Some(scheduled_deadline) = scheduled_deadline
+                        && now < scheduled_deadline
+                    {
+                        if scheduled_begin_frame_deadline_id.get() == Some(begin_frame.id) {
+                            return;
+                        }
+
+                        scheduled_begin_frame_deadline_id.set(Some(begin_frame.id));
+                        scheduled_begin_frame_options.set(Some(request_frame_options));
+                        let delay = scheduled_deadline.saturating_duration_since(now);
+                        let mut cx = cx.clone();
+                        let handle = handle;
+                        let invalidator = invalidator.clone();
+                        let current_begin_frame_id = current_begin_frame_id.clone();
+                        let drew_current_begin_frame = drew_current_begin_frame.clone();
+                        let scheduled_begin_frame_deadline_id =
+                            scheduled_begin_frame_deadline_id.clone();
+                        let scheduled_begin_frame_options = scheduled_begin_frame_options.clone();
+                        let draw_duration_estimate = draw_duration_estimate.clone();
+                        let main_thread_missed_last_deadline =
+                            main_thread_missed_last_deadline.clone();
+                        cx.spawn(async move |cx| {
+                            cx.background_executor().timer(delay).await;
+                            scheduled_begin_frame_deadline_id.set(None);
+                            scheduled_begin_frame_options.set(None);
+                            if current_begin_frame_id.get() != Some(begin_frame.id)
+                                || drew_current_begin_frame.get()
+                            {
+                                return;
+                            }
+
+                            let swap_backpressured = handle
+                                .update(cx, |_, window, _| window.platform_swap_backpressured())
+                                .unwrap_or(false);
+                            if swap_backpressured {
+                                handle
+                                    .update(cx, |_, window, _| {
+                                        window.pending_gpu_available_frame =
+                                            Some(request_frame_options);
+                                        window.complete_frame();
+                                    })
+                                    .log_err();
+                                return;
+                            }
+
+                            if invalidator.is_dirty() || request_frame_options.force_render {
+                                let draw_started_at = Instant::now();
+                                measure("frame duration", || {
+                                    handle
+                                        .update(cx, |_, window, cx| {
+                                            if request_frame_options.force_render {
+                                                window.refresh();
+                                            }
+                                            let arena_clear_needed = window.draw(cx);
+                                            window.present();
+                                            arena_clear_needed.clear();
+                                        })
+                                        .log_err();
+                                });
+                                let draw_finished_at = Instant::now();
+                                let draw_duration =
+                                    draw_finished_at.saturating_duration_since(draw_started_at);
+                                update_draw_duration_estimate(
+                                    &draw_duration_estimate,
+                                    draw_duration,
+                                );
+                                drew_current_begin_frame.set(true);
+                                if let Some(presentation_deadline) = presentation_deadline {
+                                    main_thread_missed_last_deadline
+                                        .set(draw_finished_at > presentation_deadline);
+                                }
+                            } else {
+                                main_thread_missed_last_deadline.set(false);
+                            }
+
+                            handle
+                                .update(cx, |_, window, _| {
+                                    window.complete_frame();
+                                })
+                                .log_err();
+                        })
+                        .detach();
+                        return;
+                    }
+                }
+
+                if should_draw {
+                    let draw_started_at = Instant::now();
                     measure("frame duration", || {
                         handle
                             .update(&mut cx, |_, window, cx| {
@@ -1523,11 +1935,27 @@ impl Window {
                                 arena_clear_needed.clear();
                             })
                             .log_err();
-                    })
+                    });
+                    if request_frame_options.begin_frame.is_some() {
+                        let draw_finished_at = Instant::now();
+                        let draw_duration =
+                            draw_finished_at.saturating_duration_since(draw_started_at);
+                        update_draw_duration_estimate(&draw_duration_estimate, draw_duration);
+                        drew_current_begin_frame.set(true);
+                        if let Some(presentation_deadline) = presentation_deadline {
+                            main_thread_missed_last_deadline
+                                .set(draw_finished_at > presentation_deadline);
+                        }
+                    }
                 } else if needs_present {
                     handle
                         .update(&mut cx, |_, window, _| window.present())
                         .log_err();
+                    if request_frame_options.begin_frame.is_some() {
+                        main_thread_missed_last_deadline.set(false);
+                    }
+                } else if request_frame_options.begin_frame.is_some() {
+                    main_thread_missed_last_deadline.set(false);
                 }
 
                 handle
@@ -1683,6 +2111,7 @@ impl Window {
         }
 
         platform_window.map_window().unwrap();
+        platform_window.set_needs_begin_frame(true);
 
         Ok(Window {
             handle,
@@ -1727,6 +2156,10 @@ impl Window {
             active,
             hovered,
             needs_present,
+            uses_platform_swap_completion,
+            max_pending_platform_swaps,
+            pending_platform_swaps: 0,
+            pending_gpu_available_frame: None,
             input_rate_tracker,
             #[cfg(feature = "input-latency-histogram")]
             input_latency_tracker: InputLatencyTracker::new()?,
@@ -1870,6 +2303,7 @@ impl Window {
         if self.invalidator.not_drawing() {
             self.refreshing = true;
             self.invalidator.set_dirty(true);
+            self.platform_window.set_needs_begin_frame(true);
         }
     }
 
@@ -2158,6 +2592,7 @@ impl Window {
     /// Schedule the given closure to be run directly after the current frame is rendered.
     pub fn on_next_frame(&self, callback: impl FnOnce(&mut Window, &mut App) + 'static) {
         RefCell::borrow_mut(&self.next_frame_callbacks).push(Box::new(callback));
+        self.platform_window.set_needs_begin_frame(true);
     }
 
     /// Schedule a frame to be drawn on the next animation frame.
@@ -2517,6 +2952,21 @@ impl Window {
         )
     }
 
+    pub(crate) fn damage_bounds(&mut self, bounds: Bounds<Pixels>) {
+        let viewport_bounds = Bounds::new(point(px(0.), px(0.)), self.viewport_size);
+        let bounds = bounds.intersect(&viewport_bounds);
+        if !bounds.is_empty() {
+            self.next_frame.scene.add_damage(self.cover_bounds(bounds));
+        }
+    }
+
+    pub(crate) fn damage_full_viewport(&mut self) {
+        let viewport_bounds = Bounds::new(point(px(0.), px(0.)), self.viewport_size);
+        self.next_frame
+            .scene
+            .add_damage(self.cover_bounds(viewport_bounds));
+    }
+
     #[inline]
     fn snapped_content_mask(&self) -> ContentMask<ScaledPixels> {
         ContentMask {
@@ -2595,6 +3045,29 @@ impl Window {
 
     fn complete_frame(&self) {
         self.platform_window.completed_frame();
+        self.update_begin_frame_subscription();
+    }
+
+    fn update_begin_frame_subscription(&self) {
+        self.platform_window
+            .set_needs_begin_frame(self.has_frame_work());
+    }
+
+    fn has_frame_work(&self) -> bool {
+        self.invalidator.is_dirty()
+            || self.needs_present.get()
+            || !self.next_frame_callbacks.borrow().is_empty()
+            || (self.active.get() && self.input_rate_tracker.borrow().is_high_rate())
+            || (self.active.get()
+                && self
+                    .input_rate_tracker
+                    .borrow()
+                    .should_keep_frame_source_active())
+    }
+
+    fn platform_swap_backpressured(&self) -> bool {
+        self.max_pending_platform_swaps
+            .is_some_and(|max_pending_swaps| self.pending_platform_swaps >= max_pending_swaps)
     }
 
     /// Produces a new frame and assigns it to `rendered_frame`. To actually show
@@ -2613,6 +3086,7 @@ impl Window {
         self.invalidate_entities();
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
+        let full_damage = self.refreshing;
         self.invalidator.set_dirty(false);
         self.requested_autoscroll = None;
 
@@ -2634,6 +3108,9 @@ impl Window {
             }
         }
         if !cx.mode.skip_drawing() {
+            if full_damage {
+                self.damage_full_viewport();
+            }
             self.draw_roots(cx);
         }
         self.dirty_views.clear();
@@ -2736,10 +3213,19 @@ impl Window {
 
     #[profiling::function]
     fn present(&mut self) {
-        self.platform_window.draw(&self.rendered_frame.scene);
+        if self.uses_platform_swap_completion {
+            self.pending_platform_swaps = self.pending_platform_swaps.saturating_add(1);
+        }
+        let draw_result = self.platform_window.draw(&self.rendered_frame.scene);
+        if self.uses_platform_swap_completion
+            && !matches!(draw_result, crate::PlatformDrawResult::Submitted)
+        {
+            self.pending_platform_swaps = self.pending_platform_swaps.saturating_sub(1);
+        }
         #[cfg(feature = "input-latency-histogram")]
         self.input_latency_tracker.record_frame_presented();
-        self.needs_present.set(false);
+        self.needs_present
+            .set(matches!(draw_result, crate::PlatformDrawResult::Deferred));
         profiling::finish_frame!();
     }
 
@@ -4499,6 +4985,10 @@ impl Window {
         #[cfg(feature = "input-latency-histogram")]
         let dispatch_time = Instant::now();
         let update_count_before = self.invalidator.update_count();
+        let is_scroll_input = matches!(
+            &event,
+            PlatformInput::ScrollWheel(_) | PlatformInput::Pinch(_)
+        );
         // Track input modality for focus-visible styling and hover suppression.
         // Hover is suppressed during keyboard modality so that keyboard navigation
         // doesn't show hover highlights on the item under the mouse cursor.
@@ -4616,6 +5106,9 @@ impl Window {
             } else {
                 self.input_latency_tracker.record_mid_draw_input();
             }
+        }
+        if is_scroll_input {
+            self.input_rate_tracker.borrow_mut().record_scroll_input();
         }
 
         DispatchEventResult {

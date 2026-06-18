@@ -1,4 +1,4 @@
-use crate::metal_atlas::MetalAtlas;
+use crate::{ca_time, metal_atlas::MetalAtlas, remote_layer::CoreAnimationLayerTree};
 use anyhow::Result;
 use block::ConcreteBlock;
 use cocoa::{
@@ -8,8 +8,9 @@ use cocoa::{
 };
 use gpui::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, MonochromeSprite, PaintSurface,
-    Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size,
-    Surface, Underline, point, size,
+    Path, PlatformDrawResult, Point, PolychromeSprite, PresentationFeedback, PrimitiveBatch, Quad,
+    ScaledPixels, Scene, Shadow, Size, Surface, SwapCompletionFeedback, Underline, bounds, point,
+    size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -26,8 +27,8 @@ use core_video::{
 };
 use foreign_types::{ForeignType, ForeignTypeRef};
 use metal::{
-    CommandQueue, MTLGPUFamily, MTLPixelFormat, MTLResourceOptions, NSRange,
-    RenderPassColorAttachmentDescriptorRef,
+    CommandQueue, MTLCommandBufferStatus, MTLGPUFamily, MTLPixelFormat, MTLResourceOptions,
+    MTLScissorRect, NSRange, RenderPassColorAttachmentDescriptorRef,
 };
 use objc::{self, class, msg_send, sel, sel_impl};
 use parking_lot::Mutex;
@@ -36,10 +37,12 @@ use std::{
     cell::Cell,
     ffi::c_void,
     mem, ptr,
+    rc::Rc,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 // Exported to metal
@@ -52,9 +55,10 @@ const SHADERS_SOURCE_FILE: &str = include_str!(concat!(env!("OUT_DIR"), "/stitch
 // Use 4x MSAA, all devices support it.
 // https://developer.apple.com/documentation/metal/mtldevice/1433355-supportstexturesamplecount
 const PATH_SAMPLE_COUNT: u32 = 4;
-const CHROMIUM_PIPELINE_ENV: &str = "ZED_MACOS_CHROMIUM_PIPELINE";
+const LEGACY_METAL_LAYER_ENV: &str = "ZED_MACOS_LEGACY_METAL_LAYER";
 const IOSURFACE_BUFFER_COUNT: usize = 3;
 const IOSURFACE_MAX_PENDING_SWAPS: usize = IOSURFACE_BUFFER_COUNT - 1;
+const CA_TRANSACTION_PHASE_POST_COMMIT: usize = 2;
 const NO_CURRENT_BUFFER: usize = usize::MAX;
 const BGRA_IOSURFACE_PIXEL_FORMAT: i32 = i32::from_be_bytes(*b"BGRA");
 
@@ -68,10 +72,10 @@ pub(crate) unsafe fn new_renderer(
     _bounds: gpui::Size<f32>,
     transparent: bool,
 ) -> Renderer {
-    if std::env::var_os(CHROMIUM_PIPELINE_ENV).is_some() {
-        MetalRenderer::new_chromium_pipeline(context, transparent, _bounds)
-    } else {
+    if std::env::var_os(LEGACY_METAL_LAYER_ENV).is_some() {
         MetalRenderer::new(context, transparent)
+    } else {
+        MetalRenderer::new_chromium_pipeline(context, transparent, _bounds)
     }
 }
 
@@ -95,13 +99,24 @@ pub(crate) struct InstanceBuffer {
 }
 
 struct CoreAnimationPresenter {
-    layer: id,
+    layer_tree: CoreAnimationLayerTree,
     drawable_size: Size<DevicePixels>,
     buffers: Vec<IosurfaceFrameBuffer>,
     pending_swap_count: Arc<AtomicUsize>,
     current_buffer_index: Arc<AtomicUsize>,
+    generation: Arc<AtomicUsize>,
     deferred_frame_requested: Arc<AtomicBool>,
     deferred_frame_callback: Option<Arc<dyn Fn() + Send + Sync>>,
+    has_resized_since_last_swap: bool,
+    swap_completion_callback: Option<Arc<dyn Fn(SwapCompletionFeedback) + Send + Sync>>,
+    presentation_feedback_callback: Option<Arc<dyn Fn(PresentationFeedback) + Send + Sync>>,
+    latest_display_timing: Arc<Mutex<Option<FrameDisplayTiming>>>,
+}
+
+#[derive(Clone, Copy)]
+struct FrameDisplayTiming {
+    next_display_time: scheduler::Instant,
+    frame_interval: Option<Duration>,
 }
 
 #[allow(deprecated)]
@@ -109,6 +124,7 @@ struct IosurfaceFrameBuffer {
     surface: io_surface::IOSurface,
     texture: metal::Texture,
     pending: Arc<AtomicBool>,
+    damage: Bounds<DevicePixels>,
 }
 
 #[allow(deprecated)]
@@ -118,20 +134,18 @@ struct PresentedIosurfaceFrame {
     buffer_pending: Arc<AtomicBool>,
     pending_swap_count: Arc<AtomicUsize>,
     current_buffer_index: Arc<AtomicUsize>,
+    current_generation: Arc<AtomicUsize>,
+    generation: usize,
     deferred_frame_requested: Arc<AtomicBool>,
     deferred_frame_callback: Option<Arc<dyn Fn() + Send + Sync>>,
+    swap_completion_callback: Option<Arc<dyn Fn(SwapCompletionFeedback) + Send + Sync>>,
+    presentation_feedback_callback: Option<Arc<dyn Fn(PresentationFeedback) + Send + Sync>>,
+    latest_display_timing: Arc<Mutex<Option<FrameDisplayTiming>>>,
+    ready_time: scheduler::Instant,
     buffer_index: usize,
 }
 
 impl Drop for PresentedIosurfaceFrame {
-    fn drop(&mut self) {
-        unsafe {
-            let _: () = msg_send![self.layer, release];
-        }
-    }
-}
-
-impl Drop for CoreAnimationPresenter {
     fn drop(&mut self) {
         unsafe {
             let _: () = msg_send![self.layer, release];
@@ -182,25 +196,29 @@ impl CoreAnimationPresenter {
         transparent: bool,
         initial_size: Size<DevicePixels>,
     ) -> Result<Self> {
-        let layer: id = unsafe { msg_send![class!(CALayer), new] };
-        unsafe {
-            let _: () = msg_send![layer, setOpaque: if transparent { NO } else { YES }];
-            let _: () = msg_send![layer, setNeedsDisplayOnBoundsChange: YES];
-            let _: () = msg_send![
-                layer,
-                setAutoresizingMask: AutoresizingMask::WIDTH_SIZABLE
-                    | AutoresizingMask::HEIGHT_SIZABLE
-            ];
-        }
+        let layer_tree = CoreAnimationLayerTree::new(transparent, initial_size);
+        log::info!(
+            "using Chromium-style {}CA/IOSurface renderer",
+            if layer_tree.uses_ca_context() {
+                "CAContext/CALayerHost "
+            } else {
+                ""
+            }
+        );
 
         let mut presenter = Self {
-            layer,
+            layer_tree,
             drawable_size: size(0.into(), 0.into()),
             buffers: Vec::new(),
             pending_swap_count: Arc::new(AtomicUsize::new(0)),
             current_buffer_index: Arc::new(AtomicUsize::new(NO_CURRENT_BUFFER)),
+            generation: Arc::new(AtomicUsize::new(0)),
             deferred_frame_requested: Arc::new(AtomicBool::new(false)),
             deferred_frame_callback: None,
+            has_resized_since_last_swap: false,
+            swap_completion_callback: None,
+            presentation_feedback_callback: None,
+            latest_display_timing: Arc::new(Mutex::new(None)),
         };
         presenter.update_drawable_size(device, initial_size)?;
         Ok(presenter)
@@ -215,8 +233,13 @@ impl CoreAnimationPresenter {
             return Ok(());
         }
 
+        let had_drawable_size = self.drawable_size.width.0 > 0 && self.drawable_size.height.0 > 0;
         self.drawable_size = drawable_size;
-        self.pending_swap_count.store(0, Ordering::Release);
+        self.layer_tree.set_drawable_size(drawable_size);
+        if had_drawable_size && self.layer_tree.uses_ca_context() {
+            self.has_resized_since_last_swap = true;
+        }
+        self.generation.fetch_add(1, Ordering::AcqRel);
         self.current_buffer_index
             .store(NO_CURRENT_BUFFER, Ordering::Release);
         self.buffers.clear();
@@ -233,20 +256,62 @@ impl CoreAnimationPresenter {
         Ok(())
     }
 
-    fn set_contents_scale(&self, scale_factor: f64) {
-        unsafe {
-            let _: () = msg_send![self.layer, setContentsScale: scale_factor];
-        }
+    fn set_contents_scale(&mut self, scale_factor: f64) {
+        self.layer_tree.set_contents_scale(scale_factor);
+        self.layer_tree.set_drawable_size(self.drawable_size);
     }
 
     fn set_opaque(&self, opaque: bool) {
-        unsafe {
-            let _: () = msg_send![self.layer, setOpaque: if opaque { YES } else { NO }];
-        }
+        self.layer_tree.set_opaque(opaque);
     }
 
     fn layer_ptr(&self) -> id {
-        self.layer
+        self.layer_tree.backing_layer()
+    }
+
+    fn content_layer_ptr(&self) -> id {
+        self.layer_tree.content_layer()
+    }
+
+    fn prepare_to_present(&mut self) {
+        if self.has_resized_since_last_swap {
+            if self.layer_tree.recreate_ca_context() {
+                self.layer_tree.set_drawable_size(self.drawable_size);
+            }
+            self.has_resized_since_last_swap = false;
+        }
+    }
+
+    fn full_damage(&self) -> Bounds<DevicePixels> {
+        full_texture_bounds(self.drawable_size)
+    }
+
+    fn update_buffer_damage(&mut self, damage: Bounds<DevicePixels>) {
+        let damage = clamp_damage(damage, self.drawable_size);
+        if damage.is_empty() {
+            return;
+        }
+
+        let current_buffer_index = self.current_buffer_index.load(Ordering::Acquire);
+        let full_damage = self.full_damage();
+        for (index, buffer) in self.buffers.iter_mut().enumerate() {
+            if index != current_buffer_index {
+                buffer.damage = buffer.damage.union(&damage).intersect(&full_damage);
+            }
+        }
+    }
+
+    fn buffer_damage(&self, buffer_index: usize) -> Bounds<DevicePixels> {
+        self.buffers
+            .get(buffer_index)
+            .map(|buffer| clamp_damage(buffer.damage, self.drawable_size))
+            .unwrap_or_else(|| self.full_damage())
+    }
+
+    fn clear_buffer_damage(&mut self, buffer_index: usize) {
+        if let Some(buffer) = self.buffers.get_mut(buffer_index) {
+            buffer.damage = Bounds::default();
+        }
     }
 
     fn next_buffer_index(&self) -> Option<usize> {
@@ -261,11 +326,7 @@ impl CoreAnimationPresenter {
             .iter()
             .enumerate()
             .find(|(index, buffer)| {
-                *index != current_buffer_index
-                    && !buffer.pending.load(Ordering::Acquire)
-                    && unsafe {
-                        !io_surface::IOSurfaceIsInUse(buffer.surface.as_concrete_TypeRef())
-                    }
+                *index != current_buffer_index && !buffer.pending.load(Ordering::Acquire)
             })
             .map(|(index, _)| index);
 
@@ -286,6 +347,31 @@ impl CoreAnimationPresenter {
     fn set_deferred_frame_callback(&mut self, callback: Option<Arc<dyn Fn() + Send + Sync>>) {
         self.deferred_frame_callback = callback;
     }
+
+    fn set_swap_completion_callback(
+        &mut self,
+        callback: Option<Arc<dyn Fn(SwapCompletionFeedback) + Send + Sync>>,
+    ) {
+        self.swap_completion_callback = callback;
+    }
+
+    fn set_presentation_feedback_callback(
+        &mut self,
+        callback: Option<Arc<dyn Fn(PresentationFeedback) + Send + Sync>>,
+    ) {
+        self.presentation_feedback_callback = callback;
+    }
+
+    fn set_display_timing(
+        &self,
+        next_display_time: scheduler::Instant,
+        frame_interval: Option<Duration>,
+    ) {
+        *self.latest_display_timing.lock() = Some(FrameDisplayTiming {
+            next_display_time,
+            frame_interval,
+        });
+    }
 }
 
 #[allow(deprecated)]
@@ -298,6 +384,7 @@ impl IosurfaceFrameBuffer {
             surface,
             texture,
             pending: Arc::new(AtomicBool::new(false)),
+            damage: full_texture_bounds(size),
         })
     }
 }
@@ -364,22 +451,224 @@ fn align_to(value: usize, alignment: usize) -> usize {
     value.div_ceil(alignment) * alignment
 }
 
-extern "C" fn present_iosurface_frame(context: *mut c_void) {
-    let frame = unsafe { Box::from_raw(context as *mut PresentedIosurfaceFrame) };
-    unsafe {
-        let _: () = msg_send![frame.layer, setContents: frame.surface.as_concrete_TypeRef() as id];
-        let _: () = msg_send![frame.layer, setNeedsDisplay];
+fn presentation_feedback_from_ca_time(ca_time: f64) -> PresentationFeedback {
+    let display_time = ca_time::media_time_to_instant(ca_time);
+    PresentationFeedback {
+        ready_time: display_time,
+        latch_time: display_time,
+        display_time,
+        interval: None,
+        presented: true,
+        vsync: true,
+        hardware_completion: true,
     }
-    frame
-        .current_buffer_index
-        .store(frame.buffer_index, Ordering::Release);
+}
+
+fn presentation_feedback_for_iosurface_frame(
+    ready_time: scheduler::Instant,
+    latch_time: scheduler::Instant,
+    display_timing: Option<FrameDisplayTiming>,
+) -> PresentationFeedback {
+    let (display_time, interval) = if let Some(display_timing) = display_timing {
+        (
+            estimated_display_time_for_latch(display_timing, latch_time),
+            display_timing.frame_interval,
+        )
+    } else {
+        (latch_time, None)
+    };
+
+    PresentationFeedback {
+        ready_time,
+        latch_time,
+        display_time,
+        interval,
+        presented: true,
+        vsync: true,
+        hardware_completion: true,
+    }
+}
+
+fn estimated_display_time_for_latch(
+    display_timing: FrameDisplayTiming,
+    latch_time: scheduler::Instant,
+) -> scheduler::Instant {
+    const LATCH_BUFFER: Duration = Duration::from_micros(1500);
+
+    if let Some(next_latch_deadline) = display_timing.next_display_time.checked_sub(LATCH_BUFFER)
+        && latch_time < next_latch_deadline
+    {
+        return display_timing.next_display_time;
+    }
+
+    let Some(frame_interval) = display_timing
+        .frame_interval
+        .filter(|interval| !interval.is_zero())
+    else {
+        return latch_time;
+    };
+
+    let mut display_time = display_timing.next_display_time;
+    for _ in 0..240 {
+        let latch_deadline = display_time
+            .checked_sub(LATCH_BUFFER)
+            .unwrap_or(display_time);
+        if latch_time < latch_deadline {
+            return display_time;
+        }
+        display_time += frame_interval;
+    }
+
+    latch_time
+}
+
+fn decrement_pending_swap_count(pending_swap_count: &AtomicUsize) {
+    let mut count = pending_swap_count.load(Ordering::Acquire);
+    while count > 0 {
+        match pending_swap_count.compare_exchange_weak(
+            count,
+            count - 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return,
+            Err(next_count) => count = next_count,
+        }
+    }
+}
+
+fn complete_iosurface_frame(frame: Box<PresentedIosurfaceFrame>) {
+    let latch_time = scheduler::Instant::now();
+    let presented = frame.generation == frame.current_generation.load(Ordering::Acquire);
+    if let Some(callback) = &frame.swap_completion_callback {
+        callback(SwapCompletionFeedback {
+            ready_time: frame.ready_time,
+            latch_time,
+            presented,
+        });
+    }
+    if let Some(callback) = &frame.presentation_feedback_callback {
+        if presented {
+            callback(presentation_feedback_for_iosurface_frame(
+                frame.ready_time,
+                latch_time,
+                *frame.latest_display_timing.lock(),
+            ));
+        } else {
+            callback(PresentationFeedback {
+                ready_time: frame.ready_time,
+                latch_time,
+                display_time: latch_time,
+                interval: None,
+                presented: false,
+                vsync: false,
+                hardware_completion: true,
+            });
+        }
+    }
+    if presented {
+        frame
+            .current_buffer_index
+            .store(frame.buffer_index, Ordering::Release);
+    }
     frame.buffer_pending.store(false, Ordering::Release);
-    frame.pending_swap_count.fetch_sub(1, Ordering::AcqRel);
+    decrement_pending_swap_count(&frame.pending_swap_count);
     if frame.deferred_frame_requested.swap(false, Ordering::AcqRel)
         && let Some(callback) = &frame.deferred_frame_callback
     {
         callback();
     }
+}
+
+fn supports_ca_transaction_phase_handlers() -> bool {
+    static SUPPORTS_CA_TRANSACTION_PHASE_HANDLERS: OnceLock<bool> = OnceLock::new();
+    *SUPPORTS_CA_TRANSACTION_PHASE_HANDLERS.get_or_init(|| unsafe {
+        msg_send![
+            class!(CATransaction),
+            respondsToSelector: sel!(addCommitHandler:forPhase:)
+        ]
+    })
+}
+
+fn fail_iosurface_frame(frame: Box<PresentedIosurfaceFrame>) {
+    let latch_time = scheduler::Instant::now();
+    if let Some(callback) = &frame.swap_completion_callback {
+        callback(SwapCompletionFeedback {
+            ready_time: frame.ready_time,
+            latch_time,
+            presented: false,
+        });
+    }
+    if let Some(callback) = &frame.presentation_feedback_callback {
+        callback(PresentationFeedback {
+            ready_time: frame.ready_time,
+            latch_time,
+            display_time: latch_time,
+            interval: None,
+            presented: false,
+            vsync: false,
+            hardware_completion: true,
+        });
+    }
+    frame.buffer_pending.store(false, Ordering::Release);
+    decrement_pending_swap_count(&frame.pending_swap_count);
+    frame
+        .deferred_frame_requested
+        .store(false, Ordering::Release);
+    if let Some(callback) = &frame.deferred_frame_callback {
+        callback();
+    }
+}
+
+extern "C" fn present_iosurface_frame(context: *mut c_void) {
+    let frame = unsafe { Box::from_raw(context as *mut PresentedIosurfaceFrame) };
+    if frame.generation != frame.current_generation.load(Ordering::Acquire) {
+        complete_iosurface_frame(frame);
+        return;
+    }
+
+    let frame = Rc::new(Cell::new(Some(frame)));
+    let post_commit_handler = if supports_ca_transaction_phase_handlers() {
+        let frame = frame.clone();
+        let block = ConcreteBlock::new(move || {
+            if let Some(frame) = frame.take() {
+                complete_iosurface_frame(frame);
+            }
+        });
+        Some(block.copy())
+    } else {
+        None
+    };
+
+    unsafe {
+        let _: () = msg_send![class!(CATransaction), begin];
+        let _: () = msg_send![class!(CATransaction), setDisableActions: YES];
+        if let Some(post_commit_handler) = &post_commit_handler {
+            let post_commit_handler = &**post_commit_handler;
+            let _: () = msg_send![
+                class!(CATransaction),
+                addCommitHandler: post_commit_handler
+                forPhase: CA_TRANSACTION_PHASE_POST_COMMIT
+            ];
+        }
+        if let Some(frame_for_contents) = frame.take() {
+            let _: () = msg_send![
+                frame_for_contents.layer,
+                setContents: frame_for_contents.surface.as_concrete_TypeRef() as id
+            ];
+            frame.set(Some(frame_for_contents));
+        }
+        let _: () = msg_send![class!(CATransaction), commit];
+    }
+
+    if let Some(frame) = frame.take() {
+        complete_iosurface_frame(frame);
+    }
+}
+
+extern "C" fn fail_iosurface_frame_async(context: *mut c_void) {
+    let frame = unsafe { Box::from_raw(context as *mut PresentedIosurfaceFrame) };
+    fail_iosurface_frame(frame);
 }
 
 pub(crate) struct MetalRenderer {
@@ -389,6 +678,8 @@ pub(crate) struct MetalRenderer {
     is_apple_gpu: bool,
     is_unified_memory: bool,
     presents_with_transaction: bool,
+    swap_completion_callback: Option<Arc<dyn Fn(SwapCompletionFeedback) + Send + Sync>>,
+    presentation_feedback_callback: Option<Arc<dyn Fn(PresentationFeedback) + Send + Sync>>,
     /// For headless rendering, tracks whether output should be opaque
     opaque: bool,
     command_queue: CommandQueue,
@@ -464,11 +755,11 @@ impl MetalRenderer {
         match CoreAnimationPresenter::new(&renderer.device, transparent, initial_size) {
             Ok(presenter) => {
                 renderer.core_animation_presenter = Some(presenter);
-                log::info!("using experimental Chromium-style CA/IOSurface renderer");
+                log::info!("using Chromium-style CA/IOSurface renderer");
             }
             Err(error) => {
                 log::error!(
-                    "failed to initialize experimental CA/IOSurface renderer: {error}; falling back to CAMetalLayer"
+                    "failed to initialize Chromium-style CA/IOSurface renderer: {error}; falling back to CAMetalLayer"
                 );
                 let fallback = Self::new(renderer.instance_buffer_pool.clone(), transparent);
                 return fallback;
@@ -635,6 +926,8 @@ impl MetalRenderer {
             layer,
             core_animation_presenter: None,
             presents_with_transaction: false,
+            swap_completion_callback: None,
+            presentation_feedback_callback: None,
             is_apple_gpu,
             is_unified_memory,
             opaque,
@@ -690,7 +983,7 @@ impl MetalRenderer {
                 ];
             }
         }
-        if let Some(presenter) = &self.core_animation_presenter {
+        if let Some(presenter) = &mut self.core_animation_presenter {
             presenter.set_contents_scale(scale_factor);
         }
     }
@@ -698,6 +991,46 @@ impl MetalRenderer {
     pub fn set_deferred_frame_callback(&mut self, callback: Option<Arc<dyn Fn() + Send + Sync>>) {
         if let Some(presenter) = &mut self.core_animation_presenter {
             presenter.set_deferred_frame_callback(callback);
+        }
+    }
+
+    pub fn supports_swap_completion_feedback(&self) -> bool {
+        self.core_animation_presenter.is_some()
+    }
+
+    pub fn max_pending_swaps(&self) -> Option<u32> {
+        self.core_animation_presenter
+            .as_ref()
+            .map(|_| IOSURFACE_MAX_PENDING_SWAPS as u32)
+    }
+
+    pub fn set_swap_completion_callback(
+        &mut self,
+        callback: Option<Arc<dyn Fn(SwapCompletionFeedback) + Send + Sync>>,
+    ) {
+        self.swap_completion_callback = callback.clone();
+        if let Some(presenter) = &mut self.core_animation_presenter {
+            presenter.set_swap_completion_callback(callback);
+        }
+    }
+
+    pub fn set_presentation_feedback_callback(
+        &mut self,
+        callback: Option<Arc<dyn Fn(PresentationFeedback) + Send + Sync>>,
+    ) {
+        self.presentation_feedback_callback = callback.clone();
+        if let Some(presenter) = &mut self.core_animation_presenter {
+            presenter.set_presentation_feedback_callback(callback);
+        }
+    }
+
+    pub fn set_display_timing(
+        &mut self,
+        next_display_time: scheduler::Instant,
+        frame_interval: Option<Duration>,
+    ) {
+        if let Some(presenter) = &self.core_animation_presenter {
+            presenter.set_display_timing(next_display_time, frame_interval);
         }
     }
 
@@ -774,10 +1107,9 @@ impl MetalRenderer {
         // nothing to do
     }
 
-    pub fn draw(&mut self, scene: &Scene) {
+    pub fn draw(&mut self, scene: &Scene) -> PlatformDrawResult {
         if self.core_animation_presenter.is_some() {
-            self.draw_chromium_pipeline(scene);
-            return;
+            return self.draw_chromium_pipeline(scene);
         }
 
         let layer = match &self.layer {
@@ -786,7 +1118,7 @@ impl MetalRenderer {
                 log::error!(
                     "draw() called on headless renderer - use render_scene_to_image() instead"
                 );
-                return;
+                return PlatformDrawResult::Skipped;
             }
         };
         let viewport_size = layer.drawable_size();
@@ -794,6 +1126,9 @@ impl MetalRenderer {
             (viewport_size.width.ceil() as i32).into(),
             (viewport_size.height.ceil() as i32).into(),
         );
+        if viewport_size.width.0 <= 0 || viewport_size.height.0 <= 0 {
+            return PlatformDrawResult::Skipped;
+        }
         let drawable = if let Some(drawable) = layer.next_drawable() {
             drawable
         } else {
@@ -801,7 +1136,7 @@ impl MetalRenderer {
                 "failed to retrieve next drawable, drawable size: {:?}",
                 viewport_size
             );
-            return;
+            return PlatformDrawResult::Deferred;
         };
 
         loop {
@@ -825,6 +1160,16 @@ impl MetalRenderer {
                     let block = block.copy();
                     command_buffer.add_completed_handler(&block);
 
+                    if let Some(callback) = self.presentation_feedback_callback.clone() {
+                        let block = ConcreteBlock::new(move |drawable: &metal::DrawableRef| {
+                            callback(presentation_feedback_from_ca_time(
+                                drawable.presented_time(),
+                            ));
+                        });
+                        let block = block.copy();
+                        drawable.add_presented_handler(&block);
+                    }
+
                     if self.presents_with_transaction {
                         command_buffer.commit();
                         command_buffer.wait_until_scheduled();
@@ -833,7 +1178,7 @@ impl MetalRenderer {
                         command_buffer.present_drawable(drawable);
                         command_buffer.commit();
                     }
-                    return;
+                    return PlatformDrawResult::Submitted;
                 }
                 Err(err) => {
                     log::error!(
@@ -854,23 +1199,24 @@ impl MetalRenderer {
                 }
             }
         }
+        PlatformDrawResult::Skipped
     }
 
-    fn draw_chromium_pipeline(&mut self, scene: &Scene) {
+    fn draw_chromium_pipeline(&mut self, scene: &Scene) -> PlatformDrawResult {
         let (viewport_size, buffer_index) = {
             let Some(presenter) = &self.core_animation_presenter else {
-                return;
+                return PlatformDrawResult::Skipped;
             };
             let viewport_size = presenter.drawable_size;
             if viewport_size.width.0 <= 0 || viewport_size.height.0 <= 0 {
-                return;
+                return PlatformDrawResult::Skipped;
             }
 
             let Some(buffer_index) = presenter.next_buffer_index() else {
                 log::debug!(
                     "skipping frame because the CA/IOSurface presenter has no available buffer"
                 );
-                return;
+                return PlatformDrawResult::Deferred;
             };
             (viewport_size, buffer_index)
         };
@@ -882,14 +1228,24 @@ impl MetalRenderer {
                 .acquire(&self.device, self.is_unified_memory);
 
             let command_buffer = {
-                let texture = &self
-                    .core_animation_presenter
-                    .as_ref()
-                    .expect("checked above")
-                    .buffers[buffer_index]
-                    .texture
-                    .clone();
-                self.draw_primitives_to_texture(scene, &mut instance_buffer, texture, viewport_size)
+                let (texture, damage) = {
+                    let presenter = self
+                        .core_animation_presenter
+                        .as_mut()
+                        .expect("checked above");
+                    let frame_damage = scene_damage(scene, viewport_size);
+                    presenter.update_buffer_damage(frame_damage);
+                    let damage = presenter.buffer_damage(buffer_index);
+                    let texture = presenter.buffers[buffer_index].texture.clone();
+                    (texture, damage)
+                };
+                self.draw_primitives_to_texture(
+                    scene,
+                    &mut instance_buffer,
+                    &texture,
+                    viewport_size,
+                    Some(damage),
+                )
             };
 
             match command_buffer {
@@ -897,43 +1253,69 @@ impl MetalRenderer {
                     let instance_buffer_pool = self.instance_buffer_pool.clone();
                     let presenter = self
                         .core_animation_presenter
-                        .as_ref()
+                        .as_mut()
                         .expect("checked above");
+                    presenter.clear_buffer_damage(buffer_index);
                     presenter.mark_buffer_pending(buffer_index);
+                    presenter.prepare_to_present();
 
                     let buffer = &presenter.buffers[buffer_index];
                     let presented_frame = PresentedIosurfaceFrame {
                         layer: unsafe {
-                            let retained_layer: id = msg_send![presenter.layer_ptr(), retain];
+                            let retained_layer: id =
+                                msg_send![presenter.content_layer_ptr(), retain];
                             retained_layer
                         },
                         surface: buffer.surface.clone(),
                         buffer_pending: buffer.pending.clone(),
                         pending_swap_count: presenter.pending_swap_count.clone(),
                         current_buffer_index: presenter.current_buffer_index.clone(),
+                        current_generation: presenter.generation.clone(),
+                        generation: presenter.generation.load(Ordering::Acquire),
                         deferred_frame_requested: presenter.deferred_frame_requested.clone(),
                         deferred_frame_callback: presenter.deferred_frame_callback.clone(),
+                        swap_completion_callback: presenter.swap_completion_callback.clone(),
+                        presentation_feedback_callback: presenter
+                            .presentation_feedback_callback
+                            .clone(),
+                        latest_display_timing: presenter.latest_display_timing.clone(),
+                        ready_time: scheduler::Instant::now(),
                         buffer_index,
                     };
                     let instance_buffer = Cell::new(Some(instance_buffer));
                     let presented_frame = Cell::new(Some(presented_frame));
-                    let block = ConcreteBlock::new(move |_| {
-                        if let Some(instance_buffer) = instance_buffer.take() {
-                            instance_buffer_pool.lock().release(instance_buffer);
-                        }
-
-                        if let Some(presented_frame) = presented_frame.take() {
-                            let context = Box::into_raw(Box::new(presented_frame)) as *mut c_void;
-                            unsafe {
-                                dispatch2::DispatchQueue::main()
-                                    .exec_async_f(context, present_iosurface_frame);
+                    let block = ConcreteBlock::new(
+                        move |command_buffer: &metal::CommandBufferRef| {
+                            if let Some(instance_buffer) = instance_buffer.take() {
+                                instance_buffer_pool.lock().release(instance_buffer);
                             }
-                        }
-                    });
+
+                            if let Some(mut presented_frame) = presented_frame.take() {
+                                presented_frame.ready_time = scheduler::Instant::now();
+                                let context =
+                                    Box::into_raw(Box::new(presented_frame)) as *mut c_void;
+                                let callback = if command_buffer.status()
+                                    == MTLCommandBufferStatus::Completed
+                                {
+                                    present_iosurface_frame
+                                } else {
+                                    log::error!(
+                                        "failed to render IOSurface frame: Metal command buffer finished with status {:?}",
+                                        command_buffer.status()
+                                    );
+                                    fail_iosurface_frame_async
+                                };
+                                unsafe {
+                                    dispatch2::DispatchQueue::main()
+                                        .exec_async_f(context, callback);
+                                }
+                            }
+                        },
+                    );
                     let block = block.copy();
                     command_buffer.add_completed_handler(&block);
                     command_buffer.commit();
-                    return;
+                    return PlatformDrawResult::Submitted;
                 }
                 Err(err) => {
                     log::error!(
@@ -954,6 +1336,7 @@ impl MetalRenderer {
                 }
             }
         }
+        PlatformDrawResult::Skipped
     }
 
     /// Renders the scene to a texture and returns the pixel data as an RGBA image.
@@ -1089,8 +1472,13 @@ impl MetalRenderer {
                 .lock()
                 .acquire(&self.device, self.is_unified_memory);
 
-            let command_buffer =
-                self.draw_primitives_to_texture(scene, &mut instance_buffer, &target_texture, size);
+            let command_buffer = self.draw_primitives_to_texture(
+                scene,
+                &mut instance_buffer,
+                &target_texture,
+                size,
+                None,
+            );
 
             match command_buffer {
                 Ok(command_buffer) => {
@@ -1211,8 +1599,13 @@ impl MetalRenderer {
                 .lock()
                 .acquire(&self.device, self.is_unified_memory);
 
-            let command_buffer =
-                self.draw_primitives_to_texture(scene, &mut instance_buffer, &target_texture, size);
+            let command_buffer = self.draw_primitives_to_texture(
+                scene,
+                &mut instance_buffer,
+                &target_texture,
+                size,
+                None,
+            );
 
             match command_buffer {
                 Ok(command_buffer) => {
@@ -1258,7 +1651,13 @@ impl MetalRenderer {
         drawable: &metal::MetalDrawableRef,
         viewport_size: Size<DevicePixels>,
     ) -> Result<metal::CommandBuffer> {
-        self.draw_primitives_to_texture(scene, instance_buffer, drawable.texture(), viewport_size)
+        self.draw_primitives_to_texture(
+            scene,
+            instance_buffer,
+            drawable.texture(),
+            viewport_size,
+            None,
+        )
     }
 
     fn draw_primitives_to_texture(
@@ -1267,21 +1666,33 @@ impl MetalRenderer {
         instance_buffer: &mut InstanceBuffer,
         texture: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
+        damage: Option<Bounds<DevicePixels>>,
     ) -> Result<metal::CommandBuffer> {
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue.new_command_buffer();
         let alpha = if self.opaque { 1. } else { 0. };
         let mut instance_offset = 0;
+        let full_damage = full_texture_bounds(viewport_size);
+        let damage = damage
+            .map(|damage| clamp_damage(damage, viewport_size))
+            .filter(|damage| !damage.is_empty())
+            .unwrap_or(full_damage);
+        let full_redraw = damage == full_damage;
 
         let mut command_encoder = new_command_encoder_for_texture(
             command_buffer,
             texture,
             viewport_size,
             |color_attachment| {
-                color_attachment.set_load_action(metal::MTLLoadAction::Clear);
-                color_attachment.set_clear_color(metal::MTLClearColor::new(0., 0., 0., alpha));
+                if full_redraw {
+                    color_attachment.set_load_action(metal::MTLLoadAction::Clear);
+                    color_attachment.set_clear_color(metal::MTLClearColor::new(0., 0., 0., alpha));
+                } else {
+                    color_attachment.set_load_action(metal::MTLLoadAction::Load);
+                }
             },
         );
+        set_scissor_for_damage(command_encoder, damage);
 
         for batch in scene.batches() {
             let ok = match batch {
@@ -1319,6 +1730,7 @@ impl MetalRenderer {
                             color_attachment.set_load_action(metal::MTLLoadAction::Load);
                         },
                     );
+                    set_scissor_for_damage(command_encoder, damage);
 
                     if did_draw {
                         self.draw_paths_from_intermediate(
@@ -2030,6 +2442,53 @@ fn new_command_encoder_for_texture<'a>(
     command_encoder
 }
 
+fn full_texture_bounds(size: Size<DevicePixels>) -> Bounds<DevicePixels> {
+    bounds(point(DevicePixels(0), DevicePixels(0)), size)
+}
+
+fn scene_damage(scene: &Scene, viewport_size: Size<DevicePixels>) -> Bounds<DevicePixels> {
+    scene
+        .damage()
+        .map(scaled_damage_to_device_bounds)
+        .map(|damage| clamp_damage(damage, viewport_size))
+        .filter(|damage| !damage.is_empty())
+        .unwrap_or_else(|| full_texture_bounds(viewport_size))
+}
+
+fn scaled_damage_to_device_bounds(damage: Bounds<ScaledPixels>) -> Bounds<DevicePixels> {
+    let min_x = damage.origin.x.0.floor() as i32;
+    let min_y = damage.origin.y.0.floor() as i32;
+    let max_x = (damage.origin.x.0 + damage.size.width.0).ceil() as i32;
+    let max_y = (damage.origin.y.0 + damage.size.height.0).ceil() as i32;
+
+    bounds(
+        point(DevicePixels(min_x), DevicePixels(min_y)),
+        size(
+            DevicePixels((max_x - min_x).max(0)),
+            DevicePixels((max_y - min_y).max(0)),
+        ),
+    )
+}
+
+fn clamp_damage(
+    damage: Bounds<DevicePixels>,
+    viewport_size: Size<DevicePixels>,
+) -> Bounds<DevicePixels> {
+    damage.intersect(&full_texture_bounds(viewport_size))
+}
+
+fn set_scissor_for_damage(
+    command_encoder: &metal::RenderCommandEncoderRef,
+    damage: Bounds<DevicePixels>,
+) {
+    command_encoder.set_scissor_rect(MTLScissorRect {
+        x: damage.origin.x.0.max(0) as u64,
+        y: damage.origin.y.0.max(0) as u64,
+        width: damage.size.width.0.max(0) as u64,
+        height: damage.size.height.0.max(0) as u64,
+    });
+}
+
 fn build_pipeline_state(
     device: &metal::DeviceRef,
     library: &metal::LibraryRef,
@@ -2231,5 +2690,37 @@ impl gpui::PlatformHeadlessRenderer for MetalHeadlessRenderer {
 
     fn sprite_atlas(&self) -> Arc<dyn gpui::PlatformAtlas> {
         self.renderer.sprite_atlas().clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scaled_damage_to_device_bounds_encloses_fractional_damage() {
+        let damage = bounds(
+            point(ScaledPixels(1.25), ScaledPixels(2.75)),
+            size(ScaledPixels(3.5), ScaledPixels(4.125)),
+        );
+
+        assert_eq!(
+            scaled_damage_to_device_bounds(damage),
+            bounds(
+                point(DevicePixels(1), DevicePixels(2)),
+                size(DevicePixels(4), DevicePixels(5))
+            )
+        );
+    }
+
+    #[test]
+    fn decrement_pending_swap_count_saturates_at_zero() {
+        let pending_swap_count = AtomicUsize::new(0);
+        decrement_pending_swap_count(&pending_swap_count);
+        assert_eq!(pending_swap_count.load(Ordering::Acquire), 0);
+
+        pending_swap_count.store(2, Ordering::Release);
+        decrement_pending_swap_count(&pending_swap_count);
+        assert_eq!(pending_swap_count.load(Ordering::Acquire), 1);
     }
 }

@@ -58,6 +58,7 @@ objc2-foundation.workspace = true
 parking_lot.workspace = true
 pathfinder_geometry = "0.5"
 raw-window-handle = "0.6"
+scheduler.workspace = true
 semver.workspace = true
 smallvec.workspace = true
 strum.workspace = true

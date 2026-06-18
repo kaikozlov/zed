@@ -4,10 +4,10 @@ use x11rb::connection::RequestConnection;
 use crate::linux::X11ClientStatePtr;
 use gpui::{
     AnyWindowHandle, Bounds, Decorations, DevicePixels, ForegroundExecutor, GpuSpecs, Modifiers,
-    Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
-    Point, PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, ScaledPixels, Scene, Size,
-    Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
-    WindowDecorations, WindowKind, WindowParams, px,
+    Pixels, PlatformAtlas, PlatformDisplay, PlatformDrawResult, PlatformInput,
+    PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
+    ResizeEdge, ScaledPixels, Scene, Size, Tiling, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowControlArea, WindowDecorations, WindowKind, WindowParams, px,
 };
 use gpui_wgpu::{CompositorGpuHint, WgpuRenderer, WgpuSurfaceConfig};
 
@@ -1663,7 +1663,7 @@ impl PlatformWindow for X11Window {
         self.0.callbacks.borrow_mut().button_layout_changed = Some(callback);
     }
 
-    fn draw(&self, scene: &Scene) {
+    fn draw(&self, scene: &Scene) -> PlatformDrawResult {
         let mut inner = self.0.state.borrow_mut();
 
         if inner.renderer.device_lost() {
@@ -1683,7 +1683,7 @@ impl PlatformWindow for X11Window {
             }
 
             inner.force_render_after_recovery = true;
-            return;
+            return PlatformDrawResult::Skipped;
         }
 
         inner.renderer.draw(scene);
@@ -1691,6 +1691,7 @@ impl PlatformWindow for X11Window {
         if inner.renderer.needs_redraw() {
             inner.force_render_after_recovery = true;
         }
+        PlatformDrawResult::Submitted
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {

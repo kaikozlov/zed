@@ -27,6 +27,8 @@ pub type DrawOrder = u32;
 pub struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
     primitive_bounds: BoundsTree<ScaledPixels>,
+    damage: Option<Bounds<ScaledPixels>>,
+    suppress_primitive_damage: bool,
     layer_stack: Vec<DrawOrder>,
     pub shadows: Vec<Shadow>,
     pub quads: Vec<Quad>,
@@ -43,6 +45,8 @@ impl Scene {
     pub fn clear(&mut self) {
         self.paint_operations.clear();
         self.primitive_bounds.clear();
+        self.damage = None;
+        self.suppress_primitive_damage = false;
         self.layer_stack.clear();
         self.paths.clear();
         self.shadows.clear();
@@ -56,6 +60,22 @@ impl Scene {
 
     pub fn len(&self) -> usize {
         self.paint_operations.len()
+    }
+
+    pub fn add_damage(&mut self, damage: Bounds<ScaledPixels>) {
+        if damage.is_empty() {
+            return;
+        }
+
+        self.damage = Some(
+            self.damage
+                .map(|previous_damage| previous_damage.union(&damage))
+                .unwrap_or(damage),
+        );
+    }
+
+    pub fn damage(&self) -> Option<Bounds<ScaledPixels>> {
+        self.damage
     }
 
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
@@ -78,6 +98,10 @@ impl Scene {
 
         if clipped_bounds.is_empty() {
             return;
+        }
+
+        if !self.suppress_primitive_damage {
+            self.add_damage(clipped_bounds);
         }
 
         let order = self
@@ -125,6 +149,8 @@ impl Scene {
     }
 
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
+        let suppress_primitive_damage = self.suppress_primitive_damage;
+        self.suppress_primitive_damage = true;
         for operation in &prev_scene.paint_operations[range] {
             match operation {
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
@@ -132,6 +158,7 @@ impl Scene {
                 PaintOperation::EndLayer => self.pop_layer(),
             }
         }
+        self.suppress_primitive_damage = suppress_primitive_damage;
     }
 
     pub fn finish(&mut self) {

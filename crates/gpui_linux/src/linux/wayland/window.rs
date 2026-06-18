@@ -31,11 +31,11 @@ use crate::linux::wayland::{display::WaylandDisplay, serial::SerialKind};
 use crate::linux::{Globals, Output, WaylandClientStatePtr, get_window};
 use gpui::{
     AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, GpuSpecs, Modifiers, Pixels,
-    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size, Tiling,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls,
-    WindowDecorations, WindowKind, WindowParams, layer_shell::LayerShellNotSupportedError, px,
-    size,
+    PlatformAtlas, PlatformDisplay, PlatformDrawResult, PlatformInput, PlatformInputHandler,
+    PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size,
+    Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
+    WindowControls, WindowDecorations, WindowKind, WindowParams,
+    layer_shell::LayerShellNotSupportedError, px, size,
 };
 use gpui_wgpu::{CompositorGpuHint, WgpuRenderer, WgpuSurfaceConfig, wgpu};
 
@@ -1403,7 +1403,7 @@ impl PlatformWindow for WaylandWindow {
         self.0.callbacks.borrow_mut().button_layout_changed = Some(callback);
     }
 
-    fn draw(&self, scene: &Scene) {
+    fn draw(&self, scene: &Scene) -> PlatformDrawResult {
         let mut state = self.borrow_mut();
 
         if state.renderer.device_lost() {
@@ -1425,7 +1425,7 @@ impl PlatformWindow for WaylandWindow {
             }
 
             state.force_render_after_recovery = true;
-            return;
+            return PlatformDrawResult::Skipped;
         }
 
         state.renderer_presented = state.renderer.draw(scene);
@@ -1433,6 +1433,7 @@ impl PlatformWindow for WaylandWindow {
         if state.renderer.needs_redraw() {
             state.force_render_after_recovery = true;
         }
+        PlatformDrawResult::Submitted
     }
 
     fn completed_frame(&self) {

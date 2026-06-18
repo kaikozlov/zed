@@ -1,8 +1,8 @@
 use crate::{
-    BoolExt, DisplayLink, MacDisplay, NSRange, NSStringExt, TISCopyCurrentKeyboardInputSource,
-    TISGetInputSourceProperty, events::platform_input_from_native,
-    kTISPropertyInputSourceIsASCIICapable, kTISPropertyInputSourceType, kTISTypeKeyboardInputMode,
-    ns_string, renderer,
+    BoolExt, DisplayLink, DisplayLinkTiming, MacDisplay, NSRange, NSStringExt,
+    TISCopyCurrentKeyboardInputSource, TISGetInputSourceProperty,
+    events::platform_input_from_native, kTISPropertyInputSourceIsASCIICapable,
+    kTISPropertyInputSourceType, kTISTypeKeyboardInputMode, ns_string, renderer,
 };
 #[cfg(any(test, feature = "test-support"))]
 use anyhow::Result;
@@ -27,10 +27,10 @@ use gpui::{
     AnyWindowHandle, BackgroundExecutor, Bounds, Capslock, CursorStyle, ExternalPaths,
     FileDropEvent, ForegroundExecutor, KeyDownEvent, Keystroke, Modifiers, ModifiersChangedEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton,
-    PromptLevel, RequestFrameOptions, SharedString, Size, SystemWindowTab, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowKind, WindowParams, point,
-    px, size,
+    PlatformDisplay, PlatformDrawResult, PlatformInput, PlatformInputHandler, PlatformWindow,
+    Point, PresentationFeedback, PromptButton, PromptLevel, RequestFrameOptions, SharedString,
+    Size, SwapCompletionFeedback, SystemWindowTab, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowControlArea, WindowKind, WindowParams, point, px, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -118,9 +118,9 @@ pub enum UserTabbingPreference {
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
     // Widely used private APIs; Apple uses them for their Terminal.app.
-    fn CGSMainConnectionID() -> id;
+    fn CGSMainConnectionID() -> u32;
     fn CGSSetWindowBackgroundBlurRadius(
-        connection_id: id,
+        connection_id: u32,
         window_id: NSInteger,
         radius: i64,
     ) -> i32;
@@ -491,8 +491,13 @@ struct MacWindowState {
     cursor_style: CursorStyle,
     cursor_visible: Arc<AtomicBool>,
     display_link: Option<DisplayLink>,
+    display_link_running: bool,
+    needs_begin_frame: bool,
+    last_display_link_timing: Option<DisplayLinkTiming>,
     renderer: renderer::Renderer,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
+    swap_completion_callback: Option<Box<dyn FnMut(SwapCompletionFeedback)>>,
+    presentation_feedback_callback: Option<Box<dyn FnMut(PresentationFeedback)>>,
     event_callback: Option<Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>>,
     activate_callback: Option<Box<dyn FnMut(bool)>>,
     resize_callback: Option<Box<dyn FnMut(Size<Pixels>, f32)>>,
@@ -523,6 +528,21 @@ struct MacWindowState {
     accesskit_adapter: Option<accesskit_macos::SubclassingAdapter>,
     // The parent window if this window is a sheet (Dialog kind)
     sheet_parent: Option<id>,
+}
+
+struct PresentationFeedbackDelivery {
+    window_state: Weak<Mutex<MacWindowState>>,
+    feedback: PresentationFeedback,
+}
+
+struct SwapCompletionDelivery {
+    window_state: Weak<Mutex<MacWindowState>>,
+    feedback: SwapCompletionFeedback,
+}
+
+struct FrameRequestDelivery {
+    window_state: Weak<Mutex<MacWindowState>>,
+    options: RequestFrameOptions,
 }
 
 impl MacWindowState {
@@ -644,8 +664,25 @@ impl MacWindowState {
         }
     }
 
-    fn start_display_link(&mut self) {
+    fn update_display_link_subscription(&mut self) {
+        if self.needs_begin_frame {
+            self.start_display_link();
+        } else {
+            self.stop_display_link();
+        }
+    }
+
+    fn restart_display_link(&mut self) {
         self.stop_display_link();
+        self.display_link.take();
+        self.update_display_link_subscription();
+    }
+
+    fn start_display_link(&mut self) {
+        if self.display_link_running {
+            return;
+        }
+
         unsafe {
             if !self
                 .native_window
@@ -656,16 +693,52 @@ impl MacWindowState {
             }
         }
         let display_id = unsafe { display_id_for_screen(self.native_window.screen()) };
-        if let Some(mut display_link) =
-            DisplayLink::new(display_id, self.native_view.as_ptr() as *mut c_void, step).log_err()
+        if self
+            .display_link
+            .as_ref()
+            .is_some_and(|display_link| display_link.source_id() != u64::from(display_id))
         {
-            display_link.start().log_err();
-            self.display_link = Some(display_link);
+            self.display_link.take();
+        }
+
+        if let Some(display_link) = &mut self.display_link {
+            if display_link.start().log_err().is_some() {
+                self.display_link_running = true;
+            }
+            return;
+        }
+
+        let initial_sequence_number = self
+            .last_display_link_timing
+            .map(|timing| timing.begin_frame.id.sequence_number)
+            .unwrap_or_default();
+        if let Some(mut display_link) = DisplayLink::new(
+            display_id,
+            self.native_view.as_ptr() as *mut c_void,
+            step,
+            initial_sequence_number,
+        )
+        .log_err()
+        {
+            if display_link.start().log_err().is_some() {
+                self.display_link_running = true;
+                self.display_link = Some(display_link);
+            }
         }
     }
 
     fn stop_display_link(&mut self) {
-        self.display_link = None;
+        if let Some(display_link) = &self.display_link
+            && let Some(timing) = display_link.latest_timing()
+        {
+            self.last_display_link_timing = Some(timing);
+        }
+        if self.display_link_running {
+            if let Some(display_link) = &mut self.display_link {
+                display_link.stop().log_err();
+            }
+            self.display_link_running = false;
+        }
     }
 
     fn is_maximized(&self) -> bool {
@@ -872,6 +945,9 @@ impl MacWindow {
                 cursor_style: CursorStyle::Arrow,
                 cursor_visible,
                 display_link: None,
+                display_link_running: false,
+                needs_begin_frame: false,
+                last_display_link_timing: None,
                 renderer: renderer::new_renderer(
                     renderer_context,
                     native_window as *mut _,
@@ -880,6 +956,8 @@ impl MacWindow {
                     false,
                 ),
                 request_frame_callback: None,
+                swap_completion_callback: None,
+                presentation_feedback_callback: None,
                 event_callback: None,
                 activate_callback: None,
                 resize_callback: None,
@@ -1148,6 +1226,7 @@ impl Drop for MacWindow {
         this.renderer.destroy();
         let window = this.native_window;
         let sheet_parent = this.sheet_parent.take();
+        this.stop_display_link();
         this.display_link.take();
         unsafe {
             this.native_window.setDelegate_(nil);
@@ -1637,6 +1716,89 @@ impl PlatformWindow for MacWindow {
             })));
     }
 
+    fn set_needs_begin_frame(&self, needs_begin_frame: bool) {
+        let window_state = Arc::downgrade(&self.0);
+        let mut lock = self.0.as_ref().lock();
+        if lock.needs_begin_frame == needs_begin_frame {
+            return;
+        }
+        lock.needs_begin_frame = needs_begin_frame;
+        lock.update_display_link_subscription();
+        drop(lock);
+
+        if needs_begin_frame {
+            let context = Box::into_raw(Box::new(window_state)) as *mut c_void;
+            unsafe {
+                DispatchQueue::main().exec_async_f(context, request_missed_frame_async);
+            }
+        }
+    }
+
+    fn request_frame(&self, options: RequestFrameOptions) {
+        let delivery = FrameRequestDelivery {
+            window_state: Arc::downgrade(&self.0),
+            options,
+        };
+        let context = Box::into_raw(Box::new(delivery)) as *mut c_void;
+        unsafe {
+            DispatchQueue::main().exec_async_f(context, request_frame_async);
+        }
+    }
+
+    fn request_begin_frame(&self) {
+        let context = Box::into_raw(Box::new(Arc::downgrade(&self.0))) as *mut c_void;
+        unsafe {
+            DispatchQueue::main().exec_async_f(context, request_begin_frame_async);
+        }
+    }
+
+    fn supports_swap_completion_feedback(&self) -> bool {
+        self.0
+            .as_ref()
+            .lock()
+            .renderer
+            .supports_swap_completion_feedback()
+    }
+
+    fn max_pending_swaps(&self) -> Option<u32> {
+        self.0.as_ref().lock().renderer.max_pending_swaps()
+    }
+
+    fn on_swap_completion(&self, callback: Box<dyn FnMut(SwapCompletionFeedback)>) {
+        let window_state = Arc::downgrade(&self.0);
+        let mut lock = self.0.as_ref().lock();
+        lock.swap_completion_callback = Some(callback);
+        lock.renderer
+            .set_swap_completion_callback(Some(Arc::new(move |feedback| {
+                let delivery = SwapCompletionDelivery {
+                    window_state: window_state.clone(),
+                    feedback,
+                };
+                let context = Box::into_raw(Box::new(delivery)) as *mut c_void;
+                unsafe {
+                    DispatchQueue::main().exec_async_f(context, deliver_swap_completion_async);
+                }
+            })));
+    }
+
+    fn on_presentation_feedback(&self, callback: Box<dyn FnMut(PresentationFeedback)>) {
+        let window_state = Arc::downgrade(&self.0);
+        let mut lock = self.0.as_ref().lock();
+        lock.presentation_feedback_callback = Some(callback);
+        lock.renderer
+            .set_presentation_feedback_callback(Some(Arc::new(move |feedback| {
+                let delivery = PresentationFeedbackDelivery {
+                    window_state: window_state.clone(),
+                    feedback,
+                };
+                let context = Box::into_raw(Box::new(delivery)) as *mut c_void;
+                unsafe {
+                    DispatchQueue::main()
+                        .exec_async_f(context, deliver_presentation_feedback_async);
+                }
+            })));
+    }
+
     fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>) {
         self.0.as_ref().lock().event_callback = Some(callback);
     }
@@ -1726,9 +1888,9 @@ impl PlatformWindow for MacWindow {
         self.0.as_ref().lock().toggle_tab_bar_callback = Some(callback);
     }
 
-    fn draw(&self, scene: &gpui::Scene) {
+    fn draw(&self, scene: &gpui::Scene) -> PlatformDrawResult {
         let mut this = self.0.lock();
-        this.renderer.draw(scene);
+        this.renderer.draw(scene)
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
@@ -2380,7 +2542,7 @@ extern "C" fn window_did_change_occlusion_state(this: &Object, _: Sel, _: id) {
             .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
         {
             lock.move_traffic_light();
-            lock.start_display_link();
+            lock.update_display_link_subscription();
         } else {
             lock.stop_display_link();
         }
@@ -2462,7 +2624,7 @@ fn update_window_scale_factor(window_state: &Arc<Mutex<MacWindowState>>) {
 extern "C" fn window_did_change_screen(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.as_ref().lock();
-    lock.start_display_link();
+    lock.restart_display_link();
     drop(lock);
     update_window_scale_factor(&window_state);
 }
@@ -2526,7 +2688,7 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
                 let mut lock = window_state.lock();
                 lock.request_frame_callback = Some(callback);
                 lock.renderer.set_presents_with_transaction(false);
-                lock.start_display_link();
+                lock.update_display_link_subscription();
             }
         } else {
             lock.activated_least_once = true;
@@ -2640,7 +2802,7 @@ extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
         let mut lock = window_state.lock();
         lock.request_frame_callback = Some(callback);
         lock.renderer.set_presents_with_transaction(false);
-        lock.start_display_link();
+        lock.update_display_link_subscription();
     }
 }
 
@@ -2648,10 +2810,29 @@ extern "C" fn step(view: *mut c_void) {
     let view = view as id;
     let window_state = unsafe { get_window_state(&*view) };
     let mut lock = window_state.lock();
+    let display_link_timing = lock
+        .display_link
+        .as_ref()
+        .and_then(DisplayLink::latest_timing);
+    if let Some(display_link_timing) = display_link_timing {
+        lock.last_display_link_timing = Some(display_link_timing);
+        lock.renderer.set_display_timing(
+            display_link_timing.predicted_display_time,
+            display_link_timing.frame_interval,
+        );
+    }
 
     if let Some(mut callback) = lock.request_frame_callback.take() {
         drop(lock);
-        callback(Default::default());
+        let mut request_frame_options = RequestFrameOptions::default();
+        if let Some(display_link_timing) = display_link_timing {
+            request_frame_options.begin_frame = Some(display_link_timing.begin_frame);
+            request_frame_options.predicted_display_time =
+                Some(display_link_timing.predicted_display_time);
+            request_frame_options.frame_interval = display_link_timing.frame_interval;
+            request_frame_options.frame_deadline = Some(display_link_timing.frame_deadline);
+        }
+        callback(request_frame_options);
         window_state.lock().request_frame_callback = Some(callback);
     }
 }
@@ -2668,11 +2849,199 @@ fn request_deferred_frame(window_state: Weak<Mutex<MacWindowState>>) {
     drop(lock);
 
     callback(RequestFrameOptions {
+        begin_frame: None,
         require_presentation: true,
         force_render: true,
+        predicted_display_time: None,
+        frame_interval: None,
+        frame_deadline: None,
     });
 
     window_state.lock().request_frame_callback = Some(callback);
+}
+
+extern "C" fn request_missed_frame_async(context: *mut c_void) {
+    let window_state = unsafe { Box::from_raw(context as *mut Weak<Mutex<MacWindowState>>) };
+    request_missed_frame(*window_state);
+}
+
+extern "C" fn request_begin_frame_async(context: *mut c_void) {
+    let window_state = unsafe { Box::from_raw(context as *mut Weak<Mutex<MacWindowState>>) };
+    request_begin_frame(*window_state);
+}
+
+extern "C" fn request_frame_async(context: *mut c_void) {
+    let delivery = unsafe { Box::from_raw(context as *mut FrameRequestDelivery) };
+    request_frame(delivery.window_state, delivery.options);
+}
+
+fn missed_display_link_timing(last_timing: DisplayLinkTiming) -> Option<DisplayLinkTiming> {
+    let interval = last_timing
+        .frame_interval
+        .unwrap_or(Duration::from_micros(16667));
+    if interval.is_zero() {
+        return None;
+    }
+
+    let now = scheduler::Instant::now();
+    let mut predicted_display_time = last_timing.predicted_display_time;
+    let mut sequence_number = last_timing.begin_frame.id.sequence_number;
+    let mut advanced = false;
+    while predicted_display_time + interval <= now {
+        predicted_display_time += interval;
+        sequence_number = sequence_number.saturating_add(1);
+        advanced = true;
+    }
+
+    if !advanced {
+        return None;
+    }
+
+    Some(DisplayLinkTiming {
+        begin_frame: gpui::BeginFrameArgs {
+            id: gpui::BeginFrameId {
+                source_id: last_timing.begin_frame.id.source_id,
+                sequence_number,
+            },
+            frame_time: predicted_display_time
+                .checked_sub(interval)
+                .unwrap_or(predicted_display_time),
+            deadline: predicted_display_time,
+            interval,
+            missed: true,
+        },
+        predicted_display_time,
+        frame_interval: Some(interval),
+        frame_deadline: predicted_display_time,
+    })
+}
+
+fn request_frame(window_state: Weak<Mutex<MacWindowState>>, options: RequestFrameOptions) {
+    let Some(window_state) = window_state.upgrade() else {
+        return;
+    };
+
+    let mut lock = window_state.lock();
+    if let Some(predicted_display_time) = options.predicted_display_time {
+        lock.renderer
+            .set_display_timing(predicted_display_time, options.frame_interval);
+    }
+    let Some(mut callback) = lock.request_frame_callback.take() else {
+        return;
+    };
+    drop(lock);
+
+    callback(options);
+
+    window_state.lock().request_frame_callback = Some(callback);
+}
+
+fn request_begin_frame(window_state: Weak<Mutex<MacWindowState>>) {
+    let Some(window_state) = window_state.upgrade() else {
+        return;
+    };
+
+    let mut lock = window_state.lock();
+    let Some(display_link_timing) = lock
+        .display_link
+        .as_ref()
+        .and_then(DisplayLink::latest_timing)
+        .or(lock.last_display_link_timing)
+    else {
+        return;
+    };
+    lock.last_display_link_timing = Some(display_link_timing);
+    drop(lock);
+
+    let mut request_frame_options = RequestFrameOptions::default();
+    request_frame_options.begin_frame = Some(display_link_timing.begin_frame);
+    request_frame_options.predicted_display_time = Some(display_link_timing.predicted_display_time);
+    request_frame_options.frame_interval = display_link_timing.frame_interval;
+    request_frame_options.frame_deadline = Some(display_link_timing.frame_deadline);
+    request_frame(Arc::downgrade(&window_state), request_frame_options);
+}
+
+fn request_missed_frame(window_state: Weak<Mutex<MacWindowState>>) {
+    let Some(window_state) = window_state.upgrade() else {
+        return;
+    };
+
+    let mut lock = window_state.lock();
+    let display_link_timing = lock
+        .display_link
+        .as_ref()
+        .and_then(DisplayLink::latest_timing)
+        .or(lock.last_display_link_timing)
+        .and_then(missed_display_link_timing);
+    let Some(display_link_timing) = display_link_timing else {
+        return;
+    };
+    lock.last_display_link_timing = Some(display_link_timing);
+    lock.renderer.set_display_timing(
+        display_link_timing.predicted_display_time,
+        display_link_timing.frame_interval,
+    );
+    let Some(mut callback) = lock.request_frame_callback.take() else {
+        return;
+    };
+    drop(lock);
+
+    let mut request_frame_options = RequestFrameOptions::default();
+    request_frame_options.begin_frame = Some(display_link_timing.begin_frame);
+    request_frame_options.predicted_display_time = Some(display_link_timing.predicted_display_time);
+    request_frame_options.frame_interval = display_link_timing.frame_interval;
+    request_frame_options.frame_deadline = Some(display_link_timing.frame_deadline);
+    callback(request_frame_options);
+
+    window_state.lock().request_frame_callback = Some(callback);
+}
+
+extern "C" fn deliver_presentation_feedback_async(context: *mut c_void) {
+    let delivery = unsafe { Box::from_raw(context as *mut PresentationFeedbackDelivery) };
+    deliver_presentation_feedback(delivery.window_state, delivery.feedback);
+}
+
+extern "C" fn deliver_swap_completion_async(context: *mut c_void) {
+    let delivery = unsafe { Box::from_raw(context as *mut SwapCompletionDelivery) };
+    deliver_swap_completion(delivery.window_state, delivery.feedback);
+}
+
+fn deliver_swap_completion(
+    window_state: Weak<Mutex<MacWindowState>>,
+    feedback: SwapCompletionFeedback,
+) {
+    let Some(window_state) = window_state.upgrade() else {
+        return;
+    };
+
+    let mut lock = window_state.lock();
+    let Some(mut callback) = lock.swap_completion_callback.take() else {
+        return;
+    };
+    drop(lock);
+
+    callback(feedback);
+
+    window_state.lock().swap_completion_callback = Some(callback);
+}
+
+fn deliver_presentation_feedback(
+    window_state: Weak<Mutex<MacWindowState>>,
+    feedback: PresentationFeedback,
+) {
+    let Some(window_state) = window_state.upgrade() else {
+        return;
+    };
+
+    let mut lock = window_state.lock();
+    let Some(mut callback) = lock.presentation_feedback_callback.take() else {
+        return;
+    };
+    drop(lock);
+
+    callback(feedback);
+
+    window_state.lock().presentation_feedback_callback = Some(callback);
 }
 
 extern "C" fn valid_attributes_for_marked_text(_: &Object, _: Sel) -> id {

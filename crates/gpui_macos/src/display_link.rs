@@ -3,12 +3,42 @@ use core_graphics::display::CGDirectDisplayID;
 use dispatch2::{
     _dispatch_source_type_data_add, DispatchObject, DispatchQueue, DispatchRetained, DispatchSource,
 };
+use gpui::{BeginFrameArgs, BeginFrameId};
 use gpui_util::ResultExt;
-use std::ffi::c_void;
+use mach2::mach_time::{mach_absolute_time, mach_timebase_info, mach_timebase_info_data_t};
+use scheduler::Instant;
+use std::{
+    ffi::c_void,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 pub struct DisplayLink {
     display_link: Option<sys::DisplayLink>,
     frame_requests: DispatchRetained<DispatchSource>,
+    source_id: u64,
+    latest_sequence_number: Arc<AtomicU64>,
+    latest_output_host_time: Arc<AtomicU64>,
+    latest_frame_interval_ns: Arc<AtomicU64>,
+    _callback_context: Box<DisplayLinkCallbackContext>,
+}
+
+struct DisplayLinkCallbackContext {
+    frame_requests: *const DispatchSource,
+    latest_sequence_number: Arc<AtomicU64>,
+    latest_output_host_time: Arc<AtomicU64>,
+    latest_frame_interval_ns: Arc<AtomicU64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DisplayLinkTiming {
+    pub begin_frame: BeginFrameArgs,
+    pub predicted_display_time: Instant,
+    pub frame_interval: Option<Duration>,
+    pub frame_deadline: Instant,
 }
 
 impl DisplayLink {
@@ -16,18 +46,43 @@ impl DisplayLink {
         display_id: CGDirectDisplayID,
         data: *mut c_void,
         callback: extern "C" fn(*mut c_void),
+        initial_sequence_number: u64,
     ) -> Result<DisplayLink> {
         unsafe extern "C" fn display_link_callback(
             _display_link_out: *mut sys::CVDisplayLink,
             _current_time: *const sys::CVTimeStamp,
-            _output_time: *const sys::CVTimeStamp,
+            output_time: *const sys::CVTimeStamp,
             _flags_in: i64,
             _flags_out: *mut i64,
-            frame_requests: *mut c_void,
+            callback_context: *mut c_void,
         ) -> i32 {
             unsafe {
-                let frame_requests = &*(frame_requests as *const DispatchSource);
-                frame_requests.merge_data(1);
+                let callback_context = &*(callback_context as *const DisplayLinkCallbackContext);
+                callback_context
+                    .latest_sequence_number
+                    .fetch_add(1, Ordering::AcqRel);
+                if let Some(output_time) = output_time.as_ref()
+                    && output_time.flags & sys::kCVTimeStampHostTimeValid != 0
+                {
+                    callback_context
+                        .latest_output_host_time
+                        .store(output_time.host_time, Ordering::Release);
+                }
+                if let Some(output_time) = output_time.as_ref()
+                    && output_time.flags & sys::kCVTimeStampVideoRefreshPeriodValid != 0
+                    && output_time.video_time_scale > 0
+                    && output_time.video_refresh_period > 0
+                {
+                    let interval_ns = u128::try_from(output_time.video_refresh_period)
+                        .unwrap_or_default()
+                        * 1_000_000_000u128
+                        / u128::try_from(output_time.video_time_scale).unwrap_or(1);
+                    callback_context.latest_frame_interval_ns.store(
+                        interval_ns.min(u128::from(u64::MAX)) as u64,
+                        Ordering::Release,
+                    );
+                }
+                (*callback_context.frame_requests).merge_data(1);
                 0
             }
         }
@@ -43,17 +98,68 @@ impl DisplayLink {
             frame_requests.set_event_handler_f(callback);
             frame_requests.resume();
 
+            let source_id = u64::from(display_id);
+            let latest_sequence_number = Arc::new(AtomicU64::new(initial_sequence_number));
+            let latest_output_host_time = Arc::new(AtomicU64::new(0));
+            let latest_frame_interval_ns = Arc::new(AtomicU64::new(0));
+            let callback_context = Box::new(DisplayLinkCallbackContext {
+                frame_requests: &*frame_requests as *const DispatchSource,
+                latest_sequence_number: latest_sequence_number.clone(),
+                latest_output_host_time: latest_output_host_time.clone(),
+                latest_frame_interval_ns: latest_frame_interval_ns.clone(),
+            });
             let display_link = sys::DisplayLink::new(
                 display_id,
                 display_link_callback,
-                &*frame_requests as *const DispatchSource as *mut c_void,
+                &*callback_context as *const DisplayLinkCallbackContext as *mut c_void,
             )?;
 
             Ok(Self {
                 display_link: Some(display_link),
                 frame_requests,
+                source_id,
+                latest_sequence_number,
+                latest_output_host_time,
+                latest_frame_interval_ns,
+                _callback_context: callback_context,
             })
         }
+    }
+
+    pub fn latest_output_time(&self) -> Option<Instant> {
+        host_time_to_instant(self.latest_output_host_time.load(Ordering::Acquire))
+    }
+
+    pub fn source_id(&self) -> u64 {
+        self.source_id
+    }
+
+    pub fn latest_timing(&self) -> Option<DisplayLinkTiming> {
+        let predicted_display_time = self.latest_output_time()?;
+        let frame_interval = match self.latest_frame_interval_ns.load(Ordering::Acquire) {
+            0 => None,
+            interval_ns => Some(Duration::from_nanos(interval_ns)),
+        };
+        let interval = frame_interval.unwrap_or(Duration::from_micros(16667));
+        let sequence_number = self.latest_sequence_number.load(Ordering::Acquire);
+        let begin_frame = BeginFrameArgs {
+            id: BeginFrameId {
+                source_id: self.source_id,
+                sequence_number,
+            },
+            frame_time: predicted_display_time
+                .checked_sub(interval)
+                .unwrap_or(predicted_display_time),
+            deadline: predicted_display_time,
+            interval,
+            missed: false,
+        };
+        Some(DisplayLinkTiming {
+            begin_frame,
+            predicted_display_time,
+            frame_interval,
+            frame_deadline: predicted_display_time,
+        })
     }
 
     pub fn start(&mut self) -> Result<()> {
@@ -84,6 +190,35 @@ impl Drop for DisplayLink {
         std::mem::forget(self.display_link.take());
         self.frame_requests.cancel();
     }
+}
+
+fn host_time_to_instant(host_time: u64) -> Option<Instant> {
+    if host_time == 0 {
+        return None;
+    }
+
+    let now = Instant::now();
+    let now_host_time = unsafe { mach_absolute_time() };
+    if host_time >= now_host_time {
+        Some(now + mach_duration(host_time - now_host_time))
+    } else {
+        Some(
+            now.checked_sub(mach_duration(now_host_time - host_time))
+                .unwrap_or(now),
+        )
+    }
+}
+
+fn mach_duration(ticks: u64) -> Duration {
+    static TIMEBASE: OnceLock<(u64, u64)> = OnceLock::new();
+    let (numerator, denominator) = *TIMEBASE.get_or_init(|| unsafe {
+        let mut info = mach_timebase_info_data_t { numer: 0, denom: 0 };
+        mach_timebase_info(&mut info);
+        (u64::from(info.numer), u64::from(info.denom.max(1)))
+    });
+
+    let nanos = u128::from(ticks) * u128::from(numerator) / u128::from(denominator);
+    Duration::from_nanos(nanos.min(u128::from(u64::MAX)) as u64)
 }
 
 mod sys {

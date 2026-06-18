@@ -141,7 +141,12 @@ impl Element for AnyView {
     ) -> Option<AnyElement> {
         window.set_view_id(self.entity_id());
         window.with_rendered_view(self.entity_id(), |window| {
+            let view_is_dirty = window.dirty_views.contains(&self.entity_id());
+            let window_refreshing = window.refreshing;
             if let Some(mut element) = element.take() {
+                if view_is_dirty && !window_refreshing {
+                    window.damage_full_viewport();
+                }
                 element.prepaint(window, cx);
                 return Some(element);
             }
@@ -151,6 +156,12 @@ impl Element for AnyView {
                 |element_state, window| {
                     let content_mask = window.content_mask();
                     let text_style = window.text_style();
+                    let previous_damage_bounds = element_state.as_ref().map(|element_state| {
+                        element_state
+                            .cache_key
+                            .bounds
+                            .intersect(&element_state.cache_key.content_mask.bounds)
+                    });
 
                     if let Some(mut element_state) = element_state
                         && element_state.cache_key.bounds == bounds
@@ -180,6 +191,13 @@ impl Element for AnyView {
 
                     let prepaint_end = window.prepaint_index();
                     window.refreshing = refreshing;
+                    if view_is_dirty && !window_refreshing {
+                        let current_damage_bounds = bounds.intersect(&content_mask.bounds);
+                        let damage_bounds = previous_damage_bounds
+                            .map(|previous_bounds| previous_bounds.union(&current_damage_bounds))
+                            .unwrap_or(current_damage_bounds);
+                        window.damage_bounds(damage_bounds);
+                    }
 
                     (
                         Some(element),

@@ -1977,8 +1977,10 @@ impl X11ClientState {
                             let window = window.window.clone();
                             drop(state);
                             window.refresh(RequestFrameOptions {
+                                begin_frame: None,
                                 require_presentation: expose_event_received,
                                 force_render,
+                                ..Default::default()
                             });
                         }
                         xcb_connection

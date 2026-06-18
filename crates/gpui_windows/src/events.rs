@@ -1239,8 +1239,10 @@ impl WindowsWindowInner {
             self.state.renderer.borrow_mut().mark_drawable();
         }
         request_frame(RequestFrameOptions {
+            begin_frame: None,
             require_presentation: false,
             force_render,
+            ..Default::default()
         });
 
         self.state.callbacks.request_frame.set(Some(request_frame));

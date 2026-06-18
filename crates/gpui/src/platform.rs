@@ -610,10 +610,63 @@ pub struct A11yCallbacks {
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
 #[expect(missing_docs)]
 pub struct RequestFrameOptions {
+    /// Platform BeginFrame metadata for this frame, when the platform frame source provides it.
+    pub begin_frame: Option<BeginFrameArgs>,
     /// Whether a presentation is required.
     pub require_presentation: bool,
     /// Force refresh of all rendering states when true.
     pub force_render: bool,
+    /// Predicted display time for this frame, when the platform frame source provides it.
+    pub predicted_display_time: Option<Instant>,
+    /// Platform-provided frame interval, when known.
+    pub frame_interval: Option<Duration>,
+    /// Deadline for producing this frame, when known.
+    pub frame_deadline: Option<Instant>,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+#[expect(missing_docs)]
+pub struct BeginFrameId {
+    pub source_id: u64,
+    pub sequence_number: u64,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[expect(missing_docs)]
+pub struct BeginFrameArgs {
+    pub id: BeginFrameId,
+    pub frame_time: Instant,
+    pub deadline: Instant,
+    pub interval: Duration,
+    pub missed: bool,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[expect(missing_docs)]
+pub struct PresentationFeedback {
+    pub ready_time: Instant,
+    pub latch_time: Instant,
+    pub display_time: Instant,
+    pub interval: Option<Duration>,
+    pub presented: bool,
+    pub vsync: bool,
+    pub hardware_completion: bool,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[expect(missing_docs)]
+pub struct SwapCompletionFeedback {
+    pub ready_time: Instant,
+    pub latch_time: Instant,
+    pub presented: bool,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[expect(missing_docs)]
+pub enum PlatformDrawResult {
+    Submitted,
+    Deferred,
+    Skipped,
 }
 
 #[expect(missing_docs)]
@@ -649,6 +702,17 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn toggle_fullscreen(&self);
     fn is_fullscreen(&self) -> bool;
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>);
+    fn set_needs_begin_frame(&self, _needs_begin_frame: bool) {}
+    fn request_frame(&self, _options: RequestFrameOptions) {}
+    fn request_begin_frame(&self) {}
+    fn supports_swap_completion_feedback(&self) -> bool {
+        false
+    }
+    fn max_pending_swaps(&self) -> Option<u32> {
+        None
+    }
+    fn on_swap_completion(&self, _callback: Box<dyn FnMut(SwapCompletionFeedback)>) {}
+    fn on_presentation_feedback(&self, _callback: Box<dyn FnMut(PresentationFeedback)>) {}
     fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> DispatchEventResult>);
     fn on_active_status_change(&self, callback: Box<dyn FnMut(bool)>);
     fn on_hover_status_change(&self, callback: Box<dyn FnMut(bool)>);
@@ -659,7 +723,7 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_close(&self, callback: Box<dyn FnOnce()>);
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
-    fn draw(&self, scene: &Scene);
+    fn draw(&self, scene: &Scene) -> PlatformDrawResult;
     fn completed_frame(&self) {}
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
     fn is_subpixel_rendering_supported(&self) -> bool;
