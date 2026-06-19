@@ -2,7 +2,7 @@ use crate::{ca_time, metal_atlas::MetalAtlas, remote_layer::CoreAnimationLayerTr
 use anyhow::Result;
 use block::ConcreteBlock;
 use cocoa::{
-    base::{NO, YES, id},
+    base::{NO, YES, id, nil},
     foundation::{NSSize, NSUInteger},
     quartzcore::AutoresizingMask,
 };
@@ -154,7 +154,6 @@ struct PresentedIosurfaceFrame {
     submitted_damage: Bounds<DevicePixels>,
     backpressure_fence: IosurfaceBackpressureFence,
     committed_backpressure_fence: Arc<Mutex<Option<IosurfaceBackpressureFence>>>,
-    delay_until_next_vsync: bool,
 }
 
 #[derive(Clone)]
@@ -831,6 +830,9 @@ fn commit_iosurface_frame(frame: Box<PresentedIosurfaceFrame>) {
             ];
             if !contents.is_null() && contents == previous_contents && supports_contents_changed {
                 let _: () = msg_send![frame_for_contents.layer, setContentsChanged];
+            } else if !contents.is_null() && contents == previous_contents {
+                let _: () = msg_send![frame_for_contents.layer, setContents: nil];
+                let _: () = msg_send![frame_for_contents.layer, setContents: contents];
             } else {
                 let _: () = msg_send![frame_for_contents.layer, setContents: contents];
             }
@@ -844,11 +846,8 @@ fn commit_iosurface_frame(frame: Box<PresentedIosurfaceFrame>) {
     }
 }
 
-fn should_commit_ready_iosurface_frame_immediately(
-    queued_frame_count: usize,
-    delay_until_next_vsync: bool,
-) -> bool {
-    queued_frame_count <= 1 && !delay_until_next_vsync
+fn should_commit_ready_iosurface_frame_immediately(queued_frame_count: usize) -> bool {
+    queued_frame_count <= 1
 }
 
 fn commit_ready_iosurface_frame(
@@ -879,13 +878,10 @@ fn commit_ready_iosurface_frame_after_completion(
 ) {
     let should_commit = {
         let presented_frames = presented_frames.lock();
-        let Some(frame) = presented_frames.ready_front() else {
+        if presented_frames.ready_front().is_none() {
             return;
-        };
-        should_commit_ready_iosurface_frame_immediately(
-            presented_frames.len(),
-            frame.delay_until_next_vsync,
-        )
+        }
+        should_commit_ready_iosurface_frame_immediately(presented_frames.len())
     };
 
     if should_commit {
@@ -1575,7 +1571,6 @@ impl MetalRenderer {
                         committed_backpressure_fence: presenter
                             .committed_backpressure_fence
                             .clone(),
-                        delay_until_next_vsync: scene.is_handling_interaction(),
                     };
                     presented_frames
                         .lock()
@@ -3070,16 +3065,9 @@ mod tests {
 
     #[test]
     fn iosurface_commit_cadence_delays_when_queue_has_backlog() {
-        assert!(should_commit_ready_iosurface_frame_immediately(0, false));
-        assert!(should_commit_ready_iosurface_frame_immediately(1, false));
-        assert!(!should_commit_ready_iosurface_frame_immediately(2, false));
-    }
-
-    #[test]
-    fn iosurface_commit_cadence_delays_interaction_frames_until_vsync() {
-        assert!(!should_commit_ready_iosurface_frame_immediately(0, true));
-        assert!(!should_commit_ready_iosurface_frame_immediately(1, true));
-        assert!(!should_commit_ready_iosurface_frame_immediately(2, true));
+        assert!(should_commit_ready_iosurface_frame_immediately(0));
+        assert!(should_commit_ready_iosurface_frame_immediately(1));
+        assert!(!should_commit_ready_iosurface_frame_immediately(2));
     }
 
     #[test]

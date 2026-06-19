@@ -2174,7 +2174,7 @@ impl Interactivity {
                         .insert(debug_selector.clone(), bounds);
                 }
 
-                self.paint_hover_group_handler(window, cx);
+                self.paint_hover_group_handler(bounds, window, cx);
 
                 if style.visibility == Visibility::Hidden {
                     return ((), element_state);
@@ -2477,7 +2477,7 @@ impl Interactivity {
             });
             let current_view = window.current_view();
 
-            window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
+            window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, _cx| {
                 let hovered = hitbox.is_hovered(window);
                 let was_hovered = hover_state
                     .as_ref()
@@ -2485,7 +2485,10 @@ impl Interactivity {
                 if phase == DispatchPhase::Capture && hovered != was_hovered {
                     if let Some(hover_state) = &hover_state {
                         hover_state.borrow_mut().element = hovered;
-                        cx.notify(current_view);
+                        window.invalidate_view_bounds(
+                            current_view,
+                            hitbox.bounds.intersect(&hitbox.content_mask.bounds),
+                        );
                     }
                 }
             });
@@ -2497,9 +2500,10 @@ impl Interactivity {
                     .as_ref()
                     .and_then(|element| element.hover_state.as_ref())
                     .cloned();
+                let hitbox = hitbox.clone();
                 let current_view = window.current_view();
 
-                window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
+                window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, _cx| {
                     let group_hovered = group_hitbox_id.is_hovered(window);
                     let was_group_hovered = hover_state
                         .as_ref()
@@ -2507,8 +2511,11 @@ impl Interactivity {
                     if phase == DispatchPhase::Capture && group_hovered != was_group_hovered {
                         if let Some(hover_state) = &hover_state {
                             hover_state.borrow_mut().group = group_hovered;
+                            window.invalidate_view_bounds(
+                                current_view,
+                                hitbox.bounds.intersect(&hitbox.content_mask.bounds),
+                            );
                         }
-                        cx.notify(current_view);
                     }
                 });
             }
@@ -2556,6 +2563,7 @@ impl Interactivity {
         }
 
         if let Some(element_state) = element_state {
+            let current_view = window.current_view();
             if !click_listeners.is_empty()
                 || !aux_click_listeners.is_empty()
                 || drag_listener.is_some()
@@ -2580,7 +2588,10 @@ impl Interactivity {
                             && hitbox.is_hovered(window)
                         {
                             *pending_mouse_down.borrow_mut() = Some(event.clone());
-                            window.refresh();
+                            window.invalidate_view_bounds(
+                                current_view,
+                                hitbox.bounds.intersect(&hitbox.content_mask.bounds),
+                            );
                         }
                     }
                 });
@@ -2611,7 +2622,10 @@ impl Interactivity {
                                 cursor_style: drag_cursor_style,
                             });
                             pending_mouse_down.take();
-                            window.refresh();
+                            window.invalidate_view_bounds(
+                                current_view,
+                                hitbox.bounds.intersect(&hitbox.content_mask.bounds),
+                            );
                             cx.stop_propagation();
                         }
                     }
@@ -2661,7 +2675,10 @@ impl Interactivity {
                             let mut pending_mouse_down = pending_mouse_down.borrow_mut();
                             if pending_mouse_down.is_some() && hitbox.is_hovered(window) {
                                 captured_mouse_down = pending_mouse_down.take();
-                                window.refresh();
+                                window.invalidate_view_bounds(
+                                    current_view,
+                                    hitbox.bounds.intersect(&hitbox.content_mask.bounds),
+                                );
                             } else if pending_mouse_down.is_some() {
                                 // Clear the pending mouse down event (without firing click handlers)
                                 // if the hitbox is not being hovered.
@@ -2669,7 +2686,10 @@ impl Interactivity {
                                 // immediately after being clicked.
                                 // See https://github.com/zed-industries/zed/issues/24600 for more details
                                 pending_mouse_down.take();
-                                window.refresh();
+                                window.invalidate_view_bounds(
+                                    current_view,
+                                    hitbox.bounds.intersect(&hitbox.content_mask.bounds),
+                                );
                             }
                         }
                         // Fire click handlers during the bubble phase.
@@ -2779,10 +2799,14 @@ impl Interactivity {
 
             {
                 let active_state = active_state.clone();
+                let hitbox = hitbox.clone();
                 window.on_mouse_event(move |_: &MouseUpEvent, phase, window, _cx| {
                     if phase == DispatchPhase::Capture && active_state.borrow().is_clicked() {
                         *active_state.borrow_mut() = ElementClickedState::default();
-                        window.refresh();
+                        window.invalidate_view_bounds(
+                            current_view,
+                            hitbox.bounds.intersect(&hitbox.content_mask.bounds),
+                        );
                     }
                 });
             }
@@ -2803,7 +2827,10 @@ impl Interactivity {
                                 group: group_hovered,
                                 element: element_hovered,
                             };
-                            window.refresh();
+                            window.invalidate_view_bounds(
+                                current_view,
+                                hitbox.bounds.intersect(&hitbox.content_mask.bounds),
+                            );
                         }
                     }
                 });
@@ -2843,7 +2870,7 @@ impl Interactivity {
         }
     }
 
-    fn paint_hover_group_handler(&self, window: &mut Window, cx: &mut App) {
+    fn paint_hover_group_handler(&self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
         let group_hitbox = self
             .group_hover_style
             .as_ref()
@@ -2852,10 +2879,11 @@ impl Interactivity {
         if let Some(group_hitbox) = group_hitbox {
             let was_hovered = group_hitbox.is_hovered(window);
             let current_view = window.current_view();
-            window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
+            let damage_bounds = bounds.intersect(&window.content_mask().bounds);
+            window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, _cx| {
                 let hovered = group_hitbox.is_hovered(window);
                 if phase == DispatchPhase::Capture && hovered != was_hovered {
-                    cx.notify(current_view);
+                    window.invalidate_view_bounds(current_view, damage_bounds);
                 }
             });
         }
@@ -2875,7 +2903,7 @@ impl Interactivity {
             let line_height = window.line_height();
             let hitbox = hitbox.clone();
             let current_view = window.current_view();
-            window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
+            window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, _cx| {
                 if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
                     let mut scroll_offset = scroll_offset.borrow_mut();
                     let old_scroll_offset = *scroll_offset;
@@ -2907,7 +2935,10 @@ impl Interactivity {
                     scroll_offset.y += delta_y;
                     scroll_offset.x += delta_x;
                     if *scroll_offset != old_scroll_offset {
-                        cx.notify(current_view);
+                        window.invalidate_view_bounds(
+                            current_view,
+                            hitbox.bounds.intersect(&hitbox.content_mask.bounds),
+                        );
                     }
                 }
             });

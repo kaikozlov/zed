@@ -25,6 +25,27 @@ struct ViewCacheKey {
     text_style: TextStyle,
 }
 
+fn dirty_view_damage_bounds(
+    window: &Window,
+    view_id: EntityId,
+    bounds: Bounds<Pixels>,
+    content_mask: ContentMask<Pixels>,
+) -> Bounds<Pixels> {
+    match window.dirty_view_bounds.get(&view_id) {
+        Some(Some(damage_bounds)) => damage_bounds
+            .intersect(&bounds)
+            .intersect(&content_mask.bounds),
+        _ => bounds.intersect(&content_mask.bounds),
+    }
+}
+
+fn dirty_view_has_bounded_damage(window: &Window, view_id: EntityId) -> bool {
+    window
+        .dirty_view_bounds
+        .get(&view_id)
+        .is_some_and(|damage_bounds| damage_bounds.is_some())
+}
+
 /// A dynamically-typed handle to a view, which can be downcast to a [Entity] for a specific type.
 #[derive(Clone, Debug)]
 pub struct AnyView {
@@ -145,7 +166,12 @@ impl Element for AnyView {
             let window_refreshing = window.refreshing;
             if let Some(mut element) = element.take() {
                 if view_is_dirty && !window_refreshing {
-                    window.damage_bounds(bounds.intersect(&window.content_mask().bounds));
+                    window.damage_bounds(dirty_view_damage_bounds(
+                        window,
+                        self.entity_id(),
+                        bounds,
+                        window.content_mask(),
+                    ));
                 }
                 element.prepaint(window, cx);
                 return Some(element);
@@ -192,10 +218,22 @@ impl Element for AnyView {
                     let prepaint_end = window.prepaint_index();
                     window.refreshing = refreshing;
                     if view_is_dirty && !window_refreshing {
-                        let current_damage_bounds = bounds.intersect(&content_mask.bounds);
-                        let damage_bounds = previous_damage_bounds
-                            .map(|previous_bounds| previous_bounds.union(&current_damage_bounds))
-                            .unwrap_or(current_damage_bounds);
+                        let current_damage_bounds = dirty_view_damage_bounds(
+                            window,
+                            self.entity_id(),
+                            bounds,
+                            content_mask,
+                        );
+                        let damage_bounds =
+                            if dirty_view_has_bounded_damage(window, self.entity_id()) {
+                                current_damage_bounds
+                            } else {
+                                previous_damage_bounds
+                                    .map(|previous_bounds| {
+                                        previous_bounds.union(&current_damage_bounds)
+                                    })
+                                    .unwrap_or(current_damage_bounds)
+                            };
                         window.damage_bounds(damage_bounds);
                     }
 
@@ -229,6 +267,7 @@ impl Element for AnyView {
     ) {
         window.with_rendered_view(self.entity_id(), |window| {
             let caching_disabled = window.is_inspector_picking(cx);
+            let suppress_primitive_damage = dirty_view_has_bounded_damage(window, self.entity_id());
             if self.cached_style.is_some() && !caching_disabled {
                 window.with_element_state::<AnyViewState, _>(
                     global_id.unwrap(),
@@ -239,7 +278,13 @@ impl Element for AnyView {
 
                         if let Some(element) = element {
                             let refreshing = mem::replace(&mut window.refreshing, true);
-                            element.paint(window, cx);
+                            if suppress_primitive_damage {
+                                window.with_suppressed_primitive_damage(|window| {
+                                    element.paint(window, cx)
+                                });
+                            } else {
+                                element.paint(window, cx);
+                            }
                             window.refreshing = refreshing;
                         } else {
                             window.reuse_paint(element_state.paint_range.clone());
@@ -252,7 +297,12 @@ impl Element for AnyView {
                     },
                 )
             } else {
-                element.as_mut().unwrap().paint(window, cx);
+                let element = element.as_mut().unwrap();
+                if suppress_primitive_damage {
+                    window.with_suppressed_primitive_damage(|window| element.paint(window, cx));
+                } else {
+                    element.paint(window, cx);
+                }
             }
         });
     }

@@ -1147,20 +1147,26 @@ impl Element for InteractiveText {
                                     }
 
                                     mouse_down.take();
-                                    window.refresh();
+                                    window.invalidate_view_bounds(
+                                        current_view,
+                                        hitbox.bounds.intersect(&hitbox.content_mask.bounds),
+                                    );
                                 }
                             },
                         );
                     } else {
                         let hitbox = hitbox.clone();
-                        window.on_mouse_event(move |event: &MouseDownEvent, phase, window, _| {
+                        window.on_mouse_event(move |event: &MouseDownEvent, phase, window, _cx| {
                             if phase == DispatchPhase::Bubble
                                 && hitbox.is_hovered(window)
                                 && let Ok(mouse_down_index) =
                                     text_layout.index_for_position(event.position)
                             {
                                 mouse_down.set(Some(mouse_down_index));
-                                window.refresh();
+                                window.invalidate_view_bounds(
+                                    current_view,
+                                    hitbox.bounds.intersect(&hitbox.content_mask.bounds),
+                                );
                             }
                         });
                     }

@@ -55,12 +55,14 @@ impl CoreAnimationLayerTree {
         };
 
         unsafe {
-            self.create_and_set_fence_port();
-            let _: () = msg_send![self.ca_context, setLayer: nil];
-            let _: () = msg_send![self.ca_context, release];
-            let _: () = msg_send![ca_context, setLayer: self.content_layer];
-            let context_id: u32 = msg_send![ca_context, contextId];
-            self.replace_host_layer(context_id);
+            with_disabled_ca_actions(|| {
+                self.create_and_set_fence_port();
+                let _: () = msg_send![self.ca_context, setLayer: nil];
+                let _: () = msg_send![self.ca_context, release];
+                let _: () = msg_send![ca_context, setLayer: self.content_layer];
+                let context_id: u32 = msg_send![ca_context, contextId];
+                self.replace_host_layer(context_id);
+            });
         }
         self.ca_context = ca_context;
         true
@@ -69,21 +71,26 @@ impl CoreAnimationLayerTree {
     pub(crate) fn set_contents_scale(&mut self, scale_factor: f64) {
         self.contents_scale = scale_factor.max(1.0);
         unsafe {
-            let _: () = msg_send![self.backing_layer, setContentsScale: self.contents_scale];
-            if self.host_layer != nil {
-                let _: () = msg_send![self.host_layer, setContentsScale: self.contents_scale];
-            }
-            let _: () = msg_send![self.content_layer, setContentsScale: self.contents_scale];
+            with_disabled_ca_actions(|| {
+                let _: () = msg_send![self.backing_layer, setContentsScale: self.contents_scale];
+                if self.host_layer != nil {
+                    let _: () = msg_send![self.host_layer, setContentsScale: self.contents_scale];
+                }
+                let _: () = msg_send![self.content_layer, setContentsScale: self.contents_scale];
+            });
         }
     }
 
     pub(crate) fn set_opaque(&self, opaque: bool) {
         unsafe {
-            let _: () = msg_send![self.backing_layer, setOpaque: if opaque { YES } else { NO }];
-            if self.host_layer != nil {
-                let _: () = msg_send![self.host_layer, setOpaque: if opaque { YES } else { NO }];
-            }
-            let _: () = msg_send![self.content_layer, setOpaque: if opaque { YES } else { NO }];
+            with_disabled_ca_actions(|| {
+                let _: () = msg_send![self.backing_layer, setOpaque: if opaque { YES } else { NO }];
+                if self.host_layer != nil {
+                    let _: () =
+                        msg_send![self.host_layer, setOpaque: if opaque { YES } else { NO }];
+                }
+                let _: () = msg_send![self.content_layer, setOpaque: if opaque { YES } else { NO }];
+            });
         }
     }
 
@@ -93,11 +100,13 @@ impl CoreAnimationLayerTree {
         let bounds = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, height));
 
         unsafe {
-            let _: () = msg_send![self.backing_layer, setBounds: bounds];
-            let _: () = msg_send![self.content_layer, setBounds: bounds];
-            if self.host_layer != nil {
-                let _: () = msg_send![self.host_layer, setBounds: bounds];
-            }
+            with_disabled_ca_actions(|| {
+                let _: () = msg_send![self.backing_layer, setBounds: bounds];
+                let _: () = msg_send![self.content_layer, setBounds: bounds];
+                if self.host_layer != nil {
+                    let _: () = msg_send![self.host_layer, setBounds: bounds];
+                }
+            });
         }
     }
 
@@ -147,14 +156,16 @@ impl CoreAnimationLayerTree {
         };
 
         unsafe {
-            configure_layer(backing_layer, transparent);
-            configure_layer(content_layer, transparent);
-            configure_iosurface_content_layer(content_layer);
-            configure_hosted_layer_geometry(backing_layer);
-            configure_hosted_layer_geometry(content_layer);
-            let _: () = msg_send![backing_layer, setGeometryFlipped: YES];
-            let _: () = msg_send![content_layer, setGeometryFlipped: YES];
-            let _: () = msg_send![ca_context, setLayer: content_layer];
+            with_disabled_ca_actions(|| {
+                configure_layer(backing_layer, transparent);
+                configure_layer(content_layer, transparent);
+                configure_iosurface_content_layer(content_layer);
+                configure_hosted_layer_geometry(backing_layer);
+                configure_hosted_layer_geometry(content_layer);
+                let _: () = msg_send![backing_layer, setGeometryFlipped: YES];
+                let _: () = msg_send![content_layer, setGeometryFlipped: YES];
+                let _: () = msg_send![ca_context, setLayer: content_layer];
+            });
         }
 
         let mut tree = Self {
@@ -168,7 +179,9 @@ impl CoreAnimationLayerTree {
         };
         let context_id: u32 = unsafe { msg_send![tree.ca_context, contextId] };
         unsafe {
-            tree.replace_host_layer(context_id);
+            with_disabled_ca_actions(|| {
+                tree.replace_host_layer(context_id);
+            });
         }
         Some(tree)
     }
@@ -191,15 +204,23 @@ impl CoreAnimationLayerTree {
     }
 
     fn new_direct(transparent: bool) -> Self {
-        let layer: id = unsafe { msg_send![class!(CALayer), new] };
+        let backing_layer: id = unsafe { msg_send![class!(CALayer), new] };
+        let content_layer: id = unsafe { msg_send![class!(CALayer), new] };
         unsafe {
-            configure_layer(layer, transparent);
-            configure_iosurface_content_layer(layer);
+            with_disabled_ca_actions(|| {
+                configure_layer(backing_layer, transparent);
+                configure_layer(content_layer, transparent);
+                configure_iosurface_content_layer(content_layer);
+                configure_hosted_layer_geometry(backing_layer);
+                configure_hosted_layer_geometry(content_layer);
+                let _: () = msg_send![backing_layer, setGeometryFlipped: YES];
+                let _: () = msg_send![backing_layer, addSublayer: content_layer];
+            });
         }
         Self {
-            backing_layer: layer,
+            backing_layer,
             host_layer: nil,
-            content_layer: layer,
+            content_layer,
             ca_context: nil,
             ca_context_fence_ports: VecDeque::new(),
             uses_ca_context: false,
@@ -211,18 +232,20 @@ impl CoreAnimationLayerTree {
 impl Drop for CoreAnimationLayerTree {
     fn drop(&mut self) {
         unsafe {
-            if self.ca_context != nil {
-                let _: () = msg_send![self.ca_context, setLayer: nil];
-                let _: () = msg_send![self.ca_context, release];
-            }
-            if self.host_layer != nil {
-                let _: () = msg_send![self.host_layer, removeFromSuperlayer];
-                let _: () = msg_send![self.host_layer, release];
-            }
-            if self.content_layer != self.backing_layer {
-                let _: () = msg_send![self.content_layer, release];
-            }
-            let _: () = msg_send![self.backing_layer, release];
+            with_disabled_ca_actions(|| {
+                if self.ca_context != nil {
+                    let _: () = msg_send![self.ca_context, setLayer: nil];
+                    let _: () = msg_send![self.ca_context, release];
+                }
+                if self.host_layer != nil {
+                    let _: () = msg_send![self.host_layer, removeFromSuperlayer];
+                    let _: () = msg_send![self.host_layer, release];
+                }
+                if self.content_layer != self.backing_layer {
+                    let _: () = msg_send![self.content_layer, release];
+                }
+                let _: () = msg_send![self.backing_layer, release];
+            });
         }
         for fence_port in self.ca_context_fence_ports.drain(..) {
             deallocate_mach_port(fence_port);
@@ -309,6 +332,16 @@ fn deallocate_mach_port(port: mach_port_t) {
     }
 }
 
+unsafe fn with_disabled_ca_actions<R>(operation: impl FnOnce() -> R) -> R {
+    unsafe {
+        let _: () = msg_send![class!(CATransaction), begin];
+        let _: () = msg_send![class!(CATransaction), setDisableActions: YES];
+        let result = operation();
+        let _: () = msg_send![class!(CATransaction), commit];
+        result
+    }
+}
+
 unsafe fn configure_layer(layer: id, transparent: bool) {
     unsafe {
         let _: () = msg_send![layer, setOpaque: if transparent { NO } else { YES }];
@@ -324,6 +357,9 @@ unsafe fn configure_layer(layer: id, transparent: bool) {
 unsafe fn configure_iosurface_content_layer(layer: id) {
     unsafe {
         let _: () = msg_send![layer, setContentsGravity: ns_string("topLeft")];
+        let nearest_filter = ns_string("nearest");
+        let _: () = msg_send![layer, setMinificationFilter: nearest_filter];
+        let _: () = msg_send![layer, setMagnificationFilter: nearest_filter];
     }
 }
 

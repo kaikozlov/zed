@@ -116,6 +116,7 @@ struct WindowInvalidatorInner {
     pub dirty: bool,
     pub draw_phase: DrawPhase,
     pub dirty_views: FxHashSet<EntityId>,
+    pub dirty_view_bounds: FxHashMap<EntityId, Option<Bounds<Pixels>>>,
     pub update_count: usize,
     pub frame_dirty: FrameDirtyAccumulator,
 }
@@ -142,6 +143,7 @@ impl WindowInvalidator {
                 dirty: true,
                 draw_phase: DrawPhase::None,
                 dirty_views: FxHashSet::default(),
+                dirty_view_bounds: FxHashMap::default(),
                 update_count: 0,
                 frame_dirty: FrameDirtyAccumulator::default(),
             })),
@@ -152,10 +154,29 @@ impl WindowInvalidator {
         let mut inner = self.inner.borrow_mut();
         inner.update_count += 1;
         inner.dirty_views.insert(entity);
+        merge_dirty_view_bounds(&mut inner.dirty_view_bounds, entity, None);
         if inner.draw_phase == DrawPhase::None {
             Self::record_frame_dirty(&mut inner);
             inner.dirty = true;
             cx.push_effect(Effect::Notify { emitter: entity });
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn invalidate_view_bounds(&self, entity: EntityId, bounds: Bounds<Pixels>) -> bool {
+        if bounds.is_empty() {
+            return false;
+        }
+
+        let mut inner = self.inner.borrow_mut();
+        inner.update_count += 1;
+        inner.dirty_views.insert(entity);
+        merge_dirty_view_bounds(&mut inner.dirty_view_bounds, entity, Some(bounds));
+        if inner.draw_phase == DrawPhase::None {
+            Self::record_frame_dirty(&mut inner);
+            inner.dirty = true;
             true
         } else {
             false
@@ -194,12 +215,17 @@ impl WindowInvalidator {
         mem::take(&mut self.inner.borrow_mut().frame_dirty)
     }
 
-    pub fn take_views(&self) -> FxHashSet<EntityId> {
-        mem::take(&mut self.inner.borrow_mut().dirty_views)
-    }
-
-    pub fn replace_views(&self, views: FxHashSet<EntityId>) {
-        self.inner.borrow_mut().dirty_views = views;
+    pub fn take_view_invalidations(
+        &self,
+    ) -> (
+        FxHashSet<EntityId>,
+        FxHashMap<EntityId, Option<Bounds<Pixels>>>,
+    ) {
+        let mut inner = self.inner.borrow_mut();
+        (
+            mem::take(&mut inner.dirty_views),
+            mem::take(&mut inner.dirty_view_bounds),
+        )
     }
 
     pub fn not_drawing(&self) -> bool {
@@ -231,6 +257,21 @@ impl WindowInvalidator {
             ),
             "this method can only be called during request_layout, prepaint, or paint"
         );
+    }
+}
+
+fn merge_dirty_view_bounds(
+    dirty_view_bounds: &mut FxHashMap<EntityId, Option<Bounds<Pixels>>>,
+    view_id: EntityId,
+    bounds: Option<Bounds<Pixels>>,
+) {
+    match (dirty_view_bounds.get_mut(&view_id), bounds) {
+        (Some(existing @ Some(_)), None) => *existing = None,
+        (Some(Some(existing)), Some(bounds)) => *existing = existing.union(&bounds),
+        (Some(None), _) => {}
+        (None, bounds) => {
+            dirty_view_bounds.insert(view_id, bounds);
+        }
     }
 }
 
@@ -1016,6 +1057,7 @@ pub struct Window {
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
     next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
     pub(crate) dirty_views: FxHashSet<EntityId>,
+    pub(crate) dirty_view_bounds: FxHashMap<EntityId, Option<Bounds<Pixels>>>,
     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
     pub(crate) focus_lost_listeners: SubscriberSet<(), AnyObserver>,
     default_prevented: bool,
@@ -1078,6 +1120,8 @@ pub(crate) struct InputRateTracker {
     scroll_sustain_duration: Duration,
     frame_source_sustain_until: Instant,
     frame_source_sustain_duration: Duration,
+    post_draw_frame_source_sustain_until: Instant,
+    post_draw_frame_source_sustain_duration: Duration,
 }
 
 impl Default for InputRateTracker {
@@ -1093,6 +1137,8 @@ impl Default for InputRateTracker {
             scroll_sustain_duration: Duration::from_millis(250),
             frame_source_sustain_until: Instant::now(),
             frame_source_sustain_duration: Duration::from_millis(250),
+            post_draw_frame_source_sustain_until: Instant::now(),
+            post_draw_frame_source_sustain_duration: Duration::from_millis(50),
         }
     }
 }
@@ -1115,7 +1161,14 @@ impl InputRateTracker {
     }
 
     pub fn should_keep_frame_source_active(&self) -> bool {
-        Instant::now() < self.frame_source_sustain_until
+        let now = Instant::now();
+        now < self.frame_source_sustain_until || now < self.post_draw_frame_source_sustain_until
+    }
+
+    pub fn record_draw_attempt(&mut self) {
+        let now = Instant::now();
+        self.post_draw_frame_source_sustain_until =
+            now + self.post_draw_frame_source_sustain_duration;
     }
 
     pub fn record_scroll_input(&mut self) {
@@ -1255,6 +1308,45 @@ mod tests {
             interval: Duration::from_millis(16),
             missed: false,
         }
+    }
+
+    #[test]
+    fn input_rate_tracker_keeps_frame_source_active_after_draw_attempt() {
+        let mut input_rate_tracker = InputRateTracker::default();
+        let expired = Instant::now() - Duration::from_millis(1);
+        input_rate_tracker.frame_source_sustain_until = expired;
+        input_rate_tracker.post_draw_frame_source_sustain_until = expired;
+
+        assert!(!input_rate_tracker.should_keep_frame_source_active());
+
+        input_rate_tracker.record_draw_attempt();
+
+        assert!(input_rate_tracker.should_keep_frame_source_active());
+    }
+
+    #[test]
+    fn bounded_dirty_view_damage_unions_until_unbounded() {
+        let view_id = EntityId::from(1);
+        let mut dirty_view_bounds = FxHashMap::default();
+        let first = Bounds::new(point(px(10.), px(20.)), size(px(30.), px(40.)));
+        let second = Bounds::new(point(px(25.), px(15.)), size(px(20.), px(10.)));
+
+        merge_dirty_view_bounds(&mut dirty_view_bounds, view_id, Some(first));
+        merge_dirty_view_bounds(&mut dirty_view_bounds, view_id, Some(second));
+
+        assert_eq!(
+            dirty_view_bounds.get(&view_id).copied().flatten(),
+            Some(first.union(&second))
+        );
+
+        merge_dirty_view_bounds(&mut dirty_view_bounds, view_id, None);
+        merge_dirty_view_bounds(
+            &mut dirty_view_bounds,
+            view_id,
+            Some(Bounds::new(point(px(0.), px(0.)), size(px(1.), px(1.)))),
+        );
+
+        assert_eq!(dirty_view_bounds.get(&view_id), Some(&None));
     }
 
     #[test]
@@ -2336,6 +2428,7 @@ impl Window {
             next_tooltip_id: TooltipId::default(),
             tooltip_bounds: None,
             dirty_views: FxHashSet::default(),
+            dirty_view_bounds: FxHashMap::default(),
             focus_listeners: SubscriberSet::new(),
             focus_lost_listeners: SubscriberSet::new(),
             default_prevented: true,
@@ -2417,17 +2510,15 @@ impl ContentMask<Pixels> {
 }
 
 impl Window {
-    fn mark_view_dirty(&mut self, view_id: EntityId) {
-        // Mark ancestor views as dirty. If already in the `dirty_views` set, then all its ancestors
-        // should already be dirty.
+    fn mark_view_dirty(&mut self, view_id: EntityId, bounds: Option<Bounds<Pixels>>) {
+        // Mark ancestor views as dirty so cached parent views rebuild their child view slots.
         for view_id in self
             .rendered_frame
             .dispatch_tree
             .view_path_reversed(view_id)
         {
-            if !self.dirty_views.insert(view_id) {
-                break;
-            }
+            self.dirty_views.insert(view_id);
+            merge_dirty_view_bounds(&mut self.dirty_view_bounds, view_id, bounds);
         }
     }
 
@@ -3155,6 +3246,24 @@ impl Window {
         }
     }
 
+    pub(crate) fn invalidate_view_bounds(&mut self, view_id: EntityId, bounds: Bounds<Pixels>) {
+        if self.invalidator.invalidate_view_bounds(view_id, bounds) {
+            self.platform_window.set_needs_begin_frame(true);
+        }
+    }
+
+    pub(crate) fn with_suppressed_primitive_damage<R>(
+        &mut self,
+        operation: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let suppress_primitive_damage = self.next_frame.scene.set_suppress_primitive_damage(true);
+        let result = operation(self);
+        self.next_frame
+            .scene
+            .set_suppress_primitive_damage(suppress_primitive_damage);
+        result
+    }
+
     pub(crate) fn damage_full_viewport(&mut self) {
         let viewport_bounds = Bounds::new(point(px(0.), px(0.)), self.viewport_size);
         self.next_frame
@@ -3310,6 +3419,7 @@ impl Window {
             self.draw_roots(cx);
         }
         self.dirty_views.clear();
+        self.dirty_view_bounds.clear();
         self.next_frame.window_active = self.active.get();
         self.next_frame.scene.set_handling_interaction(
             self.input_rate_tracker
@@ -3376,6 +3486,7 @@ impl Window {
         self.refreshing = false;
         self.invalidator.set_phase(DrawPhase::None);
         self.needs_present.set(true);
+        self.input_rate_tracker.borrow_mut().record_draw_attempt();
 
         if let Some(draw_start) = draw_started_at {
             profiler::record_frame_timing(profiler::FrameTiming {
@@ -3405,11 +3516,11 @@ impl Window {
     }
 
     fn invalidate_entities(&mut self) {
-        let mut views = self.invalidator.take_views();
+        let (mut views, mut view_bounds) = self.invalidator.take_view_invalidations();
         for entity in views.drain() {
-            self.mark_view_dirty(entity);
+            let bounds = view_bounds.remove(&entity).flatten();
+            self.mark_view_dirty(entity, bounds);
         }
-        self.invalidator.replace_views(views);
     }
 
     #[profiling::function]

@@ -417,7 +417,7 @@ impl EditorElement {
                 // Clear the pending mouse down during the capture phase,
                 // so that it happens even if another event handler stops
                 // propagation.
-                DispatchPhase::Capture => editor.update(cx, |editor, _cx| {
+                DispatchPhase::Capture => editor.update(cx, |editor, cx| {
                     let pending_mouse_down = editor
                         .pending_mouse_down
                         .get_or_insert_with(Default::default)
@@ -426,7 +426,7 @@ impl EditorElement {
                     let mut pending_mouse_down = pending_mouse_down.borrow_mut();
                     if pending_mouse_down.is_some() && position_map.text_hitbox.is_hovered(window) {
                         captured_mouse_down = pending_mouse_down.take();
-                        window.refresh();
+                        cx.notify();
                     }
                 }),
                 // Fire click handlers during the bubble phase.

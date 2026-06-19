@@ -294,7 +294,27 @@ ZED_MACOS_LEGACY_METAL_LAYER=1 cargo run -p zed
   views damage their current clipped bounds; and newly painted primitives also
   contribute their clipped primitive bounds to scene damage. Cached paint replay
   suppresses primitive damage so reused content does not spuriously dirty the
-  frame. The macOS IOSurface path encloses fractional scaled-pixel damage with
+  frame.
+- Runtime finding from launching the first bounded-damage build: seeding exact
+  hitbox damage and then calling `cx.notify(current_view)` was not actually
+  enough. `notify` marks the containing view dirty, and `AnyView::prepaint`
+  widened that dirty view back to its cached view bounds; repainting the dirty
+  view then inserted fresh primitives, which widened scene damage again. Under
+  pointer-heavy interaction this looked like low FPS/choppy presentation
+  because the renderer was still asked to redraw and upload large regions every
+  frame.
+- GPUI now has bounded dirty-view invalidation for element-local visual state.
+  The invalidator records an optional absolute damage rect per dirty view,
+  propagates that bounded damage through dirty ancestors so cached parent views
+  rebuild, damages only the bounded rect during prepaint, and suppresses
+  automatic primitive damage while painting that bounded dirty view. Local
+  `div` hover/group-hover, pressed/clicked, drag-start feedback, scroll-offset
+  changes, and interactive text mouse-down/up state now use this path instead
+  of `invalidate_bounds(...) + cx.notify(current_view)` or full refreshes.
+  These common input feedback frames therefore flow through bounded dirty-view
+  damage instead of conservative viewport/view damage. Editor-local mouse/hover
+  repaint paths still notify the editor view rather than refreshing the whole
+  window. The macOS IOSurface path encloses fractional scaled-pixel damage with
   floor-origin/ceil-max device-pixel bounds before feeding the presenter, so
   partial redraw scissoring never under-covers changed content at Retina scale
   boundaries.
@@ -307,10 +327,25 @@ ZED_MACOS_LEGACY_METAL_LAYER=1 cargo run -p zed
   layer attached to the `CAContext`; the NSView displays it through
   `CALayerHost.contextId`, matching Chromium's remote-layer topology.
 - The IOSurface content layer now mirrors Chromium's raw IOSurface fallback
-  details: contents gravity is top-left, and if a handoff assigns the same
-  IOSurface object already installed on the layer, Zed calls the private
-  `setContentsChanged` selector when available instead of relying on a no-op
-  `contents` assignment to invalidate CoreAnimation state.
+  details: contents gravity is top-left, minification and magnification filters
+  are nearest-neighbor like Chromium's `kCAFilterNearest` content layers, and
+  if a handoff assigns the same IOSurface object already installed on the
+  layer, Zed calls the private `setContentsChanged` selector when available
+  instead of relying on a no-op `contents` assignment to invalidate
+  CoreAnimation state. If that selector is unavailable, Zed forces a contents
+  transition through `nil` and back to the IOSurface inside the disabled
+  transaction so same-buffer relatching still reaches CoreAnimation.
+- The direct local `CALayer` fallback now also mirrors Chromium's
+  `DisplayCALayerTree` topology: a stable flipped backing layer is attached to
+  the NSView, and the IOSurface contents live in a separate child content layer
+  anchored at the origin. This keeps the non-CAContext fallback structurally
+  aligned with Chromium's raw IOSurface path instead of making the IOSurface
+  layer itself the view backing layer.
+- Core Animation layer-tree mutations now run with actions disabled, matching
+  Chromium's `ScopedCAActionDisabler` usage in `DisplayCALayerTree`. Zed
+  already disabled actions for the IOSurface contents transaction; the layer
+  tree now also disables implicit animations for size/scale/opacity changes,
+  CAContext recreation, `CALayerHost` replacement, and teardown.
 - The IOSurface handoff now checks the completed Metal command buffer status
   before touching CoreAnimation. Failed GPU work produces failed swap and
   presentation feedback, releases backpressure, restores the submitted damage
@@ -350,14 +385,15 @@ ZED_MACOS_LEGACY_METAL_LAYER=1 cargo run -p zed
   for the same tick. Deferred buffer-availability retries use the same async
   missed-BeginFrame path to avoid reentering `MacWindowState` while the
   display-timing commit still holds its lock.
-- Chromium enables `kVSyncAlignedPresentationForScrolling` by default while
-  leaving blanket `kVSyncAlignedPresentation` disabled. Zed now carries a
-  per-frame interaction bit on `Scene`, sourced from recent scroll/pinch input,
-  and the CA/IOSurface completion path uses it the same way: an interaction
-  frame can become GPU-ready immediately, but it waits for the next display-link
-  timing callback to commit to CoreAnimation. Non-interaction frames still keep
-  the no-backlog immediate commit path, matching Chromium's default policy
-  rather than forcing every frame through vsync-aligned presentation.
+- Runtime finding after launching the CA/IOSurface path: copying Chromium's
+  scroll-specific vsync-aligned presentation policy too literally is harmful in
+  this local GPUI pipeline. Zed does not yet have Chromium's full viz scheduler
+  and compositor-thread CA transaction cadence, so parking a completed
+  interaction IOSurface until the next display-link timing callback can create
+  an every-other-vsync cadence when GPU completion lands on the wrong side of
+  the tick. The local path now commits a lone ready queue-front IOSurface
+  immediately for both interaction and non-interaction frames, while still
+  deferring when there is a queue backlog.
 - When a window moves to another display, Zed now drains all currently ready
   queue-front IOSurface frames before replacing the display-link source. This
   mirrors Chromium's `SetVSyncDisplayID()` rule to commit pending CA frames
@@ -540,6 +576,12 @@ ZED_MACOS_LEGACY_METAL_LAYER=1 cargo run -p zed
   time. GPUI now keeps the BeginFrame source warm briefly after input that
   actually dirties the window, without forcing redraws, so the next invalidation
   has fresh display timing available.
+- GPUI now also mirrors Chromium's proactive post-draw BeginFrame behavior.
+  Chromium's `ProactiveBeginFrameWanted()` keeps the source subscribed after
+  `did_attempt_draw_in_last_frame_` to avoid negative glitches in
+  `SetNeedsBeginFrame` propagation. Zed now records draw attempts and keeps the
+  platform BeginFrame source warm for a short bounded window after a produced
+  frame, without marking the window dirty or forcing presentation.
 
 ### What this still is not
 
@@ -632,8 +674,12 @@ not have Chromium's full `BeginFrame` scheduler.
   current clipped bounds for non-cached dirty views, plus primitive bounds for
   newly painted content, while suppressing damage from cached paint replay. The
   CA/IOSurface path now skips no-damage scenes instead of inflating them to
-  full-frame damage. The remaining work is reducing conservative full-frame
-  fallbacks for global refresh and invalidations without reliable bounds.
+  full-frame damage. Element-local pressed/clicked state and scroll-offset
+  changes now use view invalidation plus known hitbox damage instead of
+  full-window/full-view refresh, and hover/editor-local repaint paths have been
+  narrowed similarly where their affected view or hitbox is known. The
+  remaining work is reducing conservative full-frame fallbacks for global
+  refresh and invalidations without reliable bounds.
 - **Process split.** Chromium uses CAContext/CALayerHost across its GPU/browser
   process boundary. Zed now has the layer topology locally; a true process split
   would be a much larger platform architecture change.

@@ -345,7 +345,8 @@ impl EditorElement {
             .iter()
             .find_map(|hitbox| hitbox.is_hovered(window).then_some(hitbox.id));
 
-        window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, _cx| {
+        let editor = self.editor.clone();
+        window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
             if !phase.bubble() {
                 return;
             }
@@ -354,7 +355,7 @@ impl EditorElement {
                 .iter()
                 .find_map(|hitbox| hitbox.is_hovered(window).then_some(hitbox.id));
             if hovered_hitbox != current_hover {
-                window.refresh();
+                editor.update(cx, |_, cx| cx.notify());
             }
         });
 

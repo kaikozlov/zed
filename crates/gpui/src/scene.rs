@@ -80,6 +80,12 @@ impl Scene {
         self.damage
     }
 
+    pub(crate) fn set_suppress_primitive_damage(&mut self, suppress: bool) -> bool {
+        let previous = self.suppress_primitive_damage;
+        self.suppress_primitive_damage = suppress;
+        previous
+    }
+
     pub fn set_handling_interaction(&mut self, handling_interaction: bool) {
         self.handling_interaction = handling_interaction;
     }
