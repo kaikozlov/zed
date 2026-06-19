@@ -1208,6 +1208,32 @@ fn update_draw_duration_estimate(draw_duration_estimate: &Cell<Duration>, draw_d
     ));
 }
 
+fn presentation_feedback_missed_latch(feedback: crate::PresentationFeedback) -> bool {
+    const LATCH_BUFFER: Duration = Duration::from_micros(1500);
+
+    if !feedback.presented || !feedback.vsync {
+        return false;
+    }
+
+    let Some(target_latch_time) = feedback.display_time.checked_sub(LATCH_BUFFER) else {
+        return false;
+    };
+    feedback.ready_time > target_latch_time
+}
+
+fn frame_interval_for_request(
+    request_frame_options: crate::RequestFrameOptions,
+    last_presentation_interval: Option<Duration>,
+) -> Duration {
+    request_frame_options
+        .begin_frame
+        .map(|begin_frame| begin_frame.interval)
+        .or(request_frame_options.frame_interval)
+        .or(last_presentation_interval)
+        .filter(|interval| !interval.is_zero())
+        .unwrap_or(Duration::from_micros(16667))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BeginFrameDeadlineMode {
     None,
@@ -1347,6 +1373,72 @@ mod tests {
         );
 
         assert_eq!(dirty_view_bounds.get(&view_id), Some(&None));
+    }
+
+    #[test]
+    fn presentation_feedback_detects_ready_after_target_latch() {
+        let display_time = Instant::now() + Duration::from_millis(16);
+        let feedback = crate::PresentationFeedback {
+            ready_time: display_time - Duration::from_micros(1000),
+            latch_time: display_time - Duration::from_micros(900),
+            display_time,
+            interval: Some(Duration::from_millis(16)),
+            presented: true,
+            vsync: true,
+            hardware_completion: true,
+        };
+
+        assert!(presentation_feedback_missed_latch(feedback));
+    }
+
+    #[test]
+    fn presentation_feedback_accepts_ready_before_target_latch() {
+        let display_time = Instant::now() + Duration::from_millis(16);
+        let feedback = crate::PresentationFeedback {
+            ready_time: display_time - Duration::from_micros(2000),
+            latch_time: display_time - Duration::from_micros(1900),
+            display_time,
+            interval: Some(Duration::from_millis(16)),
+            presented: true,
+            vsync: true,
+            hardware_completion: true,
+        };
+
+        assert!(!presentation_feedback_missed_latch(feedback));
+    }
+
+    #[test]
+    fn frame_interval_for_request_uses_presentation_feedback_fallback() {
+        assert_eq!(
+            frame_interval_for_request(
+                crate::RequestFrameOptions::default(),
+                Some(Duration::from_millis(8))
+            ),
+            Duration::from_millis(8)
+        );
+    }
+
+    #[test]
+    fn frame_interval_for_request_prefers_begin_frame_interval() {
+        let mut request_frame_options = crate::RequestFrameOptions {
+            frame_interval: Some(Duration::from_millis(12)),
+            ..Default::default()
+        };
+        request_frame_options.begin_frame = Some(crate::BeginFrameArgs {
+            id: crate::BeginFrameId {
+                source_id: 1,
+                sequence_number: 1,
+            },
+            frame_time: Instant::now(),
+            deadline: Instant::now() + Duration::from_millis(10),
+            interval: Duration::from_millis(10),
+            missed: false,
+        });
+
+        assert_eq!(
+            frame_interval_for_request(request_frame_options, Some(Duration::from_millis(8))),
+            Duration::from_millis(10)
+        );
     }
 
     #[test]
@@ -1735,6 +1827,7 @@ impl Window {
         let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
         let input_rate_tracker = Rc::new(RefCell::new(InputRateTracker::default()));
         let last_frame_time = Rc::new(Cell::new(None));
+        let last_presentation_interval = Rc::new(Cell::new(None));
         let has_presentation_feedback = Rc::new(Cell::new(false));
         let current_begin_frame_id = Rc::new(Cell::new(None::<crate::BeginFrameId>));
         let current_begin_frame_args = Rc::new(Cell::new(None::<crate::BeginFrameArgs>));
@@ -1742,6 +1835,7 @@ impl Window {
         let scheduled_begin_frame_deadline_id = Rc::new(Cell::new(None::<crate::BeginFrameId>));
         let scheduled_begin_frame_options = Rc::new(Cell::new(None::<crate::RequestFrameOptions>));
         let main_thread_missed_last_deadline = Rc::new(Cell::new(false));
+        let presentation_missed_last_latch = Rc::new(Cell::new(false));
         let draw_duration_estimate = Rc::new(Cell::new(Duration::from_micros(1000)));
 
         platform_window
@@ -1778,12 +1872,19 @@ impl Window {
         }
         platform_window.on_presentation_feedback(Box::new({
             let last_frame_time = last_frame_time.clone();
+            let last_presentation_interval = last_presentation_interval.clone();
             let has_presentation_feedback = has_presentation_feedback.clone();
+            let presentation_missed_last_latch = presentation_missed_last_latch.clone();
             move |feedback| {
                 if feedback.presented {
                     has_presentation_feedback.set(true);
                     last_frame_time.set(Some(feedback.display_time));
+                    if let Some(interval) = feedback.interval.filter(|interval| !interval.is_zero())
+                    {
+                        last_presentation_interval.set(Some(interval));
+                    }
                 }
+                presentation_missed_last_latch.set(presentation_feedback_missed_latch(feedback));
             }
         }));
 
@@ -1891,12 +1992,14 @@ impl Window {
             let next_frame_callbacks = next_frame_callbacks.clone();
             let input_rate_tracker = input_rate_tracker.clone();
             let has_presentation_feedback = has_presentation_feedback.clone();
+            let last_presentation_interval = last_presentation_interval.clone();
             let current_begin_frame_id = current_begin_frame_id.clone();
             let current_begin_frame_args = current_begin_frame_args.clone();
             let drew_current_begin_frame = drew_current_begin_frame.clone();
             let scheduled_begin_frame_deadline_id = scheduled_begin_frame_deadline_id.clone();
             let scheduled_begin_frame_options = scheduled_begin_frame_options.clone();
             let main_thread_missed_last_deadline = main_thread_missed_last_deadline.clone();
+            let presentation_missed_last_latch = presentation_missed_last_latch.clone();
             let draw_duration_estimate = draw_duration_estimate.clone();
             move |request_frame_options| {
                 if let Some(begin_frame) = request_frame_options.begin_frame {
@@ -1981,11 +2084,10 @@ impl Window {
                 let thermal_state = handle
                     .update(&mut cx, |_, _, cx| cx.thermal_state())
                     .log_err();
-                let frame_interval = request_frame_options
-                    .begin_frame
-                    .map(|begin_frame| begin_frame.interval)
-                    .or(request_frame_options.frame_interval)
-                    .unwrap_or(Duration::from_micros(16667));
+                let frame_interval = frame_interval_for_request(
+                    request_frame_options,
+                    last_presentation_interval.get(),
+                );
 
                 let presentation_deadline = request_frame_options
                     .begin_frame
@@ -2010,7 +2112,8 @@ impl Window {
                 // Throttle frame rate based on conditions:
                 // - Thermal pressure (Serious/Critical): cap to ~60fps
                 // - Inactive window (not focused): cap to ~30fps to save energy
-                let deadline_was_missed = main_thread_missed_last_deadline.get();
+                let deadline_was_missed =
+                    main_thread_missed_last_deadline.get() || presentation_missed_last_latch.get();
                 let min_frame_interval = if deadline_was_missed {
                     None
                 } else if !request_frame_options.force_render

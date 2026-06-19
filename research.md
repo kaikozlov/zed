@@ -471,6 +471,20 @@ ZED_MACOS_LEGACY_METAL_LAYER=1 cargo run -p zed
   time to presentation feedback time once feedback starts arriving. This is the
   first scheduler-level replacement for Zed's old "draw submitted means frame
   complete" model.
+- GPUI now also feeds presentation feedback back into deadline selection. If a
+  presented frame's GPU-ready time lands after the target latch window
+  (`display_time - 1.5 ms`, matching the Chromium mac latch-buffer model), the
+  next dirty BeginFrame is treated like a missed deadline and takes the
+  `IMMEDIATE` path instead of waiting for the regular delayed draw deadline.
+  This mirrors Chromium's `DisplayScheduler::OnPresentationFeedback()` check
+  for `ready_timestamp > target_latch_time`, adapted to Zed's local
+  display-link display-time estimate.
+- GPUI now retains the last valid `PresentationFeedback.interval` and uses it
+  as the scheduler's frame-interval fallback when a platform frame request does
+  not carry BeginFrame or frame-interval metadata. Chromium's mac coordinator
+  fills `feedback.interval` from display timing and viz preserves that interval
+  for vsync-backed presentation feedback; Zed now uses the same signal rather
+  than falling straight back to a hardcoded 16.667 ms interval.
 
 **BeginFrame input and lifecycle**
 
