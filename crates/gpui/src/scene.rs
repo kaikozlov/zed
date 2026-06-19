@@ -29,6 +29,7 @@ pub struct Scene {
     primitive_bounds: BoundsTree<ScaledPixels>,
     damage: Option<Bounds<ScaledPixels>>,
     suppress_primitive_damage: bool,
+    handling_interaction: bool,
     layer_stack: Vec<DrawOrder>,
     pub shadows: Vec<Shadow>,
     pub quads: Vec<Quad>,
@@ -47,6 +48,7 @@ impl Scene {
         self.primitive_bounds.clear();
         self.damage = None;
         self.suppress_primitive_damage = false;
+        self.handling_interaction = false;
         self.layer_stack.clear();
         self.paths.clear();
         self.shadows.clear();
@@ -76,6 +78,14 @@ impl Scene {
 
     pub fn damage(&self) -> Option<Bounds<ScaledPixels>> {
         self.damage
+    }
+
+    pub fn set_handling_interaction(&mut self, handling_interaction: bool) {
+        self.handling_interaction = handling_interaction;
+    }
+
+    pub fn is_handling_interaction(&self) -> bool {
+        self.handling_interaction
     }
 
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {

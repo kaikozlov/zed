@@ -282,6 +282,11 @@ ZED_MACOS_LEGACY_METAL_LAYER=1 cargo run -p zed
 - The Metal pass is ready for partial damage: full damage keeps the previous
   clear-and-redraw behavior, while non-full damage loads existing IOSurface
   contents and applies a Metal scissor rect for the damaged area.
+- The CA/IOSurface path now preserves no-damage frames as no-damage. If a
+  completed `Scene` has no damage region, the renderer skips taking an
+  IOSurface buffer instead of treating missing damage as full viewport damage.
+  This matches Chromium's partial-swap/root-render-pass behavior, where an
+  empty damage rect can skip drawing rather than manufacturing damage.
 - `Scene` now carries a damage region. Global refreshes and uncertain view
   invalidations remain conservative/full-frame, but dirty views no longer
   blindly damage the full viewport. Cached dirty views damage the union of
@@ -335,13 +340,24 @@ ZED_MACOS_LEGACY_METAL_LAYER=1 cargo run -p zed
   from that commit was still queued asynchronously on the main queue. GPUI
   therefore saw the stale "2 pending swaps" state for that display tick,
   classified the tick as GPU-busy, and completed the frame without drawing.
-  That creates an every-other-vsync-looking cadence under load. The macOS
-  display-link path now detects when `set_display_timing()` actually commits a
-  ready IOSurface and posts the normal GPUI frame callback behind the queued
+  That creates an every-other-vsync-looking cadence under load. The macOS frame
+  request path now detects when `set_display_timing()` actually commits a ready
+  IOSurface and posts the normal GPUI frame callback behind the queued
   swap-completion delivery, so the pending-swap count is current before the
-  scheduler decides whether to draw. Deferred buffer-availability retries use
-  the same async missed-BeginFrame path to avoid reentering `MacWindowState`
-  while the display-timing commit still holds its lock.
+  scheduler decides whether to draw. This applies both to normal display-link
+  ticks and explicit replay/missed-frame requests; a queued request skips
+  reapplying display timing so one request cannot drain several ready IOSurfaces
+  for the same tick. Deferred buffer-availability retries use the same async
+  missed-BeginFrame path to avoid reentering `MacWindowState` while the
+  display-timing commit still holds its lock.
+- Chromium enables `kVSyncAlignedPresentationForScrolling` by default while
+  leaving blanket `kVSyncAlignedPresentation` disabled. Zed now carries a
+  per-frame interaction bit on `Scene`, sourced from recent scroll/pinch input,
+  and the CA/IOSurface completion path uses it the same way: an interaction
+  frame can become GPU-ready immediately, but it waits for the next display-link
+  timing callback to commit to CoreAnimation. Non-interaction frames still keep
+  the no-backlog immediate commit path, matching Chromium's default policy
+  rather than forcing every frame through vsync-aligned presentation.
 - When a window moves to another display, Zed now drains all currently ready
   queue-front IOSurface frames before replacing the display-link source. This
   mirrors Chromium's `SetVSyncDisplayID()` rule to commit pending CA frames
@@ -615,8 +631,9 @@ not have Chromium's full `BeginFrame` scheduler.
   GPUI now submits precise old/new clipped bounds for cached dirty views and
   current clipped bounds for non-cached dirty views, plus primitive bounds for
   newly painted content, while suppressing damage from cached paint replay. The
-  remaining work is reducing conservative full-frame fallbacks for global
-  refresh and invalidations without reliable bounds.
+  CA/IOSurface path now skips no-damage scenes instead of inflating them to
+  full-frame damage. The remaining work is reducing conservative full-frame
+  fallbacks for global refresh and invalidations without reliable bounds.
 - **Process split.** Chromium uses CAContext/CALayerHost across its GPU/browser
   process boundary. Zed now has the layer topology locally; a true process split
   would be a much larger platform architecture change.

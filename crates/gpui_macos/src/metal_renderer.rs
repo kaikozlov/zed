@@ -154,6 +154,7 @@ struct PresentedIosurfaceFrame {
     submitted_damage: Bounds<DevicePixels>,
     backpressure_fence: IosurfaceBackpressureFence,
     committed_backpressure_fence: Arc<Mutex<Option<IosurfaceBackpressureFence>>>,
+    delay_until_next_vsync: bool,
 }
 
 #[derive(Clone)]
@@ -232,6 +233,13 @@ impl<T> IosurfaceSubmissionQueue<T> {
         self.frames
             .pop_front()
             .map(|queued_frame| queued_frame.frame)
+    }
+
+    fn ready_front(&self) -> Option<&T> {
+        self.frames
+            .front()
+            .filter(|queued_frame| queued_frame.ready)
+            .map(|queued_frame| &queued_frame.frame)
     }
 
     fn ready_front_count(&self) -> usize {
@@ -836,8 +844,11 @@ fn commit_iosurface_frame(frame: Box<PresentedIosurfaceFrame>) {
     }
 }
 
-fn should_commit_ready_iosurface_frame_immediately(queued_frame_count: usize) -> bool {
-    queued_frame_count <= 1
+fn should_commit_ready_iosurface_frame_immediately(
+    queued_frame_count: usize,
+    delay_until_next_vsync: bool,
+) -> bool {
+    queued_frame_count <= 1 && !delay_until_next_vsync
 }
 
 fn commit_ready_iosurface_frame(
@@ -863,6 +874,25 @@ fn commit_all_ready_iosurface_frames(
     }
 }
 
+fn commit_ready_iosurface_frame_after_completion(
+    presented_frames: Arc<Mutex<IosurfaceSubmissionQueue<Box<PresentedIosurfaceFrame>>>>,
+) {
+    let should_commit = {
+        let presented_frames = presented_frames.lock();
+        let Some(frame) = presented_frames.ready_front() else {
+            return;
+        };
+        should_commit_ready_iosurface_frame_immediately(
+            presented_frames.len(),
+            frame.delay_until_next_vsync,
+        )
+    };
+
+    if should_commit {
+        commit_ready_iosurface_frame(presented_frames);
+    }
+}
+
 extern "C" fn complete_presented_iosurface_frame_async(context: *mut c_void) {
     let completion = unsafe { Box::from_raw(context as *mut IosurfaceFrameCompletion) };
     if completion.status == MTLCommandBufferStatus::Completed {
@@ -879,10 +909,7 @@ extern "C" fn complete_presented_iosurface_frame_async(context: *mut c_void) {
                 completion.submission_order
             );
         }
-        let queued_frame_count = completion.presented_frames.lock().len();
-        if should_commit_ready_iosurface_frame_immediately(queued_frame_count) {
-            commit_ready_iosurface_frame(completion.presented_frames.clone());
-        }
+        commit_ready_iosurface_frame_after_completion(completion.presented_frames.clone());
     } else {
         log::error!(
             "failed to render IOSurface frame: Metal command buffer finished with status {:?}",
@@ -900,10 +927,7 @@ extern "C" fn complete_presented_iosurface_frame_async(context: *mut c_void) {
                 completion.submission_order
             );
         }
-        let queued_frame_count = completion.presented_frames.lock().len();
-        if should_commit_ready_iosurface_frame_immediately(queued_frame_count) {
-            commit_ready_iosurface_frame(completion.presented_frames.clone());
-        }
+        commit_ready_iosurface_frame_after_completion(completion.presented_frames.clone());
     }
 }
 
@@ -1466,6 +1490,10 @@ impl MetalRenderer {
                 commit_ready_iosurface_frame(presenter.presented_frames.clone());
             }
 
+            if scene_damage(scene, viewport_size).is_none() {
+                return PlatformDrawResult::Skipped;
+            }
+
             let Some(buffer_index) = presenter.next_buffer_index() else {
                 log::debug!(
                     "skipping frame because the CA/IOSurface presenter has no available buffer"
@@ -1487,7 +1515,7 @@ impl MetalRenderer {
                         .core_animation_presenter
                         .as_mut()
                         .expect("checked above");
-                    let frame_damage = scene_damage(scene, viewport_size);
+                    let frame_damage = scene_damage(scene, viewport_size).expect("checked above");
                     presenter.update_buffer_damage(frame_damage);
                     let damage = presenter.buffer_damage(buffer_index);
                     let texture = presenter.buffers[buffer_index].texture.clone();
@@ -1547,6 +1575,7 @@ impl MetalRenderer {
                         committed_backpressure_fence: presenter
                             .committed_backpressure_fence
                             .clone(),
+                        delay_until_next_vsync: scene.is_handling_interaction(),
                     };
                     presented_frames
                         .lock()
@@ -2705,13 +2734,12 @@ fn full_texture_bounds(size: Size<DevicePixels>) -> Bounds<DevicePixels> {
     bounds(point(DevicePixels(0), DevicePixels(0)), size)
 }
 
-fn scene_damage(scene: &Scene, viewport_size: Size<DevicePixels>) -> Bounds<DevicePixels> {
+fn scene_damage(scene: &Scene, viewport_size: Size<DevicePixels>) -> Option<Bounds<DevicePixels>> {
     scene
         .damage()
         .map(scaled_damage_to_device_bounds)
         .map(|damage| clamp_damage(damage, viewport_size))
         .filter(|damage| !damage.is_empty())
-        .unwrap_or_else(|| full_texture_bounds(viewport_size))
 }
 
 fn scaled_damage_to_device_bounds(damage: Bounds<ScaledPixels>) -> Bounds<DevicePixels> {
@@ -2973,6 +3001,16 @@ mod tests {
     }
 
     #[test]
+    fn scene_damage_preserves_empty_damage() {
+        let scene = Scene::default();
+
+        assert_eq!(
+            scene_damage(&scene, size(DevicePixels(100), DevicePixels(50))),
+            None
+        );
+    }
+
+    #[test]
     fn decrement_pending_swap_count_saturates_at_zero() {
         let pending_swap_count = AtomicUsize::new(0);
         decrement_pending_swap_count(&pending_swap_count);
@@ -3032,9 +3070,16 @@ mod tests {
 
     #[test]
     fn iosurface_commit_cadence_delays_when_queue_has_backlog() {
-        assert!(should_commit_ready_iosurface_frame_immediately(0));
-        assert!(should_commit_ready_iosurface_frame_immediately(1));
-        assert!(!should_commit_ready_iosurface_frame_immediately(2));
+        assert!(should_commit_ready_iosurface_frame_immediately(0, false));
+        assert!(should_commit_ready_iosurface_frame_immediately(1, false));
+        assert!(!should_commit_ready_iosurface_frame_immediately(2, false));
+    }
+
+    #[test]
+    fn iosurface_commit_cadence_delays_interaction_frames_until_vsync() {
+        assert!(!should_commit_ready_iosurface_frame_immediately(0, true));
+        assert!(!should_commit_ready_iosurface_frame_immediately(1, true));
+        assert!(!should_commit_ready_iosurface_frame_immediately(2, true));
     }
 
     #[test]

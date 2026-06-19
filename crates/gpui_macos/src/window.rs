@@ -543,6 +543,7 @@ struct SwapCompletionDelivery {
 struct FrameRequestDelivery {
     window_state: Weak<Mutex<MacWindowState>>,
     options: RequestFrameOptions,
+    apply_display_timing: bool,
 }
 
 impl MacWindowState {
@@ -1739,14 +1740,7 @@ impl PlatformWindow for MacWindow {
     }
 
     fn request_frame(&self, options: RequestFrameOptions) {
-        let delivery = FrameRequestDelivery {
-            window_state: Arc::downgrade(&self.0),
-            options,
-        };
-        let context = Box::into_raw(Box::new(delivery)) as *mut c_void;
-        unsafe {
-            DispatchQueue::main().exec_async_f(context, request_frame_async);
-        }
+        dispatch_frame_request(Arc::downgrade(&self.0), options, true);
     }
 
     fn request_begin_frame(&self) {
@@ -2848,6 +2842,7 @@ extern "C" fn step(view: *mut c_void) {
         let delivery = FrameRequestDelivery {
             window_state: Arc::downgrade(&window_state),
             options: request_frame_options,
+            apply_display_timing: false,
         };
         let context = Box::into_raw(Box::new(delivery)) as *mut c_void;
         unsafe {
@@ -2883,7 +2878,11 @@ extern "C" fn request_begin_frame_async(context: *mut c_void) {
 
 extern "C" fn request_frame_async(context: *mut c_void) {
     let delivery = unsafe { Box::from_raw(context as *mut FrameRequestDelivery) };
-    request_frame(delivery.window_state, delivery.options);
+    request_frame(
+        delivery.window_state,
+        delivery.options,
+        delivery.apply_display_timing,
+    );
 }
 
 fn missed_display_link_timing(last_timing: DisplayLinkTiming) -> Option<DisplayLinkTiming> {
@@ -2904,15 +2903,42 @@ fn missed_display_link_timing(last_timing: DisplayLinkTiming) -> Option<DisplayL
     })
 }
 
-fn request_frame(window_state: Weak<Mutex<MacWindowState>>, options: RequestFrameOptions) {
+fn dispatch_frame_request(
+    window_state: Weak<Mutex<MacWindowState>>,
+    options: RequestFrameOptions,
+    apply_display_timing: bool,
+) {
+    let delivery = FrameRequestDelivery {
+        window_state,
+        options,
+        apply_display_timing,
+    };
+    let context = Box::into_raw(Box::new(delivery)) as *mut c_void;
+    unsafe {
+        DispatchQueue::main().exec_async_f(context, request_frame_async);
+    }
+}
+
+fn request_frame(
+    window_state: Weak<Mutex<MacWindowState>>,
+    options: RequestFrameOptions,
+    apply_display_timing: bool,
+) {
     let Some(window_state) = window_state.upgrade() else {
         return;
     };
 
     let mut lock = window_state.lock();
-    if let Some(predicted_display_time) = options.predicted_display_time {
-        lock.renderer
-            .set_display_timing(predicted_display_time, options.frame_interval);
+    if apply_display_timing
+        && let Some(predicted_display_time) = options.predicted_display_time
+        && lock
+            .renderer
+            .set_display_timing(predicted_display_time, options.frame_interval)
+        && lock.request_frame_callback.is_some()
+    {
+        drop(lock);
+        dispatch_frame_request(Arc::downgrade(&window_state), options, false);
+        return;
     }
     let Some(mut callback) = lock.request_frame_callback.take() else {
         return;
@@ -2945,7 +2971,7 @@ fn request_begin_frame(window_state: Weak<Mutex<MacWindowState>>) {
     request_frame_options.predicted_display_time = Some(display_link_timing.predicted_display_time);
     request_frame_options.frame_interval = display_link_timing.frame_interval;
     request_frame_options.frame_deadline = Some(display_link_timing.frame_deadline);
-    request_frame(Arc::downgrade(&window_state), request_frame_options);
+    request_frame(Arc::downgrade(&window_state), request_frame_options, true);
 }
 
 fn request_missed_frame(window_state: Weak<Mutex<MacWindowState>>) {
@@ -2964,23 +2990,14 @@ fn request_missed_frame(window_state: Weak<Mutex<MacWindowState>>) {
         return;
     };
     lock.last_display_link_timing = Some(display_link_timing);
-    lock.renderer.set_display_timing(
-        display_link_timing.predicted_display_time,
-        display_link_timing.frame_interval,
-    );
-    let Some(mut callback) = lock.request_frame_callback.take() else {
-        return;
-    };
-    drop(lock);
-
     let mut request_frame_options = RequestFrameOptions::default();
     request_frame_options.begin_frame = Some(display_link_timing.begin_frame);
     request_frame_options.predicted_display_time = Some(display_link_timing.predicted_display_time);
     request_frame_options.frame_interval = display_link_timing.frame_interval;
     request_frame_options.frame_deadline = Some(display_link_timing.frame_deadline);
-    callback(request_frame_options);
+    drop(lock);
 
-    window_state.lock().request_frame_callback = Some(callback);
+    request_frame(Arc::downgrade(&window_state), request_frame_options, true);
 }
 
 extern "C" fn deliver_presentation_feedback_async(context: *mut c_void) {

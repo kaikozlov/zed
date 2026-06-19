@@ -1131,6 +1131,10 @@ impl InputRateTracker {
                 .is_some_and(|last_scroll_input_at| last_scroll_input_at < begin_frame.frame_time)
     }
 
+    pub fn is_handling_scroll_interaction(&self) -> bool {
+        Instant::now() < self.scroll_sustain_until
+    }
+
     fn prune_old_timestamps(&mut self, now: Instant) {
         self.timestamps
             .retain(|&t| now.duration_since(t) <= self.window);
@@ -3307,6 +3311,11 @@ impl Window {
         }
         self.dirty_views.clear();
         self.next_frame.window_active = self.active.get();
+        self.next_frame.scene.set_handling_interaction(
+            self.input_rate_tracker
+                .borrow()
+                .is_handling_scroll_interaction(),
+        );
 
         // Register requested input handler with the platform window.
         // Use .take() instead of .pop() to preserve Vec length, so that cached
