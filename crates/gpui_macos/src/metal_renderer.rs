@@ -9,8 +9,8 @@ use cocoa::{
 use gpui::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, MonochromeSprite, PaintSurface,
     Path, PlatformDrawResult, Point, PolychromeSprite, PresentationFeedback, PrimitiveBatch, Quad,
-    ScaledPixels, Scene, Shadow, Size, Surface, SwapCompletionFeedback, Underline, bounds, point,
-    size,
+    ScaledPixels, Scene, Shadow, Size, Surface, SwapCompletionFeedback, SwapCompletionResult,
+    Underline, bounds, point, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -28,20 +28,22 @@ use core_video::{
 use foreign_types::{ForeignType, ForeignTypeRef};
 use metal::{
     CommandQueue, MTLCommandBufferStatus, MTLGPUFamily, MTLPixelFormat, MTLResourceOptions,
-    MTLScissorRect, NSRange, RenderPassColorAttachmentDescriptorRef,
+    MTLScissorRect, NSRange, RenderPassColorAttachmentDescriptorRef, SharedEvent,
 };
 use objc::{self, class, msg_send, sel, sel_impl};
 use parking_lot::Mutex;
 
 use std::{
     cell::Cell,
+    collections::VecDeque,
     ffi::c_void,
     mem, ptr,
     rc::Rc,
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
+    thread,
     time::Duration,
 };
 
@@ -105,6 +107,11 @@ struct CoreAnimationPresenter {
     pending_swap_count: Arc<AtomicUsize>,
     current_buffer_index: Arc<AtomicUsize>,
     generation: Arc<AtomicUsize>,
+    next_submission_order: Arc<AtomicUsize>,
+    backpressure_event: SharedEvent,
+    next_backpressure_value: AtomicU64,
+    committed_backpressure_fence: Arc<Mutex<Option<IosurfaceBackpressureFence>>>,
+    presented_frames: Arc<Mutex<IosurfaceSubmissionQueue<Box<PresentedIosurfaceFrame>>>>,
     deferred_frame_requested: Arc<AtomicBool>,
     deferred_frame_callback: Option<Arc<dyn Fn() + Send + Sync>>,
     has_resized_since_last_swap: bool,
@@ -124,7 +131,7 @@ struct IosurfaceFrameBuffer {
     surface: io_surface::IOSurface,
     texture: metal::Texture,
     pending: Arc<AtomicBool>,
-    damage: Bounds<DevicePixels>,
+    damage: Arc<Mutex<Bounds<DevicePixels>>>,
 }
 
 #[allow(deprecated)]
@@ -143,6 +150,106 @@ struct PresentedIosurfaceFrame {
     latest_display_timing: Arc<Mutex<Option<FrameDisplayTiming>>>,
     ready_time: scheduler::Instant,
     buffer_index: usize,
+    buffer_damage: Arc<Mutex<Bounds<DevicePixels>>>,
+    submitted_damage: Bounds<DevicePixels>,
+    backpressure_fence: IosurfaceBackpressureFence,
+    committed_backpressure_fence: Arc<Mutex<Option<IosurfaceBackpressureFence>>>,
+}
+
+#[derive(Clone)]
+struct IosurfaceBackpressureFence {
+    event: SharedEvent,
+    value: u64,
+}
+
+struct QueuedIosurfaceSubmission<T> {
+    order: usize,
+    ready: bool,
+    frame: T,
+}
+
+struct IosurfaceSubmissionQueue<T> {
+    frames: VecDeque<QueuedIosurfaceSubmission<T>>,
+}
+
+impl<T> Default for IosurfaceSubmissionQueue<T> {
+    fn default() -> Self {
+        Self {
+            frames: VecDeque::new(),
+        }
+    }
+}
+
+impl<T> IosurfaceSubmissionQueue<T> {
+    fn push(&mut self, order: usize, frame: T) {
+        let queued_frame = QueuedIosurfaceSubmission {
+            order,
+            ready: false,
+            frame,
+        };
+        let insertion_index = self
+            .frames
+            .iter()
+            .position(|queued_frame| queued_frame.order > order);
+        if let Some(insertion_index) = insertion_index {
+            self.frames.insert(insertion_index, queued_frame);
+        } else {
+            self.frames.push_back(queued_frame);
+        }
+    }
+
+    fn mark_ready_with(&mut self, order: usize, update: impl FnOnce(&mut T)) -> bool {
+        let Some(frame) = self
+            .frames
+            .iter_mut()
+            .find(|queued_frame| queued_frame.order == order)
+        else {
+            return false;
+        };
+        update(&mut frame.frame);
+        frame.ready = true;
+        true
+    }
+
+    fn remove(&mut self, order: usize) -> Option<T> {
+        let index = self
+            .frames
+            .iter()
+            .position(|queued_frame| queued_frame.order == order)?;
+        self.frames
+            .remove(index)
+            .map(|queued_frame| queued_frame.frame)
+    }
+
+    fn pop_ready_front(&mut self) -> Option<T> {
+        if !self
+            .frames
+            .front()
+            .is_some_and(|queued_frame| queued_frame.ready)
+        {
+            return None;
+        }
+        self.frames
+            .pop_front()
+            .map(|queued_frame| queued_frame.frame)
+    }
+
+    fn ready_front_count(&self) -> usize {
+        self.frames
+            .iter()
+            .take_while(|queued_frame| queued_frame.ready)
+            .count()
+    }
+
+    fn len(&self) -> usize {
+        self.frames.len()
+    }
+}
+
+struct IosurfaceFrameCompletion {
+    presented_frames: Arc<Mutex<IosurfaceSubmissionQueue<Box<PresentedIosurfaceFrame>>>>,
+    submission_order: usize,
+    status: MTLCommandBufferStatus,
 }
 
 impl Drop for PresentedIosurfaceFrame {
@@ -213,6 +320,11 @@ impl CoreAnimationPresenter {
             pending_swap_count: Arc::new(AtomicUsize::new(0)),
             current_buffer_index: Arc::new(AtomicUsize::new(NO_CURRENT_BUFFER)),
             generation: Arc::new(AtomicUsize::new(0)),
+            next_submission_order: Arc::new(AtomicUsize::new(0)),
+            backpressure_event: device.new_shared_event(),
+            next_backpressure_value: AtomicU64::new(0),
+            committed_backpressure_fence: Arc::new(Mutex::new(None)),
+            presented_frames: Arc::new(Mutex::new(IosurfaceSubmissionQueue::default())),
             deferred_frame_requested: Arc::new(AtomicBool::new(false)),
             deferred_frame_callback: None,
             has_resized_since_last_swap: false,
@@ -296,7 +408,8 @@ impl CoreAnimationPresenter {
         let full_damage = self.full_damage();
         for (index, buffer) in self.buffers.iter_mut().enumerate() {
             if index != current_buffer_index {
-                buffer.damage = buffer.damage.union(&damage).intersect(&full_damage);
+                let mut buffer_damage = buffer.damage.lock();
+                *buffer_damage = buffer_damage.union(&damage).intersect(&full_damage);
             }
         }
     }
@@ -304,13 +417,13 @@ impl CoreAnimationPresenter {
     fn buffer_damage(&self, buffer_index: usize) -> Bounds<DevicePixels> {
         self.buffers
             .get(buffer_index)
-            .map(|buffer| clamp_damage(buffer.damage, self.drawable_size))
+            .map(|buffer| clamp_damage(*buffer.damage.lock(), self.drawable_size))
             .unwrap_or_else(|| self.full_damage())
     }
 
     fn clear_buffer_damage(&mut self, buffer_index: usize) {
         if let Some(buffer) = self.buffers.get_mut(buffer_index) {
-            buffer.damage = Bounds::default();
+            *buffer.damage.lock() = Bounds::default();
         }
     }
 
@@ -344,6 +457,23 @@ impl CoreAnimationPresenter {
         }
     }
 
+    fn next_submission_order(&self) -> usize {
+        self.next_submission_order.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    fn next_backpressure_fence(&self) -> IosurfaceBackpressureFence {
+        IosurfaceBackpressureFence {
+            event: self.backpressure_event.clone(),
+            value: self.next_backpressure_value.fetch_add(1, Ordering::AcqRel) + 1,
+        }
+    }
+
+    fn apply_committed_backpressure(&self) {
+        if let Some(fence) = self.committed_backpressure_fence.lock().take() {
+            apply_iosurface_backpressure_fence(&fence);
+        }
+    }
+
     fn set_deferred_frame_callback(&mut self, callback: Option<Arc<dyn Fn() + Send + Sync>>) {
         self.deferred_frame_callback = callback;
     }
@@ -366,11 +496,12 @@ impl CoreAnimationPresenter {
         &self,
         next_display_time: scheduler::Instant,
         frame_interval: Option<Duration>,
-    ) {
+    ) -> bool {
         *self.latest_display_timing.lock() = Some(FrameDisplayTiming {
             next_display_time,
             frame_interval,
         });
+        commit_ready_iosurface_frame(self.presented_frames.clone())
     }
 }
 
@@ -384,7 +515,7 @@ impl IosurfaceFrameBuffer {
             surface,
             texture,
             pending: Arc::new(AtomicBool::new(false)),
-            damage: full_texture_bounds(size),
+            damage: Arc::new(Mutex::new(full_texture_bounds(size))),
         })
     }
 }
@@ -537,13 +668,43 @@ fn decrement_pending_swap_count(pending_swap_count: &AtomicUsize) {
     }
 }
 
-fn complete_iosurface_frame(frame: Box<PresentedIosurfaceFrame>) {
+fn restore_failed_buffer_damage(
+    buffer_damage: &Mutex<Bounds<DevicePixels>>,
+    submitted_damage: Bounds<DevicePixels>,
+) {
+    if submitted_damage.is_empty() {
+        return;
+    }
+
+    let mut buffer_damage = buffer_damage.lock();
+    *buffer_damage = buffer_damage.union(&submitted_damage);
+}
+
+fn swap_completion_result_for_iosurface_frame(presented: bool) -> SwapCompletionResult {
+    if presented {
+        SwapCompletionResult::Ack
+    } else {
+        SwapCompletionResult::Skipped
+    }
+}
+
+fn iosurface_backpressure_fence_is_signaled(signaled_value: u64, fence_value: u64) -> bool {
+    signaled_value >= fence_value
+}
+
+fn apply_iosurface_backpressure_fence(fence: &IosurfaceBackpressureFence) {
+    while !iosurface_backpressure_fence_is_signaled(fence.event.signaled_value(), fence.value) {
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn complete_iosurface_frame(frame: Box<PresentedIosurfaceFrame>, presented: bool) {
     let latch_time = scheduler::Instant::now();
-    let presented = frame.generation == frame.current_generation.load(Ordering::Acquire);
     if let Some(callback) = &frame.swap_completion_callback {
         callback(SwapCompletionFeedback {
             ready_time: frame.ready_time,
             latch_time,
+            result: swap_completion_result_for_iosurface_frame(presented),
             presented,
         });
     }
@@ -570,6 +731,7 @@ fn complete_iosurface_frame(frame: Box<PresentedIosurfaceFrame>) {
         frame
             .current_buffer_index
             .store(frame.buffer_index, Ordering::Release);
+        *frame.committed_backpressure_fence.lock() = Some(frame.backpressure_fence.clone());
     }
     frame.buffer_pending.store(false, Ordering::Release);
     decrement_pending_swap_count(&frame.pending_swap_count);
@@ -592,10 +754,12 @@ fn supports_ca_transaction_phase_handlers() -> bool {
 
 fn fail_iosurface_frame(frame: Box<PresentedIosurfaceFrame>) {
     let latch_time = scheduler::Instant::now();
+    restore_failed_buffer_damage(&frame.buffer_damage, frame.submitted_damage);
     if let Some(callback) = &frame.swap_completion_callback {
         callback(SwapCompletionFeedback {
             ready_time: frame.ready_time,
             latch_time,
+            result: SwapCompletionResult::Failed,
             presented: false,
         });
     }
@@ -620,10 +784,9 @@ fn fail_iosurface_frame(frame: Box<PresentedIosurfaceFrame>) {
     }
 }
 
-extern "C" fn present_iosurface_frame(context: *mut c_void) {
-    let frame = unsafe { Box::from_raw(context as *mut PresentedIosurfaceFrame) };
+fn commit_iosurface_frame(frame: Box<PresentedIosurfaceFrame>) {
     if frame.generation != frame.current_generation.load(Ordering::Acquire) {
-        complete_iosurface_frame(frame);
+        complete_iosurface_frame(frame, false);
         return;
     }
 
@@ -632,7 +795,7 @@ extern "C" fn present_iosurface_frame(context: *mut c_void) {
         let frame = frame.clone();
         let block = ConcreteBlock::new(move || {
             if let Some(frame) = frame.take() {
-                complete_iosurface_frame(frame);
+                complete_iosurface_frame(frame, true);
             }
         });
         Some(block.copy())
@@ -652,23 +815,96 @@ extern "C" fn present_iosurface_frame(context: *mut c_void) {
             ];
         }
         if let Some(frame_for_contents) = frame.take() {
-            let _: () = msg_send![
+            let contents = frame_for_contents.surface.as_concrete_TypeRef() as id;
+            let previous_contents: id = msg_send![frame_for_contents.layer, contents];
+            let supports_contents_changed: bool = msg_send![
                 frame_for_contents.layer,
-                setContents: frame_for_contents.surface.as_concrete_TypeRef() as id
+                respondsToSelector: sel!(setContentsChanged)
             ];
+            if !contents.is_null() && contents == previous_contents && supports_contents_changed {
+                let _: () = msg_send![frame_for_contents.layer, setContentsChanged];
+            } else {
+                let _: () = msg_send![frame_for_contents.layer, setContents: contents];
+            }
             frame.set(Some(frame_for_contents));
         }
         let _: () = msg_send![class!(CATransaction), commit];
     }
 
     if let Some(frame) = frame.take() {
-        complete_iosurface_frame(frame);
+        complete_iosurface_frame(frame, true);
     }
 }
 
-extern "C" fn fail_iosurface_frame_async(context: *mut c_void) {
-    let frame = unsafe { Box::from_raw(context as *mut PresentedIosurfaceFrame) };
-    fail_iosurface_frame(frame);
+fn should_commit_ready_iosurface_frame_immediately(queued_frame_count: usize) -> bool {
+    queued_frame_count <= 1
+}
+
+fn commit_ready_iosurface_frame(
+    presented_frames: Arc<Mutex<IosurfaceSubmissionQueue<Box<PresentedIosurfaceFrame>>>>,
+) -> bool {
+    let frame = {
+        let mut presented_frames = presented_frames.lock();
+        presented_frames.pop_ready_front()
+    };
+    let Some(frame) = frame else {
+        return false;
+    };
+    commit_iosurface_frame(frame);
+    true
+}
+
+fn commit_all_ready_iosurface_frames(
+    presented_frames: Arc<Mutex<IosurfaceSubmissionQueue<Box<PresentedIosurfaceFrame>>>>,
+) {
+    let ready_front_count = presented_frames.lock().ready_front_count();
+    for _ in 0..ready_front_count {
+        commit_ready_iosurface_frame(presented_frames.clone());
+    }
+}
+
+extern "C" fn complete_presented_iosurface_frame_async(context: *mut c_void) {
+    let completion = unsafe { Box::from_raw(context as *mut IosurfaceFrameCompletion) };
+    if completion.status == MTLCommandBufferStatus::Completed {
+        let ready_time = scheduler::Instant::now();
+        let marked_ready = {
+            let mut presented_frames = completion.presented_frames.lock();
+            presented_frames.mark_ready_with(completion.submission_order, |frame| {
+                frame.ready_time = ready_time;
+            })
+        };
+        if !marked_ready {
+            log::error!(
+                "completed IOSurface submission {} was not found in the presentation queue",
+                completion.submission_order
+            );
+        }
+        let queued_frame_count = completion.presented_frames.lock().len();
+        if should_commit_ready_iosurface_frame_immediately(queued_frame_count) {
+            commit_ready_iosurface_frame(completion.presented_frames.clone());
+        }
+    } else {
+        log::error!(
+            "failed to render IOSurface frame: Metal command buffer finished with status {:?}",
+            completion.status
+        );
+        let frame = {
+            let mut presented_frames = completion.presented_frames.lock();
+            presented_frames.remove(completion.submission_order)
+        };
+        if let Some(frame) = frame {
+            fail_iosurface_frame(frame);
+        } else {
+            log::error!(
+                "failed IOSurface submission {} was not found in the presentation queue",
+                completion.submission_order
+            );
+        }
+        let queued_frame_count = completion.presented_frames.lock().len();
+        if should_commit_ready_iosurface_frame_immediately(queued_frame_count) {
+            commit_ready_iosurface_frame(completion.presented_frames.clone());
+        }
+    }
 }
 
 pub(crate) struct MetalRenderer {
@@ -1004,6 +1240,10 @@ impl MetalRenderer {
             .map(|_| IOSURFACE_MAX_PENDING_SWAPS as u32)
     }
 
+    pub fn supports_delayed_begin_frame_scheduling(&self) -> bool {
+        self.core_animation_presenter.is_none()
+    }
+
     pub fn set_swap_completion_callback(
         &mut self,
         callback: Option<Arc<dyn Fn(SwapCompletionFeedback) + Send + Sync>>,
@@ -1028,9 +1268,17 @@ impl MetalRenderer {
         &mut self,
         next_display_time: scheduler::Instant,
         frame_interval: Option<Duration>,
-    ) {
+    ) -> bool {
         if let Some(presenter) = &self.core_animation_presenter {
-            presenter.set_display_timing(next_display_time, frame_interval);
+            presenter.set_display_timing(next_display_time, frame_interval)
+        } else {
+            false
+        }
+    }
+
+    pub fn flush_ready_display_frames(&mut self) {
+        if let Some(presenter) = &self.core_animation_presenter {
+            commit_all_ready_iosurface_frames(presenter.presented_frames.clone());
         }
     }
 
@@ -1212,6 +1460,12 @@ impl MetalRenderer {
                 return PlatformDrawResult::Skipped;
             }
 
+            presenter.apply_committed_backpressure();
+
+            if presenter.pending_swap_count.load(Ordering::Acquire) >= IOSURFACE_MAX_PENDING_SWAPS {
+                commit_ready_iosurface_frame(presenter.presented_frames.clone());
+            }
+
             let Some(buffer_index) = presenter.next_buffer_index() else {
                 log::debug!(
                     "skipping frame because the CA/IOSurface presenter has no available buffer"
@@ -1246,10 +1500,11 @@ impl MetalRenderer {
                     viewport_size,
                     Some(damage),
                 )
+                .map(|command_buffer| (command_buffer, damage))
             };
 
             match command_buffer {
-                Ok(command_buffer) => {
+                Ok((command_buffer, submitted_damage)) => {
                     let instance_buffer_pool = self.instance_buffer_pool.clone();
                     let presenter = self
                         .core_animation_presenter
@@ -1258,6 +1513,11 @@ impl MetalRenderer {
                     presenter.clear_buffer_damage(buffer_index);
                     presenter.mark_buffer_pending(buffer_index);
                     presenter.prepare_to_present();
+                    let submission_order = presenter.next_submission_order();
+                    let backpressure_fence = presenter.next_backpressure_fence();
+                    command_buffer
+                        .encode_signal_event(&backpressure_fence.event, backpressure_fence.value);
+                    let presented_frames = presenter.presented_frames.clone();
 
                     let buffer = &presenter.buffers[buffer_index];
                     let presented_frame = PresentedIosurfaceFrame {
@@ -1281,37 +1541,36 @@ impl MetalRenderer {
                         latest_display_timing: presenter.latest_display_timing.clone(),
                         ready_time: scheduler::Instant::now(),
                         buffer_index,
+                        buffer_damage: buffer.damage.clone(),
+                        submitted_damage,
+                        backpressure_fence,
+                        committed_backpressure_fence: presenter
+                            .committed_backpressure_fence
+                            .clone(),
                     };
+                    presented_frames
+                        .lock()
+                        .push(submission_order, Box::new(presented_frame));
                     let instance_buffer = Cell::new(Some(instance_buffer));
-                    let presented_frame = Cell::new(Some(presented_frame));
-                    let block = ConcreteBlock::new(
-                        move |command_buffer: &metal::CommandBufferRef| {
+                    let block =
+                        ConcreteBlock::new(move |command_buffer: &metal::CommandBufferRef| {
                             if let Some(instance_buffer) = instance_buffer.take() {
                                 instance_buffer_pool.lock().release(instance_buffer);
                             }
 
-                            if let Some(mut presented_frame) = presented_frame.take() {
-                                presented_frame.ready_time = scheduler::Instant::now();
-                                let context =
-                                    Box::into_raw(Box::new(presented_frame)) as *mut c_void;
-                                let callback = if command_buffer.status()
-                                    == MTLCommandBufferStatus::Completed
-                                {
-                                    present_iosurface_frame
-                                } else {
-                                    log::error!(
-                                        "failed to render IOSurface frame: Metal command buffer finished with status {:?}",
-                                        command_buffer.status()
-                                    );
-                                    fail_iosurface_frame_async
-                                };
-                                unsafe {
-                                    dispatch2::DispatchQueue::main()
-                                        .exec_async_f(context, callback);
-                                }
+                            let completion = IosurfaceFrameCompletion {
+                                presented_frames: presented_frames.clone(),
+                                submission_order,
+                                status: command_buffer.status(),
+                            };
+                            let context = Box::into_raw(Box::new(completion)) as *mut c_void;
+                            unsafe {
+                                dispatch2::DispatchQueue::main().exec_async_f(
+                                    context,
+                                    complete_presented_iosurface_frame_async,
+                                );
                             }
-                        },
-                    );
+                        });
                     let block = block.copy();
                     command_buffer.add_completed_handler(&block);
                     command_buffer.commit();
@@ -2722,5 +2981,106 @@ mod tests {
         pending_swap_count.store(2, Ordering::Release);
         decrement_pending_swap_count(&pending_swap_count);
         assert_eq!(pending_swap_count.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn restore_failed_buffer_damage_unions_submitted_damage() {
+        let buffer_damage = Mutex::new(bounds(
+            point(DevicePixels(10), DevicePixels(10)),
+            size(DevicePixels(5), DevicePixels(5)),
+        ));
+        let submitted_damage = bounds(
+            point(DevicePixels(20), DevicePixels(12)),
+            size(DevicePixels(4), DevicePixels(6)),
+        );
+
+        restore_failed_buffer_damage(&buffer_damage, submitted_damage);
+
+        assert_eq!(
+            *buffer_damage.lock(),
+            bounds(
+                point(DevicePixels(10), DevicePixels(10)),
+                size(DevicePixels(14), DevicePixels(8))
+            )
+        );
+    }
+
+    #[test]
+    fn restore_failed_buffer_damage_ignores_empty_submitted_damage() {
+        let original_damage = bounds(
+            point(DevicePixels(10), DevicePixels(10)),
+            size(DevicePixels(5), DevicePixels(5)),
+        );
+        let buffer_damage = Mutex::new(original_damage);
+
+        restore_failed_buffer_damage(&buffer_damage, Bounds::default());
+
+        assert_eq!(*buffer_damage.lock(), original_damage);
+    }
+
+    #[test]
+    fn swap_completion_result_tracks_iosurface_commit_result() {
+        assert_eq!(
+            swap_completion_result_for_iosurface_frame(true),
+            SwapCompletionResult::Ack
+        );
+        assert_eq!(
+            swap_completion_result_for_iosurface_frame(false),
+            SwapCompletionResult::Skipped
+        );
+    }
+
+    #[test]
+    fn iosurface_commit_cadence_delays_when_queue_has_backlog() {
+        assert!(should_commit_ready_iosurface_frame_immediately(0));
+        assert!(should_commit_ready_iosurface_frame_immediately(1));
+        assert!(!should_commit_ready_iosurface_frame_immediately(2));
+    }
+
+    #[test]
+    fn iosurface_backpressure_fence_uses_monotonic_signal_values() {
+        assert!(!iosurface_backpressure_fence_is_signaled(1, 2));
+        assert!(iosurface_backpressure_fence_is_signaled(2, 2));
+        assert!(iosurface_backpressure_fence_is_signaled(3, 2));
+    }
+
+    #[test]
+    fn iosurface_submission_queue_waits_for_ready_front() {
+        let mut queue = IosurfaceSubmissionQueue::default();
+        queue.push(1, "first");
+        queue.push(2, "second");
+
+        assert!(queue.mark_ready_with(2, |_| {}));
+        assert_eq!(queue.pop_ready_front(), None);
+
+        assert!(queue.mark_ready_with(1, |_| {}));
+        assert_eq!(queue.pop_ready_front(), Some("first"));
+        assert_eq!(queue.pop_ready_front(), Some("second"));
+    }
+
+    #[test]
+    fn iosurface_submission_queue_removing_failed_front_unblocks_ready_frame() {
+        let mut queue = IosurfaceSubmissionQueue::default();
+        queue.push(1, "first");
+        queue.push(2, "second");
+
+        assert!(queue.mark_ready_with(2, |_| {}));
+        assert_eq!(queue.remove(1), Some("first"));
+        assert_eq!(queue.pop_ready_front(), Some("second"));
+    }
+
+    #[test]
+    fn iosurface_submission_queue_counts_contiguous_ready_front() {
+        let mut queue = IosurfaceSubmissionQueue::default();
+        queue.push(1, "first");
+        queue.push(2, "second");
+        queue.push(3, "third");
+
+        assert!(queue.mark_ready_with(1, |_| {}));
+        assert!(queue.mark_ready_with(3, |_| {}));
+        assert_eq!(queue.ready_front_count(), 1);
+
+        assert!(queue.mark_ready_with(2, |_| {}));
+        assert_eq!(queue.ready_front_count(), 3);
     }
 }

@@ -1,3 +1,4 @@
+use crate::ns_string;
 use cocoa::{
     base::{NO, YES, id, nil},
     foundation::{NSPoint, NSRect, NSSize},
@@ -11,12 +12,13 @@ use mach2::{
     traps::mach_task_self,
 };
 use objc::{class, msg_send, runtime::Class, sel, sel_impl};
-use std::collections::VecDeque;
+use std::{collections::VecDeque, ffi::c_char, sync::OnceLock};
 
 const MAX_CA_CONTEXT_FENCE_PORTS: usize = 4;
 
 pub(crate) struct CoreAnimationLayerTree {
     backing_layer: id,
+    host_layer: id,
     content_layer: id,
     ca_context: id,
     ca_context_fence_ports: VecDeque<mach_port_t>,
@@ -48,7 +50,7 @@ impl CoreAnimationLayerTree {
             return false;
         }
 
-        let Some(ca_context) = Self::create_ca_context(self.content_layer) else {
+        let Some(ca_context) = Self::create_ca_context() else {
             return false;
         };
 
@@ -56,8 +58,9 @@ impl CoreAnimationLayerTree {
             self.create_and_set_fence_port();
             let _: () = msg_send![self.ca_context, setLayer: nil];
             let _: () = msg_send![self.ca_context, release];
+            let _: () = msg_send![ca_context, setLayer: self.content_layer];
             let context_id: u32 = msg_send![ca_context, contextId];
-            let _: () = msg_send![self.backing_layer, setContextId: context_id];
+            self.replace_host_layer(context_id);
         }
         self.ca_context = ca_context;
         true
@@ -67,6 +70,9 @@ impl CoreAnimationLayerTree {
         self.contents_scale = scale_factor.max(1.0);
         unsafe {
             let _: () = msg_send![self.backing_layer, setContentsScale: self.contents_scale];
+            if self.host_layer != nil {
+                let _: () = msg_send![self.host_layer, setContentsScale: self.contents_scale];
+            }
             let _: () = msg_send![self.content_layer, setContentsScale: self.contents_scale];
         }
     }
@@ -74,6 +80,9 @@ impl CoreAnimationLayerTree {
     pub(crate) fn set_opaque(&self, opaque: bool) {
         unsafe {
             let _: () = msg_send![self.backing_layer, setOpaque: if opaque { YES } else { NO }];
+            if self.host_layer != nil {
+                let _: () = msg_send![self.host_layer, setOpaque: if opaque { YES } else { NO }];
+            }
             let _: () = msg_send![self.content_layer, setOpaque: if opaque { YES } else { NO }];
         }
     }
@@ -84,9 +93,10 @@ impl CoreAnimationLayerTree {
         let bounds = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, height));
 
         unsafe {
+            let _: () = msg_send![self.backing_layer, setBounds: bounds];
             let _: () = msg_send![self.content_layer, setBounds: bounds];
-            if self.uses_ca_context {
-                let _: () = msg_send![self.backing_layer, setBounds: bounds];
+            if self.host_layer != nil {
+                let _: () = msg_send![self.host_layer, setBounds: bounds];
             }
         }
     }
@@ -122,27 +132,13 @@ impl CoreAnimationLayerTree {
     }
 
     fn new_remote(transparent: bool) -> Option<Self> {
-        let ca_context_class = Class::get("CAContext")?;
-        let ca_layer_host_class = Class::get("CALayerHost")?;
-        let supports_ca_context: bool = unsafe {
-            msg_send![
-                ca_context_class,
-                respondsToSelector: sel!(contextWithCGSConnection:options:)
-            ]
-        };
-        let supports_layer_host: bool = unsafe {
-            msg_send![
-                ca_layer_host_class,
-                instancesRespondToSelector: sel!(setContextId:)
-            ]
-        };
-        if !supports_ca_context || !supports_layer_host {
+        if !remote_layer_api_supported() {
             return None;
         }
 
-        let backing_layer: id = unsafe { msg_send![ca_layer_host_class, new] };
+        let backing_layer: id = unsafe { msg_send![class!(CALayer), new] };
         let content_layer: id = unsafe { msg_send![class!(CALayer), new] };
-        let Some(ca_context) = Self::create_ca_context(content_layer) else {
+        let Some(ca_context) = Self::create_ca_context() else {
             unsafe {
                 let _: () = msg_send![backing_layer, release];
                 let _: () = msg_send![content_layer, release];
@@ -153,24 +149,31 @@ impl CoreAnimationLayerTree {
         unsafe {
             configure_layer(backing_layer, transparent);
             configure_layer(content_layer, transparent);
+            configure_iosurface_content_layer(content_layer);
             configure_hosted_layer_geometry(backing_layer);
             configure_hosted_layer_geometry(content_layer);
+            let _: () = msg_send![backing_layer, setGeometryFlipped: YES];
             let _: () = msg_send![content_layer, setGeometryFlipped: YES];
-            let context_id: u32 = msg_send![ca_context, contextId];
-            let _: () = msg_send![backing_layer, setContextId: context_id];
+            let _: () = msg_send![ca_context, setLayer: content_layer];
         }
 
-        Some(Self {
+        let mut tree = Self {
             backing_layer,
+            host_layer: nil,
             content_layer,
             ca_context,
             ca_context_fence_ports: VecDeque::new(),
             uses_ca_context: true,
             contents_scale: 1.0,
-        })
+        };
+        let context_id: u32 = unsafe { msg_send![tree.ca_context, contextId] };
+        unsafe {
+            tree.replace_host_layer(context_id);
+        }
+        Some(tree)
     }
 
-    fn create_ca_context(content_layer: id) -> Option<id> {
+    fn create_ca_context() -> Option<id> {
         let ca_context_class = Class::get("CAContext")?;
         unsafe {
             let options: id = msg_send![class!(NSDictionary), dictionary];
@@ -183,7 +186,6 @@ impl CoreAnimationLayerTree {
                 return None;
             }
             let context: id = msg_send![context, retain];
-            let _: () = msg_send![context, setLayer: content_layer];
             Some(context)
         }
     }
@@ -192,9 +194,11 @@ impl CoreAnimationLayerTree {
         let layer: id = unsafe { msg_send![class!(CALayer), new] };
         unsafe {
             configure_layer(layer, transparent);
+            configure_iosurface_content_layer(layer);
         }
         Self {
             backing_layer: layer,
+            host_layer: nil,
             content_layer: layer,
             ca_context: nil,
             ca_context_fence_ports: VecDeque::new(),
@@ -211,6 +215,10 @@ impl Drop for CoreAnimationLayerTree {
                 let _: () = msg_send![self.ca_context, setLayer: nil];
                 let _: () = msg_send![self.ca_context, release];
             }
+            if self.host_layer != nil {
+                let _: () = msg_send![self.host_layer, removeFromSuperlayer];
+                let _: () = msg_send![self.host_layer, release];
+            }
             if self.content_layer != self.backing_layer {
                 let _: () = msg_send![self.content_layer, release];
             }
@@ -220,6 +228,74 @@ impl Drop for CoreAnimationLayerTree {
             deallocate_mach_port(fence_port);
         }
     }
+}
+
+impl CoreAnimationLayerTree {
+    unsafe fn replace_host_layer(&mut self, context_id: u32) {
+        unsafe {
+            let ca_layer_host_class = Class::get("CALayerHost").expect("checked by support gate");
+            let host_layer: id = msg_send![ca_layer_host_class, new];
+            configure_layer(host_layer, !self.is_opaque());
+            configure_host_layer(host_layer);
+            let bounds: NSRect = msg_send![self.backing_layer, bounds];
+            let _: () = msg_send![host_layer, setBounds: bounds];
+            let _: () = msg_send![host_layer, setContentsScale: self.contents_scale];
+            let _: () = msg_send![host_layer, setContextId: context_id];
+            let _: () = msg_send![self.backing_layer, addSublayer: host_layer];
+            if self.host_layer != nil {
+                let _: () = msg_send![self.host_layer, removeFromSuperlayer];
+                let _: () = msg_send![self.host_layer, release];
+            }
+            self.host_layer = host_layer;
+        }
+    }
+
+    unsafe fn is_opaque(&self) -> bool {
+        unsafe { msg_send![self.backing_layer, isOpaque] }
+    }
+}
+
+fn remote_layer_api_supported() -> bool {
+    static REMOTE_LAYER_API_SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *REMOTE_LAYER_API_SUPPORTED.get_or_init(|| {
+        let Some(ca_context_class) = Class::get("CAContext") else {
+            return false;
+        };
+        let supports_ca_context: bool = unsafe {
+            msg_send![
+                ca_context_class,
+                respondsToSelector: sel!(contextWithCGSConnection:options:)
+            ]
+        };
+        if !supports_ca_context
+            || !class_has_property(ca_context_class, b"contextId\0")
+            || !class_has_property(ca_context_class, b"layer\0")
+        {
+            return false;
+        }
+
+        let Some(ca_layer_host_class) = Class::get("CALayerHost") else {
+            return false;
+        };
+        let supports_context_id: bool = unsafe {
+            msg_send![
+                ca_layer_host_class,
+                instancesRespondToSelector: sel!(contextId)
+            ]
+        };
+        let supports_set_context_id: bool = unsafe {
+            msg_send![
+                ca_layer_host_class,
+                instancesRespondToSelector: sel!(setContextId:)
+            ]
+        };
+        supports_context_id && supports_set_context_id
+    })
+}
+
+fn class_has_property(class: &Class, name: &'static [u8]) -> bool {
+    let name = name.as_ptr().cast::<c_char>();
+    unsafe { !class_getProperty(class, name).is_null() }
 }
 
 fn deallocate_mach_port(port: mach_port_t) {
@@ -245,6 +321,22 @@ unsafe fn configure_layer(layer: id, transparent: bool) {
     }
 }
 
+unsafe fn configure_iosurface_content_layer(layer: id) {
+    unsafe {
+        let _: () = msg_send![layer, setContentsGravity: ns_string("topLeft")];
+    }
+}
+
+unsafe fn configure_host_layer(layer: id) {
+    unsafe {
+        configure_hosted_layer_geometry(layer);
+        let _: () = msg_send![
+            layer,
+            setAutoresizingMask: AutoresizingMask::MAX_X_MARGIN | AutoresizingMask::MAX_Y_MARGIN
+        ];
+    }
+}
+
 unsafe fn configure_hosted_layer_geometry(layer: id) {
     unsafe {
         let _: () = msg_send![layer, setAnchorPoint: NSPoint::new(0.0, 0.0)];
@@ -255,4 +347,9 @@ unsafe fn configure_hosted_layer_geometry(layer: id) {
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
     fn CGSMainConnectionID() -> u32;
+}
+
+#[link(name = "objc", kind = "dylib")]
+unsafe extern "C" {
+    fn class_getProperty(class: *const Class, name: *const c_char) -> *const libc::c_void;
 }

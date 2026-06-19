@@ -13,12 +13,12 @@ use crate::{
     Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
     RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
-    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
-    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
-    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
-    WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, profiler, px, rems, size,
-    transparent_black,
+    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SwapCompletionResult,
+    SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
+    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
+    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem, point,
+    prelude::*, profiler, px, rems, size, transparent_black,
 };
 
 use anyhow::{Context as _, Result, anyhow};
@@ -1171,6 +1171,7 @@ fn begin_frame_deadline_mode(
     swap_backpressured: bool,
     should_wait_for_scroll: bool,
     draw_already_performed: bool,
+    supports_delayed_begin_frame_scheduling: bool,
 ) -> BeginFrameDeadlineMode {
     if begin_frame.is_none() {
         return BeginFrameDeadlineMode::None;
@@ -1196,6 +1197,10 @@ fn begin_frame_deadline_mode(
         return BeginFrameDeadlineMode::Immediate;
     }
 
+    if !supports_delayed_begin_frame_scheduling {
+        return BeginFrameDeadlineMode::Immediate;
+    }
+
     if active && should_wait_for_scroll {
         return BeginFrameDeadlineMode::WaitForScroll;
     }
@@ -1208,10 +1213,190 @@ fn begin_frame_is_older(
     incoming: crate::BeginFrameArgs,
 ) -> bool {
     current.is_some_and(|current| {
-        incoming.frame_time < current.frame_time
+        if incoming.missed && incoming.id == current.id {
+            return false;
+        }
+
+        incoming.frame_time <= current.frame_time
             || (incoming.id.source_id == current.id.source_id
-                && incoming.id.sequence_number < current.id.sequence_number)
+                && incoming.id.sequence_number <= current.id.sequence_number)
     })
+}
+
+fn swap_completion_requires_refresh(result: SwapCompletionResult) -> bool {
+    result == SwapCompletionResult::Failed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn begin_frame_args(sequence_number: u64) -> crate::BeginFrameArgs {
+        let now = Instant::now();
+        begin_frame_args_at(1, sequence_number, now)
+    }
+
+    fn begin_frame_args_at(
+        source_id: u64,
+        sequence_number: u64,
+        frame_time: Instant,
+    ) -> crate::BeginFrameArgs {
+        crate::BeginFrameArgs {
+            id: crate::BeginFrameId {
+                source_id,
+                sequence_number,
+            },
+            frame_time,
+            deadline: frame_time + Duration::from_millis(16),
+            interval: Duration::from_millis(16),
+            missed: false,
+        }
+    }
+
+    #[test]
+    fn begin_frame_deadline_mode_respects_platform_delayed_scheduling_support() {
+        assert_eq!(
+            begin_frame_deadline_mode(
+                Some(begin_frame_args(1)),
+                true,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false,
+                true,
+            ),
+            BeginFrameDeadlineMode::Regular
+        );
+        assert_eq!(
+            begin_frame_deadline_mode(
+                Some(begin_frame_args(1)),
+                true,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+            ),
+            BeginFrameDeadlineMode::Immediate
+        );
+    }
+
+    #[test]
+    fn begin_frame_deadline_mode_keeps_backpressure_and_duplicate_draw_guards() {
+        assert_eq!(
+            begin_frame_deadline_mode(
+                Some(begin_frame_args(1)),
+                true,
+                false,
+                true,
+                true,
+                false,
+                true,
+                false,
+                false,
+                false,
+            ),
+            BeginFrameDeadlineMode::Blocked
+        );
+        assert_eq!(
+            begin_frame_deadline_mode(
+                Some(begin_frame_args(1)),
+                true,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                true,
+                false,
+            ),
+            BeginFrameDeadlineMode::Blocked
+        );
+    }
+
+    #[test]
+    fn begin_frame_deadline_mode_does_not_force_present_only_frames_immediate() {
+        assert_eq!(
+            begin_frame_deadline_mode(
+                Some(begin_frame_args(1)),
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+            ),
+            BeginFrameDeadlineMode::Late
+        );
+    }
+
+    #[test]
+    fn begin_frame_continuity_rejects_equal_frame_time() {
+        let frame_time = Instant::now();
+        let current = begin_frame_args_at(1, 1, frame_time);
+        let same_source_next_sequence = begin_frame_args_at(1, 2, frame_time);
+        let new_source = begin_frame_args_at(2, 1, frame_time);
+
+        assert!(begin_frame_is_older(
+            Some(current),
+            same_source_next_sequence
+        ));
+        assert!(begin_frame_is_older(Some(current), new_source));
+    }
+
+    #[test]
+    fn begin_frame_continuity_allows_newer_frame_time_from_new_source() {
+        let frame_time = Instant::now();
+        let current = begin_frame_args_at(1, 10, frame_time);
+        let newer_from_new_source =
+            begin_frame_args_at(2, 1, frame_time + Duration::from_millis(16));
+
+        assert!(!begin_frame_is_older(Some(current), newer_from_new_source));
+    }
+
+    #[test]
+    fn begin_frame_continuity_rejects_same_source_equal_sequence() {
+        let frame_time = Instant::now();
+        let current = begin_frame_args_at(1, 10, frame_time);
+        let newer_time_same_sequence =
+            begin_frame_args_at(1, 10, frame_time + Duration::from_millis(16));
+
+        assert!(begin_frame_is_older(
+            Some(current),
+            newer_time_same_sequence
+        ));
+    }
+
+    #[test]
+    fn begin_frame_continuity_allows_missed_retry_for_current_frame() {
+        let frame_time = Instant::now();
+        let current = begin_frame_args_at(1, 10, frame_time);
+        let mut missed_retry = current;
+        missed_retry.missed = true;
+
+        assert!(!begin_frame_is_older(Some(current), missed_retry));
+    }
+
+    #[test]
+    fn failed_swap_completion_requires_refresh() {
+        assert!(!swap_completion_requires_refresh(SwapCompletionResult::Ack));
+        assert!(!swap_completion_requires_refresh(
+            SwapCompletionResult::Skipped
+        ));
+        assert!(swap_completion_requires_refresh(
+            SwapCompletionResult::Failed
+        ));
+    }
 }
 
 /// A point-in-time snapshot of the input-latency histograms for a window,
@@ -1468,15 +1653,20 @@ impl Window {
         platform_window.set_background_appearance(window_background);
         let uses_platform_swap_completion = platform_window.supports_swap_completion_feedback();
         let max_pending_platform_swaps = platform_window.max_pending_swaps();
+        let supports_delayed_begin_frame_scheduling =
+            platform_window.supports_delayed_begin_frame_scheduling();
         if uses_platform_swap_completion {
             platform_window.on_swap_completion(Box::new({
                 let mut cx = cx.to_async();
-                move |_feedback| {
+                move |feedback| {
                     handle
                         .update(&mut cx, |_, window, _| {
                             let was_backpressured = window.platform_swap_backpressured();
                             window.pending_platform_swaps =
                                 window.pending_platform_swaps.saturating_sub(1);
+                            if swap_completion_requires_refresh(feedback.result) {
+                                window.refresh();
+                            }
                             window.update_begin_frame_subscription();
                             if was_backpressured && window.has_frame_work() {
                                 if let Some(options) = window.pending_gpu_available_frame.take() {
@@ -1802,6 +1992,7 @@ impl Window {
                     swap_backpressured,
                     should_wait_for_scroll,
                     drew_current_begin_frame.get(),
+                    supports_delayed_begin_frame_scheduling,
                 );
                 if deadline_mode == BeginFrameDeadlineMode::Blocked {
                     handle
@@ -3056,6 +3247,7 @@ impl Window {
     fn has_frame_work(&self) -> bool {
         self.invalidator.is_dirty()
             || self.needs_present.get()
+            || (self.uses_platform_swap_completion && self.pending_platform_swaps > 0)
             || !self.next_frame_callbacks.borrow().is_empty()
             || (self.active.get() && self.input_rate_tracker.borrow().is_high_rate())
             || (self.active.get()

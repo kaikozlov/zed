@@ -658,7 +658,16 @@ pub struct PresentationFeedback {
 pub struct SwapCompletionFeedback {
     pub ready_time: Instant,
     pub latch_time: Instant,
+    pub result: SwapCompletionResult,
     pub presented: bool,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[expect(missing_docs)]
+pub enum SwapCompletionResult {
+    Ack,
+    Skipped,
+    Failed,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -705,6 +714,9 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn set_needs_begin_frame(&self, _needs_begin_frame: bool) {}
     fn request_frame(&self, _options: RequestFrameOptions) {}
     fn request_begin_frame(&self) {}
+    fn supports_delayed_begin_frame_scheduling(&self) -> bool {
+        true
+    }
     fn supports_swap_completion_feedback(&self) -> bool {
         false
     }

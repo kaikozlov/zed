@@ -145,7 +145,7 @@ impl Element for AnyView {
             let window_refreshing = window.refreshing;
             if let Some(mut element) = element.take() {
                 if view_is_dirty && !window_refreshing {
-                    window.damage_full_viewport();
+                    window.damage_bounds(bounds.intersect(&window.content_mask().bounds));
                 }
                 element.prepaint(window, cx);
                 return Some(element);

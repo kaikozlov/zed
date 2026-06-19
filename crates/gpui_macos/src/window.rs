@@ -673,6 +673,7 @@ impl MacWindowState {
     }
 
     fn restart_display_link(&mut self) {
+        self.renderer.flush_ready_display_frames();
         self.stop_display_link();
         self.display_link.take();
         self.update_display_link_subscription();
@@ -1712,7 +1713,10 @@ impl PlatformWindow for MacWindow {
         lock.request_frame_callback = Some(callback);
         lock.renderer
             .set_deferred_frame_callback(Some(Arc::new(move || {
-                request_deferred_frame(window_state.clone());
+                let context = Box::into_raw(Box::new(window_state.clone())) as *mut c_void;
+                unsafe {
+                    DispatchQueue::main().exec_async_f(context, request_missed_frame_async);
+                }
             })));
     }
 
@@ -1750,6 +1754,14 @@ impl PlatformWindow for MacWindow {
         unsafe {
             DispatchQueue::main().exec_async_f(context, request_begin_frame_async);
         }
+    }
+
+    fn supports_delayed_begin_frame_scheduling(&self) -> bool {
+        self.0
+            .as_ref()
+            .lock()
+            .renderer
+            .supports_delayed_begin_frame_scheduling()
     }
 
     fn supports_swap_completion_feedback(&self) -> bool {
@@ -2814,12 +2826,34 @@ extern "C" fn step(view: *mut c_void) {
         .display_link
         .as_ref()
         .and_then(DisplayLink::latest_timing);
+    let mut committed_ready_iosurface_frame = false;
     if let Some(display_link_timing) = display_link_timing {
         lock.last_display_link_timing = Some(display_link_timing);
-        lock.renderer.set_display_timing(
+        committed_ready_iosurface_frame = lock.renderer.set_display_timing(
             display_link_timing.predicted_display_time,
             display_link_timing.frame_interval,
         );
+    }
+
+    if committed_ready_iosurface_frame && lock.request_frame_callback.is_some() {
+        drop(lock);
+        let mut request_frame_options = RequestFrameOptions::default();
+        if let Some(display_link_timing) = display_link_timing {
+            request_frame_options.begin_frame = Some(display_link_timing.begin_frame);
+            request_frame_options.predicted_display_time =
+                Some(display_link_timing.predicted_display_time);
+            request_frame_options.frame_interval = display_link_timing.frame_interval;
+            request_frame_options.frame_deadline = Some(display_link_timing.frame_deadline);
+        }
+        let delivery = FrameRequestDelivery {
+            window_state: Arc::downgrade(&window_state),
+            options: request_frame_options,
+        };
+        let context = Box::into_raw(Box::new(delivery)) as *mut c_void;
+        unsafe {
+            DispatchQueue::main().exec_async_f(context, request_frame_async);
+        }
+        return;
     }
 
     if let Some(mut callback) = lock.request_frame_callback.take() {
@@ -2835,29 +2869,6 @@ extern "C" fn step(view: *mut c_void) {
         callback(request_frame_options);
         window_state.lock().request_frame_callback = Some(callback);
     }
-}
-
-fn request_deferred_frame(window_state: Weak<Mutex<MacWindowState>>) {
-    let Some(window_state) = window_state.upgrade() else {
-        return;
-    };
-
-    let mut lock = window_state.lock();
-    let Some(mut callback) = lock.request_frame_callback.take() else {
-        return;
-    };
-    drop(lock);
-
-    callback(RequestFrameOptions {
-        begin_frame: None,
-        require_presentation: true,
-        force_render: true,
-        predicted_display_time: None,
-        frame_interval: None,
-        frame_deadline: None,
-    });
-
-    window_state.lock().request_frame_callback = Some(callback);
 }
 
 extern "C" fn request_missed_frame_async(context: *mut c_void) {
@@ -2883,36 +2894,13 @@ fn missed_display_link_timing(last_timing: DisplayLinkTiming) -> Option<DisplayL
         return None;
     }
 
-    let now = scheduler::Instant::now();
-    let mut predicted_display_time = last_timing.predicted_display_time;
-    let mut sequence_number = last_timing.begin_frame.id.sequence_number;
-    let mut advanced = false;
-    while predicted_display_time + interval <= now {
-        predicted_display_time += interval;
-        sequence_number = sequence_number.saturating_add(1);
-        advanced = true;
-    }
-
-    if !advanced {
-        return None;
-    }
-
+    let mut begin_frame = last_timing.begin_frame;
+    begin_frame.missed = true;
     Some(DisplayLinkTiming {
-        begin_frame: gpui::BeginFrameArgs {
-            id: gpui::BeginFrameId {
-                source_id: last_timing.begin_frame.id.source_id,
-                sequence_number,
-            },
-            frame_time: predicted_display_time
-                .checked_sub(interval)
-                .unwrap_or(predicted_display_time),
-            deadline: predicted_display_time,
-            interval,
-            missed: true,
-        },
-        predicted_display_time,
+        begin_frame,
+        predicted_display_time: last_timing.predicted_display_time,
         frame_interval: Some(interval),
-        frame_deadline: predicted_display_time,
+        frame_deadline: last_timing.frame_deadline,
     })
 }
 
@@ -2946,7 +2934,6 @@ fn request_begin_frame(window_state: Weak<Mutex<MacWindowState>>) {
         .display_link
         .as_ref()
         .and_then(DisplayLink::latest_timing)
-        .or(lock.last_display_link_timing)
     else {
         return;
     };
@@ -3529,5 +3516,68 @@ extern "C" fn toggle_tab_bar(this: &Object, _sel: Sel, _id: id) {
             callback();
             window_state.lock().toggle_tab_bar_callback = Some(callback);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missed_display_link_timing_reissues_last_timing_as_missed() {
+        let frame_time = scheduler::Instant::now();
+        let predicted_display_time = frame_time + Duration::from_millis(16);
+        let frame_interval = Some(Duration::from_millis(16));
+        let last_timing = DisplayLinkTiming {
+            begin_frame: gpui::BeginFrameArgs {
+                id: gpui::BeginFrameId {
+                    source_id: 7,
+                    sequence_number: 42,
+                },
+                frame_time,
+                deadline: predicted_display_time,
+                interval: frame_interval.unwrap(),
+                missed: false,
+            },
+            predicted_display_time,
+            frame_interval,
+            frame_deadline: predicted_display_time,
+        };
+
+        let missed_timing = missed_display_link_timing(last_timing).unwrap();
+
+        assert_eq!(missed_timing.begin_frame.id, last_timing.begin_frame.id);
+        assert_eq!(
+            missed_timing.begin_frame.frame_time,
+            last_timing.begin_frame.frame_time
+        );
+        assert_eq!(
+            missed_timing.predicted_display_time,
+            last_timing.predicted_display_time
+        );
+        assert_eq!(missed_timing.frame_deadline, last_timing.frame_deadline);
+        assert!(missed_timing.begin_frame.missed);
+    }
+
+    #[test]
+    fn missed_display_link_timing_rejects_zero_interval() {
+        let frame_time = scheduler::Instant::now();
+        let last_timing = DisplayLinkTiming {
+            begin_frame: gpui::BeginFrameArgs {
+                id: gpui::BeginFrameId {
+                    source_id: 7,
+                    sequence_number: 42,
+                },
+                frame_time,
+                deadline: frame_time,
+                interval: Duration::ZERO,
+                missed: false,
+            },
+            predicted_display_time: frame_time,
+            frame_interval: Some(Duration::ZERO),
+            frame_deadline: frame_time,
+        };
+
+        assert!(missed_display_link_timing(last_timing).is_none());
     }
 }
