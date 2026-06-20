@@ -260,12 +260,30 @@ ZED_MACOS_LEGACY_METAL_LAYER=1 cargo run -p zed
   are throttled, and GPU availability replays the stored pending BeginFrame.
   This gate is checked both when a BeginFrame arrives and when a delayed
   regular/scroll deadline actually fires, matching Chromium's
-  `AttemptDrawAndSwap()` check before `DrawAndSwap()`. A swap ack lowers the
-  pending count, re-evaluates BeginFrame subscription, and if it clears a
-  backpressured state with work still pending, GPUI replays the exact
-  `RequestFrameOptions` that were blocked by GPU-busy backpressure. This mirrors
-  Chromium's `pending_begin_frame_args_` / `OnGpuNoLongerBusy()` path after
-  `DidReceiveSwapBuffersAck()`.
+  `AttemptDrawAndSwap()` check before `DrawAndSwap()`: if the current
+  BeginFrame reaches its deadline while the swap queue is still full, GPUI
+  finishes that BeginFrame with no draw instead of parking the same deadline for
+  replay. Only later BeginFrames throttled at the source/gpu-busy boundary are
+  retained in `pending_gpu_available_frame`. A swap ack lowers the pending
+  count, re-evaluates BeginFrame subscription, and if it clears a backpressured
+  state with source-throttled work pending, GPUI replays the exact
+  `BeginFrameDeadlineRequest` that was held by GPU-busy backpressure, not just
+  the raw platform `RequestFrameOptions`. The replay bridge encodes a
+  scheduler-computed `needs_present` bit back into `require_presentation`
+  because the platform request callback cannot carry private scheduler state.
+  This mirrors Chromium's `pending_begin_frame_args_` / `OnGpuNoLongerBusy()`
+  path after `DidReceiveSwapBuffersAck()` while preserving present-only intent
+  across the GPU-busy boundary.
+- Swap ack now re-enters the GPUI `BeginFrameScheduler` instead of directly
+  asking the platform for a new BeginFrame. If a frame was parked behind GPU
+  busy, GPUI replays that frame first. Otherwise, if the current BeginFrame has
+  a delayed deadline pending, GPUI reschedules that deadline immediately after
+  the pending swap count drops. Only when there is no parked frame and no
+  current delayed deadline does GPUI request a fresh BeginFrame. This matches
+  Chromium's `DidReceiveSwapBuffersAck()` ordering: update `pending_swaps_`,
+  clear GPU busy, then call `ScheduleBeginFrameDeadline()` so the current
+  BeginFrame can move off a late backpressure deadline as soon as the swap queue
+  opens.
 - Important runtime finding: do **not** use `IOSurfaceIsInUse` as the hot-path
   reuse gate in this local process. Without Chromium's full CA/viz presentation
   feedback, that check can report surfaces unavailable long after the local
@@ -553,7 +571,19 @@ ZED_MACOS_LEGACY_METAL_LAYER=1 cargo run -p zed
   BeginFrame after the frame has already been finished. This moves GPUI closer
   to Chromium's `BeginFrameSource::DidFinishFrame()` contract, where the source
   sees explicit observer completion instead of treating every retained tick as
-  eligible for replay.
+  eligible for replay. Native completions via `completed_frame(None)` no longer
+  clear the retained BeginFrame ack; otherwise a stale/older/native completion
+  after a real BeginFrame finish could make the retained display-link timing
+  look unfinished and eligible for a bogus missed-frame replay.
+- GPUI's `BeginFrameAck` now carries the original BeginFrame `frame_time` in
+  addition to the id and damage bit. Chromium's BeginFrame source asks the
+  observer for `LastUsedBeginFrameArgs()` before issuing missed frames; GPUI's
+  macOS source now records the last BeginFrame it actually delivered to the
+  request-frame callback, and also retains the last finish ack. Missed-frame
+  replay is suppressed when retained timing is not newer than either the
+  delivered last-used BeginFrame or the finished ack. This closes the
+  delivery-to-finish race where a BeginFrame accepted by GPUI but not yet
+  finished could be reissued as a duplicate missed frame.
 - macOS now drops queued missed-BeginFrame callbacks after
   `set_needs_begin_frame(false)`. This mirrors Chromium's
   `StopObservingBeginFrames()` cancellation of queued missed tasks: the dispatch
@@ -634,12 +664,13 @@ ZED_MACOS_LEGACY_METAL_LAYER=1 cargo run -p zed
 - GPUI now exposes a platform-level `BeginFrameAck` next to `BeginFrameArgs`.
   `did_finish_frame()` records and forwards an ack for every BeginFrame finish
   through `PlatformWindow::completed_frame(Some(ack))`. The ack carries the
-  `BeginFrameId` and Chromium's `has_damage` semantics: platform-submitted
-  draw/swap production records `true`, while deferred/skipped draw attempts,
-  present-only, idle, throttled, or backpressured completions record `false`.
-  Native frame completions that are not a Chromium-style BeginFrame finish, such
-  as stale BeginFrame drops or duplicate-draw blocked completions, still
-  complete the platform frame with `None`.
+  `BeginFrameId`, original `frame_time`, and Chromium's `has_damage` semantics:
+  platform-submitted draw/swap production records `true`, while
+  deferred/skipped draw attempts, present-only, idle, throttled, or
+  backpressured completions record `false`. Native frame completions that are
+  not a Chromium-style BeginFrame finish, such as stale BeginFrame drops or
+  duplicate-draw blocked completions, still complete the platform frame with
+  `None`.
 - The request-frame callback now delegates to a `BeginFrameScheduler` spine with
   Chromium-shaped phases: `on_begin_frame_continuation()`,
   `schedule_begin_frame_deadline()`, `on_begin_frame_deadline()`,
@@ -655,14 +686,27 @@ ZED_MACOS_LEGACY_METAL_LAYER=1 cargo run -p zed
   The current `RequestFrameOptions` are retained with the current BeginFrame so
   that a previous interval can be flushed even when it was not represented by a
   delayed timer task.
+- GPUI now mirrors Chromium's `OnDisplayDamaged()` call back into
+  `ScheduleBeginFrameDeadline()` while a BeginFrame interval is active. The
+  shared `FrameSchedulerState` is stored on the `Window`, and dirty transitions
+  from `refresh()`, direct view-bounds invalidation, `on_next_frame()`, global
+  refresh effects, and App-driven entity notifications ask the current
+  BeginFrame to be reconsidered. The request is coalesced per dirty burst, then
+  re-enters the normal `on_begin_frame_continuation()` path with the current
+  `BeginFrameDeadlineRequest`, preserving the computed `needs_present` bit.
+  This closes the choppy-path gap where a clean BeginFrame had already scheduled
+  a `LATE` deadline and later damage could otherwise wait until the end of the
+  interval instead of moving to Chromium's regular/immediate draw deadline.
 - `LATE` deadline mode now follows Chromium's
   `DesiredBeginFrameDeadlineTime(kLate)` behavior. Instead of completing
   clean BeginFrames immediately, GPUI waits until the end of the BeginFrame
   interval before finishing with `BeginFrameAck(has_damage=false)`. The same
   late deadline also produces present-only frames and gives swap-backpressured
   frames one interval to clear. If the swap queue is still backpressured at that
-  late deadline, GPUI parks the request in `pending_gpu_available_frame` rather
-  than drawing into the closed queue. Renderers that opt out of delayed
+  late deadline, GPUI finishes the BeginFrame with
+  `BeginFrameAck(has_damage=false)` rather than drawing into the closed queue or
+  replaying the stale deadline later. Later incoming BeginFrames are what get
+  parked behind the GPU-busy source gate. Renderers that opt out of delayed
   BeginFrame scheduling, such as the CA/IOSurface path, still execute the
   deadline immediately so the scheduler does not reintroduce the previously
   observed late-CPU-start choppiness.
@@ -670,12 +714,22 @@ ZED_MACOS_LEGACY_METAL_LAYER=1 cargo run -p zed
   state. When pending platform swaps reach the platform limit, the scheduler
   allows one new BeginFrame through, then parks later BeginFrames in
   `pending_gpu_available_frame` without advancing the current BeginFrame or
-  emitting a false `BeginFrameAck`. When swap completion drops the pending swap
-  count below the limit, GPUI resets the GPU-busy state and requests the parked
-  frame even if the source had only reached Chromium's "one BeginFrame after
-  busy sent" state. This matches Chromium's `DidReceiveSwapBuffersAck()` rule:
-  after `pending_swaps_` is decremented, the scheduler observes the updated
-  backpressure state and schedules/wakes pending BeginFrame work.
+  emitting a false `BeginFrameAck`. Parked source-throttled work stores a
+  `BeginFrameDeadlineRequest`, so the computed `needs_present` decision from
+  `OnBeginFrameContinuation()`/`ScheduleBeginFrameDeadline()` survives both the
+  delayed-deadline path and the GPU-busy replay path. Current BeginFrames whose
+  deadline fires while the swap queue is still full now finish false, matching
+  Chromium's `AttemptDrawAndSwap()` ownership: the source holds later
+  BeginFrames, not the scheduler's already-expired deadline. When swap
+  completion drops the pending swap count below the limit, GPUI resets the
+  GPU-busy state and re-enters the scheduler even if the source had only reached
+  Chromium's "one BeginFrame after busy sent" state. Parked GPU-available
+  frames are replayed first; otherwise a pending current BeginFrame deadline is
+  rescheduled before GPUI asks the platform for a fresh BeginFrame. This matches
+  Chromium's
+  `DidReceiveSwapBuffersAck()` rule: after `pending_swaps_` is decremented, the
+  scheduler observes the updated backpressure state and calls
+  `ScheduleBeginFrameDeadline()`/wakes pending BeginFrame work.
 - GPUI uses the BeginFrame deadline/frame time as its fallback frame time until
   real presentation feedback arrives. This moves frame pacing closer to
   Chromium's model, where frame production is tied to an intended display

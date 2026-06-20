@@ -1581,6 +1581,7 @@ impl App {
             if let Some(window) = window.as_deref_mut() {
                 window.refreshing = true;
                 window.invalidator.set_dirty(true);
+                window.schedule_frame_after_work();
             }
         }
     }
@@ -2393,14 +2394,14 @@ impl App {
         // doesn't mean the window is currently rendering the entity. Filter
         // through `tracked_entities` to keep invalidation tight to windows
         // that actually display this entity right now.
-        let live_invalidators: SmallVec<[WindowInvalidator; 2]> = window_invalidators
+        let live_invalidators: SmallVec<[(WindowId, WindowInvalidator); 2]> = window_invalidators
             .iter()
             .filter(|(window_id, _)| {
                 self.tracked_entities
                     .get(window_id)
                     .is_some_and(|set| set.contains(&entity_id))
             })
-            .map(|(_, invalidator)| invalidator.clone())
+            .map(|(window_id, invalidator)| (*window_id, invalidator.clone()))
             .collect();
 
         if live_invalidators.is_empty() {
@@ -2409,8 +2410,12 @@ impl App {
                     .push_back(Effect::Notify { emitter: entity_id });
             }
         } else {
-            for invalidator in &live_invalidators {
-                invalidator.invalidate_view(entity_id, self);
+            for (window_id, invalidator) in &live_invalidators {
+                if invalidator.invalidate_view(entity_id, self)
+                    && let Some(window) = self.windows.get_mut(*window_id).and_then(Option::as_mut)
+                {
+                    window.schedule_frame_after_work();
+                }
             }
         }
 

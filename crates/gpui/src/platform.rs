@@ -645,6 +645,7 @@ pub struct BeginFrameArgs {
 #[expect(missing_docs)]
 pub struct BeginFrameAck {
     pub frame_id: BeginFrameId,
+    pub frame_time: Instant,
     pub has_damage: bool,
 }
 
