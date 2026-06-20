@@ -31,7 +31,7 @@ use metal::{
     MTLScissorRect, NSRange, RenderPassColorAttachmentDescriptorRef, SharedEvent,
 };
 use objc::{self, class, msg_send, sel, sel_impl};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 
 use std::{
     cell::Cell,
@@ -44,7 +44,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 // Exported to metal
@@ -62,6 +62,10 @@ const IOSURFACE_BUFFER_COUNT: usize = 3;
 const IOSURFACE_MAX_PENDING_SWAPS: usize = IOSURFACE_BUFFER_COUNT - 1;
 const CA_TRANSACTION_PHASE_POST_COMMIT: usize = 2;
 const NO_CURRENT_BUFFER: usize = usize::MAX;
+/// Bounded wait for a parallel-produced resize frame, matching Chromium's
+/// `kPostCommitTimeout`. If the GPU has not produced a current-generation frame
+/// within this window, AppKit composites the existing layer for this tick.
+pub(crate) const RESIZE_FRAME_WAIT_TIMEOUT: Duration = Duration::from_millis(50);
 const BGRA_IOSURFACE_PIXEL_FORMAT: i32 = i32::from_be_bytes(*b"BGRA");
 
 pub(crate) type Context = Arc<Mutex<InstanceBufferPool>>;
@@ -100,6 +104,42 @@ pub(crate) struct InstanceBuffer {
     size: usize,
 }
 
+/// Synchronization between AppKit's `displayLayer:` live-resize callback
+/// (blocked on the main thread) and the Metal completion thread that produces
+/// the resize frame. While armed, completions bypass the (blocked) main
+/// dispatch queue, update the presentation queue on the Metal thread, and
+/// signal this condvar so the main thread can drain and commit the ready
+/// frame. This is the single-process analog of Chromium's
+/// `WindowResizeHelperMac::WaitForSingleTaskToRun` pre-commit pump.
+struct ResizeFrameWait {
+    inner: Mutex<ResizeFrameWaitState>,
+    cond: Condvar,
+}
+
+struct ResizeFrameWaitState {
+    armed: bool,
+    notifications: u32,
+}
+
+impl Default for ResizeFrameWait {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(ResizeFrameWaitState {
+                armed: false,
+                notifications: 0,
+            }),
+            cond: Condvar::new(),
+        }
+    }
+}
+
+/// Opaque handle to the presentation queue and resize wait, extracted under a
+/// brief lock so `displayLayer:` can wait without holding the window state lock.
+pub(crate) struct ResizeFrameWaitHandle {
+    presented_frames: Arc<Mutex<IosurfaceSubmissionQueue<Box<PresentedIosurfaceFrame>>>>,
+    wait: Arc<ResizeFrameWait>,
+}
+
 struct CoreAnimationPresenter {
     layer_tree: Arc<Mutex<CoreAnimationLayerTree>>,
     drawable_size: Size<DevicePixels>,
@@ -115,6 +155,7 @@ struct CoreAnimationPresenter {
     deferred_frame_requested: Arc<AtomicBool>,
     deferred_frame_callback: Option<Arc<dyn Fn() + Send + Sync>>,
     has_resized_since_last_swap: bool,
+    resize_frame_wait: Arc<ResizeFrameWait>,
     swap_completion_callback: Option<Arc<dyn Fn(SwapCompletionFeedback) + Send + Sync>>,
     presentation_feedback_callback: Option<Arc<dyn Fn(PresentationFeedback) + Send + Sync>>,
     latest_display_timing: Arc<Mutex<Option<FrameDisplayTiming>>>,
@@ -340,6 +381,7 @@ impl CoreAnimationPresenter {
             deferred_frame_requested: Arc::new(AtomicBool::new(false)),
             deferred_frame_callback: None,
             has_resized_since_last_swap: false,
+            resize_frame_wait: Arc::new(ResizeFrameWait::default()),
             swap_completion_callback: None,
             presentation_feedback_callback: None,
             latest_display_timing: Arc::new(Mutex::new(None)),
@@ -391,6 +433,23 @@ impl CoreAnimationPresenter {
 
     fn set_opaque(&self, opaque: bool) {
         self.layer_tree.lock().set_opaque(opaque);
+    }
+
+    fn arm_resize_frame_wait(&mut self) {
+        let mut state = self.resize_frame_wait.inner.lock();
+        state.armed = true;
+        state.notifications = 0;
+    }
+
+    fn disarm_resize_frame_wait(&mut self) {
+        {
+            let mut state = self.resize_frame_wait.inner.lock();
+            state.armed = false;
+            state.notifications = 0;
+        }
+        // Frames that completed while armed bypassed the main-queue commit
+        // path. Flush any ready frames now that normal dispatch has resumed.
+        commit_all_ready_iosurface_frames(self.presented_frames.clone());
     }
 
     fn layer_ptr(&self) -> id {
@@ -803,10 +862,10 @@ fn fail_iosurface_frame(frame: Box<PresentedIosurfaceFrame>) {
     }
 }
 
-fn commit_iosurface_frame(frame: Box<PresentedIosurfaceFrame>) {
+fn commit_iosurface_frame(frame: Box<PresentedIosurfaceFrame>) -> bool {
     if frame.generation != frame.current_generation.load(Ordering::Acquire) {
         complete_iosurface_frame(frame, false);
-        return;
+        return false;
     }
 
     let frame = Rc::new(Cell::new(Some(frame)));
@@ -863,6 +922,8 @@ fn commit_iosurface_frame(frame: Box<PresentedIosurfaceFrame>) {
     if let Some(frame) = frame.take() {
         complete_iosurface_frame(frame, true);
     }
+
+    true
 }
 
 fn should_commit_ready_iosurface_frame_immediately(queued_frame_count: usize) -> bool {
@@ -905,6 +966,57 @@ fn commit_ready_iosurface_frame_after_completion(
 
     if should_commit {
         commit_ready_iosurface_frame(presented_frames);
+    }
+}
+
+/// Commit ready frames from the front of the queue until a current-generation
+/// frame is presented. Stale-generation frames (produced before the most recent
+/// resize) self-skip inside `commit_iosurface_frame`, which is exactly the
+/// "wrong size during resize" filter: generation is bumped on every resize, so
+/// only same-size frames carry the current generation. Returns true once a
+/// current-generation frame was committed.
+fn drain_ready_frames_to_current_generation(
+    presented_frames: &Arc<Mutex<IosurfaceSubmissionQueue<Box<PresentedIosurfaceFrame>>>>,
+) -> bool {
+    loop {
+        let frame = presented_frames.lock().pop_ready_front();
+        let Some(frame) = frame else {
+            return false;
+        };
+        if commit_iosurface_frame(frame) {
+            return true;
+        }
+    }
+}
+
+/// Wait, bounded by `timeout`, for a frame of the current generation produced
+/// in parallel by the GPU, then commit it. Called from `displayLayer:` while
+/// the main thread is blocked in AppKit's live-resize callback; the Metal
+/// completion thread signals `handle.wait` instead of posting to the (blocked)
+/// main queue. Mirrors Chromium's `HasFrameOfSize` + pre-commit wait.
+pub(crate) fn wait_for_and_commit_current_generation_frame(
+    handle: &ResizeFrameWaitHandle,
+    timeout: Duration,
+) -> bool {
+    let start = Instant::now();
+    loop {
+        if drain_ready_frames_to_current_generation(&handle.presented_frames) {
+            return true;
+        }
+        let elapsed = start.elapsed();
+        if elapsed >= timeout {
+            return false;
+        }
+        let remaining = timeout - elapsed;
+        let mut state = handle.wait.inner.lock();
+        // Consume any notification that arrived between draining and waiting so
+        // we re-check instead of blocking (avoids a lost wakeup).
+        if state.notifications > 0 {
+            state.notifications = 0;
+            continue;
+        }
+        let _ = handle.wait.cond.wait_for(&mut state, remaining);
+        state.notifications = 0;
     }
 }
 
@@ -1247,6 +1359,9 @@ impl MetalRenderer {
         if let Some(layer) = &self.layer {
             layer.set_presents_with_transaction(presents_with_transaction);
         }
+        // The Chromium-style CA/IOSurface path has no CAMetalLayer, so this
+        // flag is a no-op there; resize atomicity is handled by the resize
+        // frame wait in `displayLayer:`.
     }
 
     pub fn set_contents_scale(&mut self, scale_factor: f64) {
@@ -1318,6 +1433,27 @@ impl MetalRenderer {
     pub fn flush_ready_display_frames(&mut self) {
         if let Some(presenter) = &self.core_animation_presenter {
             commit_all_ready_iosurface_frames(presenter.presented_frames.clone());
+        }
+    }
+
+    pub(crate) fn resize_frame_wait_handle(&self) -> Option<ResizeFrameWaitHandle> {
+        self.core_animation_presenter.as_ref().map(|presenter| {
+            ResizeFrameWaitHandle {
+                presented_frames: presenter.presented_frames.clone(),
+                wait: presenter.resize_frame_wait.clone(),
+            }
+        })
+    }
+
+    pub(crate) fn arm_resize_frame_wait(&mut self) {
+        if let Some(presenter) = &mut self.core_animation_presenter {
+            presenter.arm_resize_frame_wait();
+        }
+    }
+
+    pub(crate) fn disarm_resize_frame_wait(&mut self) {
+        if let Some(presenter) = &mut self.core_animation_presenter {
+            presenter.disarm_resize_frame_wait();
         }
     }
 
@@ -1595,6 +1731,7 @@ impl MetalRenderer {
                         layer_tree: presenter.layer_tree.clone(),
                         drawable_size: presenter.drawable_size,
                     };
+                    let resize_frame_wait = presenter.resize_frame_wait.clone();
                     presented_frames
                         .lock()
                         .push(submission_order, Box::new(presented_frame));
@@ -1605,17 +1742,64 @@ impl MetalRenderer {
                                 instance_buffer_pool.lock().release(instance_buffer);
                             }
 
-                            let completion = IosurfaceFrameCompletion {
-                                presented_frames: presented_frames.clone(),
-                                submission_order,
-                                status: command_buffer.status(),
-                            };
-                            let context = Box::into_raw(Box::new(completion)) as *mut c_void;
-                            unsafe {
-                                dispatch2::DispatchQueue::main().exec_async_f(
-                                    context,
-                                    complete_presented_iosurface_frame_async,
-                                );
+                            let status = command_buffer.status();
+                            let armed = resize_frame_wait.inner.lock().armed;
+                            if armed {
+                                // The main thread is blocked inside AppKit's
+                                // `displayLayer:` live-resize callback, so the
+                                // main dispatch queue cannot service this
+                                // completion. Update the presentation queue here
+                                // (on the Metal completion thread) and wake the
+                                // waiting main thread, which commits the ready
+                                // frame. Single-process analog of Chromium
+                                // draining the frame-delivery callback via
+                                // `WindowResizeHelperMac::WaitForSingleTaskToRun`.
+                                if status == MTLCommandBufferStatus::Completed {
+                                    let ready_time = scheduler::Instant::now();
+                                    let marked = presented_frames
+                                        .lock()
+                                        .mark_ready_with(submission_order, |frame| {
+                                            frame.ready_time = ready_time;
+                                        });
+                                    if !marked {
+                                        log::error!(
+                                            "completed IOSurface submission {} was not found in the presentation queue",
+                                            submission_order
+                                        );
+                                    }
+                                } else {
+                                    log::error!(
+                                        "failed to render IOSurface frame: Metal command buffer finished with status {:?}",
+                                        status
+                                    );
+                                    if let Some(frame) =
+                                        presented_frames.lock().remove(submission_order)
+                                    {
+                                        fail_iosurface_frame(frame);
+                                    } else {
+                                        log::error!(
+                                            "failed IOSurface submission {} was not found in the presentation queue",
+                                            submission_order
+                                        );
+                                    }
+                                }
+                                let mut state = resize_frame_wait.inner.lock();
+                                state.notifications = state.notifications.saturating_add(1);
+                                resize_frame_wait.cond.notify_one();
+                            } else {
+                                let completion = IosurfaceFrameCompletion {
+                                    presented_frames: presented_frames.clone(),
+                                    submission_order,
+                                    status,
+                                };
+                                let context = Box::into_raw(Box::new(completion))
+                                    as *mut c_void;
+                                unsafe {
+                                    dispatch2::DispatchQueue::main().exec_async_f(
+                                        context,
+                                        complete_presented_iosurface_frame_async,
+                                    );
+                                }
                             }
                         });
                     let block = block.copy();

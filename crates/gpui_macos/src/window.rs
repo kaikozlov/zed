@@ -2813,18 +2813,54 @@ extern "C" fn set_frame_size(this: &Object, _: Sel, size: NSSize) {
 
 extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
-    let mut lock = window_state.lock();
-    if let Some(mut callback) = lock.request_frame_callback.take() {
+
+    // Arm the resize wait and trigger a render, dropping the window lock while
+    // GPUI builds the scene so the renderer is not borrowed during frame
+    // production.
+    let mut callback = {
+        let mut lock = window_state.lock();
+        lock.renderer.arm_resize_frame_wait();
         lock.renderer.set_presents_with_transaction(true);
         lock.stop_display_link();
-        drop(lock);
-        callback(Default::default());
-
-        let mut lock = window_state.lock();
-        lock.request_frame_callback = Some(callback);
-        lock.renderer.set_presents_with_transaction(false);
-        lock.update_display_link_subscription();
+        lock.request_frame_callback.take()
+    };
+    if let Some(callback) = callback.as_mut() {
+        (**callback)(Default::default());
     }
+
+    // Block at the commit boundary for a frame produced in parallel by the
+    // GPU, until a frame of the current (post-resize) generation is ready,
+    // then commit it. Mirrors Chromium's HasFrameOfSize + pre-commit wait: the
+    // main thread does not render, it waits for the frame the GPU produced
+    // while the main thread was free to service AppKit's resize/layout. The
+    // Metal completion handler signals this wait directly (it cannot use the
+    // main queue, which is blocked here). The handle is extracted under a brief
+    // lock so the window state lock is not held across the wait.
+    let committed = {
+        let handle = {
+            let lock = window_state.lock();
+            lock.renderer.resize_frame_wait_handle()
+        };
+        match handle {
+            Some(handle) => renderer::wait_for_and_commit_current_generation_frame(
+                &handle,
+                renderer::RESIZE_FRAME_WAIT_TIMEOUT,
+            ),
+            None => true,
+        }
+    };
+
+    let mut lock = window_state.lock();
+    if !committed {
+        // Bounded wait elapsed without a current-generation frame. Flush any
+        // ready frames for queue hygiene and let AppKit composite the existing
+        // layer this tick (no worse than before the fix).
+        lock.renderer.flush_ready_display_frames();
+    }
+    lock.renderer.disarm_resize_frame_wait();
+    lock.request_frame_callback = callback;
+    lock.renderer.set_presents_with_transaction(false);
+    lock.update_display_link_subscription();
 }
 
 extern "C" fn step(view: *mut c_void) {
