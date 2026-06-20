@@ -45,7 +45,24 @@ impl CoreAnimationLayerTree {
         self.uses_ca_context
     }
 
-    pub(crate) fn recreate_ca_context(&mut self) -> bool {
+    /// Recreate the `CAContext` for the current drawable size and re-apply
+    /// `drawable_size` to the reused content layer and the fresh `CALayerHost`.
+    ///
+    /// The caller must already be inside a CoreAnimation transaction with
+    /// implicit actions disabled. This mirrors Chromium's
+    /// `CALayerTreeCoordinator::CommitPresentedFrameToCA`, which runs the
+    /// CAContext fence-and-replace together with the content commit inside a
+    /// single `ScopedCAActionDisabler` scope so the host `contextId` swap and
+    /// the new IOSurface land in one atomic transaction. Chromium can do that
+    /// synchronously because its GPU has already rendered the front frame by
+    /// present time; Zed's Metal completion is async, so this runs from the
+    /// ready-frame commit path instead, and the same generation guard that
+    /// gates the IOSurface commit gates this recreate, so a stale frame cannot
+    /// install the wrong `contextId`.
+    pub(crate) fn recreate_ca_context_within_transaction(
+        &mut self,
+        drawable_size: Size<DevicePixels>,
+    ) -> bool {
         if !self.uses_ca_context {
             return false;
         }
@@ -55,16 +72,15 @@ impl CoreAnimationLayerTree {
         };
 
         unsafe {
-            with_disabled_ca_actions(|| {
-                self.create_and_set_fence_port();
-                let _: () = msg_send![self.ca_context, setLayer: nil];
-                let _: () = msg_send![self.ca_context, release];
-                let _: () = msg_send![ca_context, setLayer: self.content_layer];
-                let context_id: u32 = msg_send![ca_context, contextId];
-                self.replace_host_layer(context_id);
-            });
+            self.create_and_set_fence_port();
+            let _: () = msg_send![self.ca_context, setLayer: nil];
+            let _: () = msg_send![self.ca_context, release];
+            let _: () = msg_send![ca_context, setLayer: self.content_layer];
+            let context_id: u32 = msg_send![ca_context, contextId];
+            self.replace_host_layer(context_id);
         }
         self.ca_context = ca_context;
+        self.set_drawable_size(drawable_size);
         true
     }
 

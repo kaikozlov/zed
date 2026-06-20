@@ -101,7 +101,7 @@ pub(crate) struct InstanceBuffer {
 }
 
 struct CoreAnimationPresenter {
-    layer_tree: CoreAnimationLayerTree,
+    layer_tree: Arc<Mutex<CoreAnimationLayerTree>>,
     drawable_size: Size<DevicePixels>,
     buffers: Vec<IosurfaceFrameBuffer>,
     pending_swap_count: Arc<AtomicUsize>,
@@ -154,6 +154,9 @@ struct PresentedIosurfaceFrame {
     submitted_damage: Bounds<DevicePixels>,
     backpressure_fence: IosurfaceBackpressureFence,
     committed_backpressure_fence: Arc<Mutex<Option<IosurfaceBackpressureFence>>>,
+    recreate_ca_context_on_commit: bool,
+    layer_tree: Arc<Mutex<CoreAnimationLayerTree>>,
+    drawable_size: Size<DevicePixels>,
 }
 
 #[derive(Clone)]
@@ -305,6 +308,7 @@ impl InstanceBufferPool {
 
 #[allow(deprecated)]
 impl CoreAnimationPresenter {
+    #[allow(clippy::arc_with_non_send_sync)]
     fn new(
         device: &metal::Device,
         transparent: bool,
@@ -319,6 +323,7 @@ impl CoreAnimationPresenter {
                 ""
             }
         );
+        let layer_tree = Arc::new(Mutex::new(layer_tree));
 
         let mut presenter = Self {
             layer_tree,
@@ -354,9 +359,12 @@ impl CoreAnimationPresenter {
 
         let had_drawable_size = self.drawable_size.width.0 > 0 && self.drawable_size.height.0 > 0;
         self.drawable_size = drawable_size;
-        self.layer_tree.set_drawable_size(drawable_size);
-        if had_drawable_size && self.layer_tree.uses_ca_context() {
-            self.has_resized_since_last_swap = true;
+        {
+            let layer_tree = self.layer_tree.lock();
+            layer_tree.set_drawable_size(drawable_size);
+            if had_drawable_size && layer_tree.uses_ca_context() {
+                self.has_resized_since_last_swap = true;
+            }
         }
         self.generation.fetch_add(1, Ordering::AcqRel);
         self.current_buffer_index
@@ -376,29 +384,33 @@ impl CoreAnimationPresenter {
     }
 
     fn set_contents_scale(&mut self, scale_factor: f64) {
-        self.layer_tree.set_contents_scale(scale_factor);
-        self.layer_tree.set_drawable_size(self.drawable_size);
+        let mut layer_tree = self.layer_tree.lock();
+        layer_tree.set_contents_scale(scale_factor);
+        layer_tree.set_drawable_size(self.drawable_size);
     }
 
     fn set_opaque(&self, opaque: bool) {
-        self.layer_tree.set_opaque(opaque);
+        self.layer_tree.lock().set_opaque(opaque);
     }
 
     fn layer_ptr(&self) -> id {
-        self.layer_tree.backing_layer()
+        self.layer_tree.lock().backing_layer()
     }
 
     fn content_layer_ptr(&self) -> id {
-        self.layer_tree.content_layer()
+        self.layer_tree.lock().content_layer()
     }
 
-    fn prepare_to_present(&mut self) {
-        if self.has_resized_since_last_swap {
-            if self.layer_tree.recreate_ca_context() {
-                self.layer_tree.set_drawable_size(self.drawable_size);
-            }
-            self.has_resized_since_last_swap = false;
-        }
+    // The CAContext recreate that Chromium runs synchronously in
+    // `CommitPresentedFrameToCA` runs here at the ready-frame commit instead,
+    // because Zed's Metal completion is async and the new IOSurface is not
+    // available at encode time. `has_resized_since_last_swap` is snapshotted
+    // onto the submitted frame so the recreate lands in the same CoreAnimation
+    // transaction as the content commit.
+    fn take_pending_ca_context_recreate(&mut self) -> bool {
+        let pending = self.has_resized_since_last_swap;
+        self.has_resized_since_last_swap = false;
+        pending
     }
 
     fn full_damage(&self) -> Bounds<DevicePixels> {
@@ -822,6 +834,13 @@ fn commit_iosurface_frame(frame: Box<PresentedIosurfaceFrame>) {
             ];
         }
         if let Some(frame_for_contents) = frame.take() {
+            if frame_for_contents.recreate_ca_context_on_commit {
+                let drawable_size = frame_for_contents.drawable_size;
+                frame_for_contents
+                    .layer_tree
+                    .lock()
+                    .recreate_ca_context_within_transaction(drawable_size);
+            }
             let contents = frame_for_contents.surface.as_concrete_TypeRef() as id;
             let previous_contents: id = msg_send![frame_for_contents.layer, contents];
             let supports_contents_changed: bool = msg_send![
@@ -1536,7 +1555,8 @@ impl MetalRenderer {
                         .expect("checked above");
                     presenter.clear_buffer_damage(buffer_index);
                     presenter.mark_buffer_pending(buffer_index);
-                    presenter.prepare_to_present();
+                    let recreate_ca_context_on_commit =
+                        presenter.take_pending_ca_context_recreate();
                     let submission_order = presenter.next_submission_order();
                     let backpressure_fence = presenter.next_backpressure_fence();
                     command_buffer
@@ -1571,6 +1591,9 @@ impl MetalRenderer {
                         committed_backpressure_fence: presenter
                             .committed_backpressure_fence
                             .clone(),
+                        recreate_ca_context_on_commit,
+                        layer_tree: presenter.layer_tree.clone(),
+                        drawable_size: presenter.drawable_size,
                     };
                     presented_frames
                         .lock()
