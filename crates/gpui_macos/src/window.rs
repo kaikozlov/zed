@@ -2814,6 +2814,16 @@ extern "C" fn set_frame_size(this: &Object, _: Sel, size: NSSize) {
 extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
 
+    // Hold the CoreAnimation action disabler open across the render trigger,
+    // the wait, and the commit, matching Chromium's `ScopedCAActionDisabler`,
+    // which is held open across the pre-commit wait so no implicit animations
+    // run while the main thread waits for a frame the GPU is producing in
+    // parallel. Nested CATransactions (`commit_iosurface_frame` opens its own)
+    // are fine: the disabler stays active until this guard drops at function
+    // end. CoreAnimation transactions are thread-local and this runs on the
+    // main thread, so holding one open across the condvar wait is safe.
+    let _disabler = unsafe { renderer::CaActionsDisabled::new() };
+
     // Arm the resize wait and trigger a render, dropping the window lock while
     // GPUI builds the scene so the renderer is not borrowed during frame
     // production.
