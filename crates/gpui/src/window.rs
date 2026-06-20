@@ -3211,7 +3211,7 @@ impl Window {
                 needs_present: needs_present.clone(),
                 next_frame_callbacks: next_frame_callbacks.clone(),
                 input_rate_tracker: input_rate_tracker.clone(),
-                frame_scheduler: frame_scheduler.clone(),
+                frame_scheduler,
                 supports_delayed_begin_frame_scheduling,
             };
             move |request_frame_options| {

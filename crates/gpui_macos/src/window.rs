@@ -3580,7 +3580,7 @@ mod tests {
     fn missed_display_link_timing_reissues_last_timing_as_missed() {
         let frame_time = scheduler::Instant::now();
         let predicted_display_time = frame_time + Duration::from_millis(16);
-        let frame_interval = Some(Duration::from_millis(16));
+        let frame_interval = Duration::from_millis(16);
         let last_timing = DisplayLinkTiming {
             begin_frame: gpui::BeginFrameArgs {
                 id: gpui::BeginFrameId {
@@ -3589,11 +3589,11 @@ mod tests {
                 },
                 frame_time,
                 deadline: predicted_display_time,
-                interval: frame_interval.unwrap(),
+                interval: frame_interval,
                 missed: false,
             },
             predicted_display_time,
-            frame_interval,
+            frame_interval: Some(frame_interval),
             frame_deadline: predicted_display_time,
         };
 
