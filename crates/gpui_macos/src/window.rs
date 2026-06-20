@@ -2827,16 +2827,6 @@ extern "C" fn set_frame_size(this: &Object, _: Sel, size: NSSize) {
 extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
 
-    // Hold the CoreAnimation action disabler open across the render trigger,
-    // the wait, and the commit, matching Chromium's `ScopedCAActionDisabler`,
-    // which is held open across the pre-commit wait so no implicit animations
-    // run while the main thread waits for a frame the GPU is producing in
-    // parallel. Nested CATransactions (`commit_iosurface_frame` opens its own)
-    // are fine: the disabler stays active until this guard drops at function
-    // end. CoreAnimation transactions are thread-local and this runs on the
-    // main thread, so holding one open across the condvar wait is safe.
-    let _disabler = unsafe { renderer::CaActionsDisabled::new() };
-
     // Arm the resize wait. A current-generation frame may already be in
     // flight: set_frame_size dispatches the resize render on the resize event
     // (matching Chromium starting it early), so by the time displayLayer: runs
@@ -2846,6 +2836,14 @@ extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
     // avoids a redundant render when set_frame_size already started one. When
     // skipped, the request_frame_callback is left untouched in the window
     // state; when triggered, it is taken, invoked, and restored here.
+    //
+    // No CaActionsDisabled guard is held across the wait: every layer mutation
+    // (commit_iosurface_frame's contents swap, set_drawable_size's bounds
+    // change) already disables implicit actions in its own scope, so holding a
+    // nested CATransaction open across the park would only block AppKit's outer
+    // window transaction while the main thread is parked. Chromium holds its
+    // ScopedCAActionDisabler across the wait because its coordinator mutates
+    // the layer tree during the wait; Zed's wait does not mutate anything.
     let triggered_render = {
         let mut lock = window_state.lock();
         lock.renderer.arm_resize_frame_wait();

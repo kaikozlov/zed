@@ -12,7 +12,7 @@ use mach2::{
     traps::mach_task_self,
 };
 use objc::{class, msg_send, runtime::Class, sel, sel_impl};
-use std::{collections::VecDeque, ffi::c_char, marker::PhantomData, sync::OnceLock};
+use std::{collections::VecDeque, ffi::c_char, sync::OnceLock};
 
 const MAX_CA_CONTEXT_FENCE_PORTS: usize = 4;
 
@@ -345,38 +345,6 @@ fn deallocate_mach_port(port: mach_port_t) {
     let result = unsafe { mach_port_deallocate(mach_task_self(), port) };
     if result != KERN_SUCCESS {
         log::warn!("failed to deallocate CAContext fence mach port: {result}");
-    }
-}
-
-/// Disables implicit CoreAnimation actions for the lifetime of the guard,
-/// matching Chromium's `ScopedCAActionDisabler` (ui/base/cocoa/animation_utils.h).
-/// Construction begins a `CATransaction` with actions disabled; drop commits it.
-///
-/// Must be created and dropped on the same thread (CoreAnimation transactions
-/// are thread-local). Held open across the resize frame wait in `displayLayer:`
-/// so no implicit animations run while the main thread waits for a frame the
-/// GPU is producing in parallel.
-pub(crate) struct CaActionsDisabled {
-    _not_send_sync: PhantomData<*mut ()>,
-}
-
-impl CaActionsDisabled {
-    pub(crate) unsafe fn new() -> Self {
-        unsafe {
-            let _: () = msg_send![class!(CATransaction), begin];
-            let _: () = msg_send![class!(CATransaction), setDisableActions: YES];
-        }
-        Self {
-            _not_send_sync: PhantomData,
-        }
-    }
-}
-
-impl Drop for CaActionsDisabled {
-    fn drop(&mut self) {
-        unsafe {
-            let _: () = msg_send![class!(CATransaction), commit];
-        }
     }
 }
 
