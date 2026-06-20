@@ -643,6 +643,13 @@ pub struct BeginFrameArgs {
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 #[expect(missing_docs)]
+pub struct BeginFrameAck {
+    pub frame_id: BeginFrameId,
+    pub has_damage: bool,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[expect(missing_docs)]
 pub struct PresentationFeedback {
     pub ready_time: Instant,
     pub latch_time: Instant,
@@ -736,7 +743,7 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene) -> PlatformDrawResult;
-    fn completed_frame(&self) {}
+    fn completed_frame(&self, _ack: Option<BeginFrameAck>) {}
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
     fn is_subpixel_rendering_supported(&self) -> bool;
 

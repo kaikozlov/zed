@@ -238,6 +238,11 @@ ZED_MACOS_LEGACY_METAL_LAYER=1 cargo run -p zed
   decrements submitted swaps. `PlatformDrawResult::Deferred` preserves
   `needs_present` when the IOSurface queue has no available buffer, so a
   backpressured draw does not masquerade as a completed swap.
+- BeginFrame finish accounting now uses the platform draw result for
+  Chromium's `BeginFrameAck.has_damage` semantics. A GPUI draw attempt that
+  returns `PlatformDrawResult::Submitted` records `has_damage=true`; `Deferred`
+  and `Skipped` still update draw-duration and one-draw-per-BeginFrame state,
+  but finish with `has_damage=false` because no compositor frame was submitted.
 - Swap completion feedback now carries an explicit Chromium-shaped result:
   `Ack`, `Skipped`, or `Failed`, while preserving the existing `presented`
   boolean for current scheduling code. A committed current-generation IOSurface
@@ -479,12 +484,18 @@ ZED_MACOS_LEGACY_METAL_LAYER=1 cargo run -p zed
   This mirrors Chromium's `DisplayScheduler::OnPresentationFeedback()` check
   for `ready_timestamp > target_latch_time`, adapted to Zed's local
   display-link display-time estimate.
-- GPUI now retains the last valid `PresentationFeedback.interval` and uses it
-  as the scheduler's frame-interval fallback when a platform frame request does
-  not carry BeginFrame or frame-interval metadata. Chromium's mac coordinator
-  fills `feedback.interval` from display timing and viz preserves that interval
-  for vsync-backed presentation feedback; Zed now uses the same signal rather
-  than falling straight back to a hardcoded 16.667 ms interval.
+- GPUI now retains the last valid scheduler frame interval from explicit
+  BeginFrame/request metadata and from `PresentationFeedback.interval`, using
+  that retained interval as the scheduler fallback when a platform frame request
+  does not carry interval metadata. Chromium updates `last_frame_interval_` when
+  BeginFrame intervals change, and its mac coordinator fills
+  `feedback.interval` from display timing; Zed now preserves the same interval
+  signal instead of falling straight back to a hardcoded 16.667 ms interval.
+- The same retained frame interval now updates GPUI's high-rate input tracker,
+  so proactive presentation sustain is keyed to the current display cadence
+  rather than a fixed 60 Hz threshold. This keeps the scheduler's input-rate
+  heuristic aligned with Chromium's frame-interval-updated state on high-refresh
+  displays.
 
 **BeginFrame input and lifecycle**
 
@@ -536,6 +547,18 @@ ZED_MACOS_LEGACY_METAL_LAYER=1 cargo run -p zed
   stopped; GPUI's Chromium-style continuity filter decides whether the missed
   frame is still usable or should be ignored until the next real display-link
   tick.
+- macOS now consumes `completed_frame(Some(BeginFrameAck))` at the platform
+  BeginFrame source boundary. The last acked BeginFrame id is retained, and
+  retained display-link timing for that same id is not reissued as a missed
+  BeginFrame after the frame has already been finished. This moves GPUI closer
+  to Chromium's `BeginFrameSource::DidFinishFrame()` contract, where the source
+  sees explicit observer completion instead of treating every retained tick as
+  eligible for replay.
+- macOS now drops queued missed-BeginFrame callbacks after
+  `set_needs_begin_frame(false)`. This mirrors Chromium's
+  `StopObservingBeginFrames()` cancellation of queued missed tasks: the dispatch
+  queue callback may still run, but it no longer reissues stale retained timing
+  once GPUI has gone idle.
 - The continuity filter now has the corresponding missed-frame exception: an
   explicit missed retry for the current BeginFrame is not discarded merely
   because its id/time matches the current frame. The one-draw-per-BeginFrame
@@ -570,8 +593,89 @@ ZED_MACOS_LEGACY_METAL_LAYER=1 cargo run -p zed
 - GPUI now routes BeginFrame production through explicit deadline-mode state:
   `NONE`, `BLOCKED`, `IMMEDIATE`, `REGULAR`, `LATE`, and `WAIT_FOR_SCROLL`.
   `REGULAR` dirty frames schedule at the adjusted draw deadline, `IMMEDIATE`
-  handles forced or previously-missed frames, `LATE` covers presentation without
-  redraw, and `BLOCKED` covers duplicate draw attempts for the same BeginFrame.
+  handles forced, previously-missed, or delayed-scheduling-unsupported frames,
+  `LATE` schedules at `frame_time + interval` for clean, present-only, or
+  swap-backpressured BeginFrames on platforms that can safely delay frame
+  production, and `BLOCKED` covers duplicate draw attempts for the same
+  BeginFrame.
+- The frame callback now carries those BeginFrame, deadline, presentation
+  feedback, retained interval, and draw-duration fields in a single
+  `FrameSchedulerState` object instead of a loose set of callback-local cells.
+  This is still not Chromium's full scheduler state machine, but it gives GPUI
+  a coherent scheduler state surface for continuing to port Chromium behaviors
+  such as pending BeginFrame coalescing, idle drops, and richer deadline
+  transitions.
+- Delayed BeginFrame deadlines are now tracked as an owned
+  `PendingBeginFrameDeadline` record keyed by `BeginFrameId` and desired
+  deadline time, not as independent id/options cells. A delayed timer can only
+  consume the pending deadline for its own BeginFrame at its own scheduled
+  deadline time; if a newer BeginFrame replaces it, or the same BeginFrame is
+  rescheduled to a different deadline, the stale timer exits without clearing
+  newer pending work. This matches Chromium's "use existing deadline only when
+  the task time is unchanged" behavior without requiring a cancellable platform
+  timer.
+- Pending deadlines now carry the computed frame-production state, not just the
+  raw `RequestFrameOptions`. In particular, `needs_present` is preserved across
+  delayed timers and synchronous previous-deadline flushes, so a present-only
+  `LATE` deadline cannot fire later as an idle no-op. This mirrors Chromium's
+  scheduler-state model, where `OnBeginFrameDeadline()` runs against retained
+  scheduler state rather than reconstructing presentation intent from the
+  BeginFrame args alone.
+- GPUI now has a shared local equivalent of Chromium's
+  `OnBeginFrameDeadline()`/`AttemptDrawAndSwap()` finish accounting. Immediate
+  draws, delayed deadline draws, and synchronously flushed previous deadlines
+  all call the same `draw_and_present` operation and the same
+  `FrameSchedulerState::finish_begin_frame_*` methods, so draw-duration
+  estimates, one-draw-per-BeginFrame state, and main-thread deadline misses are
+  updated consistently across every BeginFrame production path. Backpressured
+  `AttemptDrawAndSwap` now also flows through `did_finish_frame()` as a no-draw
+  result, matching Chromium's `DidFinishFrame(false)` behavior instead of
+  completing the platform frame outside scheduler finish accounting.
+- GPUI now exposes a platform-level `BeginFrameAck` next to `BeginFrameArgs`.
+  `did_finish_frame()` records and forwards an ack for every BeginFrame finish
+  through `PlatformWindow::completed_frame(Some(ack))`. The ack carries the
+  `BeginFrameId` and Chromium's `has_damage` semantics: platform-submitted
+  draw/swap production records `true`, while deferred/skipped draw attempts,
+  present-only, idle, throttled, or backpressured completions record `false`.
+  Native frame completions that are not a Chromium-style BeginFrame finish, such
+  as stale BeginFrame drops or duplicate-draw blocked completions, still
+  complete the platform frame with `None`.
+- The request-frame callback now delegates to a `BeginFrameScheduler` spine with
+  Chromium-shaped phases: `on_begin_frame_continuation()`,
+  `schedule_begin_frame_deadline()`, `on_begin_frame_deadline()`,
+  `attempt_draw_and_swap()`, and `did_finish_frame()`. The platform callback is
+  no longer the scheduler; it just passes `RequestFrameOptions` into this spine.
+  Continuation classifies incoming BeginFrames as older/current/new, deadline
+  scheduling owns delayed tasks, deadline execution performs the draw/swap
+  attempt, and finish accounting updates the BeginFrame state.
+- `FrameSchedulerState` now tracks Chromium's
+  `inside_begin_frame_deadline_interval_` equivalent. Accepting a BeginFrame
+  enters the interval, a newer BeginFrame synchronously flushes the previous
+  interval before advancing, and deadline execution/finish clears the interval.
+  The current `RequestFrameOptions` are retained with the current BeginFrame so
+  that a previous interval can be flushed even when it was not represented by a
+  delayed timer task.
+- `LATE` deadline mode now follows Chromium's
+  `DesiredBeginFrameDeadlineTime(kLate)` behavior. Instead of completing
+  clean BeginFrames immediately, GPUI waits until the end of the BeginFrame
+  interval before finishing with `BeginFrameAck(has_damage=false)`. The same
+  late deadline also produces present-only frames and gives swap-backpressured
+  frames one interval to clear. If the swap queue is still backpressured at that
+  late deadline, GPUI parks the request in `pending_gpu_available_frame` rather
+  than drawing into the closed queue. Renderers that opt out of delayed
+  BeginFrame scheduling, such as the CA/IOSurface path, still execute the
+  deadline immediately so the scheduler does not reintroduce the previously
+  observed late-CPU-start choppiness.
+- GPUI now also mirrors Chromium's `BeginFrameSource::SetIsGpuBusy()` response
+  state. When pending platform swaps reach the platform limit, the scheduler
+  allows one new BeginFrame through, then parks later BeginFrames in
+  `pending_gpu_available_frame` without advancing the current BeginFrame or
+  emitting a false `BeginFrameAck`. When swap completion drops the pending swap
+  count below the limit, GPUI resets the GPU-busy state and requests the parked
+  frame even if the source had only reached Chromium's "one BeginFrame after
+  busy sent" state. This matches Chromium's `DidReceiveSwapBuffersAck()` rule:
+  after `pending_swaps_` is decremented, the scheduler observes the updated
+  backpressure state and schedules/wakes pending BeginFrame work.
 - GPUI uses the BeginFrame deadline/frame time as its fallback frame time until
   real presentation feedback arrives. This moves frame pacing closer to
   Chromium's model, where frame production is tied to an intended display

@@ -24,13 +24,14 @@ use cocoa::{
 };
 use dispatch2::DispatchQueue;
 use gpui::{
-    AnyWindowHandle, BackgroundExecutor, Bounds, Capslock, CursorStyle, ExternalPaths,
-    FileDropEvent, ForegroundExecutor, KeyDownEvent, Keystroke, Modifiers, ModifiersChangedEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformDrawResult, PlatformInput, PlatformInputHandler, PlatformWindow,
-    Point, PresentationFeedback, PromptButton, PromptLevel, RequestFrameOptions, SharedString,
-    Size, SwapCompletionFeedback, SystemWindowTab, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControlArea, WindowKind, WindowParams, point, px, size,
+    AnyWindowHandle, BackgroundExecutor, BeginFrameAck, Bounds, Capslock, CursorStyle,
+    ExternalPaths, FileDropEvent, ForegroundExecutor, KeyDownEvent, Keystroke, Modifiers,
+    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    PlatformAtlas, PlatformDisplay, PlatformDrawResult, PlatformInput, PlatformInputHandler,
+    PlatformWindow, Point, PresentationFeedback, PromptButton, PromptLevel, RequestFrameOptions,
+    SharedString, Size, SwapCompletionFeedback, SystemWindowTab, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowKind, WindowParams, point,
+    px, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -494,6 +495,7 @@ struct MacWindowState {
     display_link_running: bool,
     needs_begin_frame: bool,
     last_display_link_timing: Option<DisplayLinkTiming>,
+    last_begin_frame_ack: Option<BeginFrameAck>,
     renderer: renderer::Renderer,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     swap_completion_callback: Option<Box<dyn FnMut(SwapCompletionFeedback)>>,
@@ -950,6 +952,7 @@ impl MacWindow {
                 display_link_running: false,
                 needs_begin_frame: false,
                 last_display_link_timing: None,
+                last_begin_frame_ack: None,
                 renderer: renderer::new_renderer(
                     renderer_context,
                     native_window as *mut _,
@@ -1897,6 +1900,18 @@ impl PlatformWindow for MacWindow {
     fn draw(&self, scene: &gpui::Scene) -> PlatformDrawResult {
         let mut this = self.0.lock();
         this.renderer.draw(scene)
+    }
+
+    fn completed_frame(&self, ack: Option<BeginFrameAck>) {
+        let mut this = self.0.lock();
+        this.last_begin_frame_ack = ack;
+        if let Some(ack) = ack
+            && this
+                .last_display_link_timing
+                .is_some_and(|timing| timing.begin_frame.id == ack.frame_id)
+        {
+            this.last_display_link_timing = None;
+        }
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
@@ -2903,6 +2918,21 @@ fn missed_display_link_timing(last_timing: DisplayLinkTiming) -> Option<DisplayL
     })
 }
 
+fn missed_display_link_timing_if_observing(
+    needs_begin_frame: bool,
+    last_timing: DisplayLinkTiming,
+    last_ack: Option<BeginFrameAck>,
+) -> Option<DisplayLinkTiming> {
+    if !needs_begin_frame {
+        return None;
+    }
+    if last_ack.is_some_and(|ack| ack.frame_id == last_timing.begin_frame.id) {
+        return None;
+    }
+
+    missed_display_link_timing(last_timing)
+}
+
 fn dispatch_frame_request(
     window_state: Weak<Mutex<MacWindowState>>,
     options: RequestFrameOptions,
@@ -2985,7 +3015,13 @@ fn request_missed_frame(window_state: Weak<Mutex<MacWindowState>>) {
         .as_ref()
         .and_then(DisplayLink::latest_timing)
         .or(lock.last_display_link_timing)
-        .and_then(missed_display_link_timing);
+        .and_then(|timing| {
+            missed_display_link_timing_if_observing(
+                lock.needs_begin_frame,
+                timing,
+                lock.last_begin_frame_ack,
+            )
+        });
     let Some(display_link_timing) = display_link_timing else {
         return;
     };
@@ -3596,5 +3632,76 @@ mod tests {
         };
 
         assert!(missed_display_link_timing(last_timing).is_none());
+    }
+
+    #[test]
+    fn missed_display_link_timing_is_dropped_when_not_observing_begin_frames() {
+        let frame_time = scheduler::Instant::now();
+        let predicted_display_time = frame_time + Duration::from_millis(16);
+        let last_timing = DisplayLinkTiming {
+            begin_frame: gpui::BeginFrameArgs {
+                id: gpui::BeginFrameId {
+                    source_id: 7,
+                    sequence_number: 42,
+                },
+                frame_time,
+                deadline: predicted_display_time,
+                interval: Duration::from_millis(16),
+                missed: false,
+            },
+            predicted_display_time,
+            frame_interval: Some(Duration::from_millis(16)),
+            frame_deadline: predicted_display_time,
+        };
+
+        assert!(missed_display_link_timing_if_observing(false, last_timing, None).is_none());
+        assert!(missed_display_link_timing_if_observing(true, last_timing, None).is_some());
+    }
+
+    #[test]
+    fn missed_display_link_timing_is_dropped_after_ack_for_same_begin_frame() {
+        let frame_time = scheduler::Instant::now();
+        let predicted_display_time = frame_time + Duration::from_millis(16);
+        let last_timing = DisplayLinkTiming {
+            begin_frame: gpui::BeginFrameArgs {
+                id: gpui::BeginFrameId {
+                    source_id: 7,
+                    sequence_number: 42,
+                },
+                frame_time,
+                deadline: predicted_display_time,
+                interval: Duration::from_millis(16),
+                missed: false,
+            },
+            predicted_display_time,
+            frame_interval: Some(Duration::from_millis(16)),
+            frame_deadline: predicted_display_time,
+        };
+
+        assert!(
+            missed_display_link_timing_if_observing(
+                true,
+                last_timing,
+                Some(gpui::BeginFrameAck {
+                    frame_id: last_timing.begin_frame.id,
+                    has_damage: true,
+                }),
+            )
+            .is_none()
+        );
+        assert!(
+            missed_display_link_timing_if_observing(
+                true,
+                last_timing,
+                Some(gpui::BeginFrameAck {
+                    frame_id: gpui::BeginFrameId {
+                        source_id: 7,
+                        sequence_number: 41,
+                    },
+                    has_damage: true,
+                }),
+            )
+            .is_some()
+        );
     }
 }
