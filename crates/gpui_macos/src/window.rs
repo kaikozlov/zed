@@ -2809,6 +2809,19 @@ extern "C" fn set_frame_size(this: &Object, _: Sel, size: NSSize) {
         callback(content_size, scale_factor);
         window_state.lock().resize_callback = Some(callback);
     };
+
+    // Start the resize render now, on the resize event, instead of waiting for
+    // AppKit's displayLayer: callback. Chromium kicks off the resize frame as
+    // soon as the size changes so it is already in flight by the time the
+    // commit-boundary wait runs. The request is dispatched asynchronously; if
+    // it has not run yet by the time displayLayer: fires, displayLayer: falls
+    // back to triggering a render itself, so this is purely an optimization
+    // (earlier GPU start, shorter wait) and never a missed frame.
+    dispatch_frame_request(
+        Arc::downgrade(&window_state),
+        RequestFrameOptions::default(),
+        false,
+    );
 }
 
 extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
@@ -2824,18 +2837,30 @@ extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
     // main thread, so holding one open across the condvar wait is safe.
     let _disabler = unsafe { renderer::CaActionsDisabled::new() };
 
-    // Arm the resize wait and trigger a render, dropping the window lock while
-    // GPUI builds the scene so the renderer is not borrowed during frame
-    // production.
-    let mut callback = {
+    // Arm the resize wait. A current-generation frame may already be in
+    // flight: set_frame_size dispatches the resize render on the resize event
+    // (matching Chromium starting it early), so by the time displayLayer: runs
+    // a correctly-sized frame may already be pending or even ready. Only
+    // trigger a render here as a fallback when no current-generation frame is
+    // pending (initial display, or the early dispatch lost the race). This
+    // avoids a redundant render when set_frame_size already started one. When
+    // skipped, the request_frame_callback is left untouched in the window
+    // state; when triggered, it is taken, invoked, and restored here.
+    let triggered_render = {
         let mut lock = window_state.lock();
         lock.renderer.arm_resize_frame_wait();
         lock.renderer.set_presents_with_transaction(true);
         lock.stop_display_link();
-        lock.request_frame_callback.take()
+        !lock.renderer.has_current_generation_submission()
     };
-    if let Some(callback) = callback.as_mut() {
-        (**callback)(Default::default());
+    if triggered_render {
+        let mut callback = window_state.lock().request_frame_callback.take();
+        if let Some(callback) = callback.as_mut() {
+            (**callback)(Default::default());
+        }
+        if let Some(callback) = callback {
+            window_state.lock().request_frame_callback = Some(callback);
+        }
     }
 
     // Block at the commit boundary for a frame produced in parallel by the
@@ -2868,7 +2893,6 @@ extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
         lock.renderer.flush_ready_display_frames();
     }
     lock.renderer.disarm_resize_frame_wait();
-    lock.request_frame_callback = callback;
     lock.renderer.set_presents_with_transaction(false);
     lock.update_display_link_subscription();
 }

@@ -298,13 +298,12 @@ impl<T> IosurfaceSubmissionQueue<T> {
     fn len(&self) -> usize {
         self.frames.len()
     }
+
+    fn any(&self, predicate: impl Fn(&T) -> bool) -> bool {
+        self.frames.iter().any(|queued_frame| predicate(&queued_frame.frame))
+    }
 }
 
-struct IosurfaceFrameCompletion {
-    presented_frames: Arc<Mutex<IosurfaceSubmissionQueue<Box<PresentedIosurfaceFrame>>>>,
-    submission_order: usize,
-    status: MTLCommandBufferStatus,
-}
 
 impl Drop for PresentedIosurfaceFrame {
     fn drop(&mut self) {
@@ -453,6 +452,19 @@ impl CoreAnimationPresenter {
         // Frames that completed while armed bypassed the main-queue commit
         // path. Flush any ready frames now that normal dispatch has resumed.
         commit_all_ready_iosurface_frames(self.presented_frames.clone());
+    }
+
+    /// Whether a frame of the current generation has been submitted but not yet
+    /// committed. Generation is bumped on every resize, so a current-generation
+    /// submission is one rendered at the current size and still in flight. Used
+    /// by `displayLayer:` to decide whether a resize render dispatched earlier
+    /// (on the resize event) is already pending, in which case it waits for that
+    /// frame instead of triggering a redundant render.
+    fn has_current_generation_submission(&self) -> bool {
+        let current_generation = self.generation.load(Ordering::Acquire);
+        self.presented_frames
+            .lock()
+            .any(|frame| frame.generation == current_generation)
     }
 
     fn layer_ptr(&self) -> id {
@@ -1023,42 +1035,13 @@ pub(crate) fn wait_for_and_commit_current_generation_frame(
     }
 }
 
-extern "C" fn complete_presented_iosurface_frame_async(context: *mut c_void) {
-    let completion = unsafe { Box::from_raw(context as *mut IosurfaceFrameCompletion) };
-    if completion.status == MTLCommandBufferStatus::Completed {
-        let ready_time = scheduler::Instant::now();
-        let marked_ready = {
-            let mut presented_frames = completion.presented_frames.lock();
-            presented_frames.mark_ready_with(completion.submission_order, |frame| {
-                frame.ready_time = ready_time;
-            })
-        };
-        if !marked_ready {
-            log::error!(
-                "completed IOSurface submission {} was not found in the presentation queue",
-                completion.submission_order
-            );
-        }
-        commit_ready_iosurface_frame_after_completion(completion.presented_frames.clone());
-    } else {
-        log::error!(
-            "failed to render IOSurface frame: Metal command buffer finished with status {:?}",
-            completion.status
-        );
-        let frame = {
-            let mut presented_frames = completion.presented_frames.lock();
-            presented_frames.remove(completion.submission_order)
-        };
-        if let Some(frame) = frame {
-            fail_iosurface_frame(frame);
-        } else {
-            log::error!(
-                "failed IOSurface submission {} was not found in the presentation queue",
-                completion.submission_order
-            );
-        }
-        commit_ready_iosurface_frame_after_completion(completion.presented_frames.clone());
-    }
+extern "C" fn commit_ready_iosurface_frame_async(context: *mut c_void) {
+    let presented_frames = unsafe {
+        Box::from_raw(
+            context as *mut Arc<Mutex<IosurfaceSubmissionQueue<Box<PresentedIosurfaceFrame>>>>,
+        )
+    };
+    commit_ready_iosurface_frame_after_completion(*presented_frames);
 }
 
 pub(crate) struct MetalRenderer {
@@ -1460,6 +1443,12 @@ impl MetalRenderer {
         }
     }
 
+    pub(crate) fn has_current_generation_submission(&self) -> bool {
+        self.core_animation_presenter
+            .as_ref()
+            .is_some_and(|presenter| presenter.has_current_generation_submission())
+    }
+
     pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {
         if let Some(layer) = &self.layer {
             let ns_size = NSSize {
@@ -1744,63 +1733,69 @@ impl MetalRenderer {
                             if let Some(instance_buffer) = instance_buffer.take() {
                                 instance_buffer_pool.lock().release(instance_buffer);
                             }
-
                             let status = command_buffer.status();
+
+                            // Always record the frame's outcome on the Metal
+                            // completion thread, not deferred to the main queue.
+                            // The main queue may be blocked inside displayLayer:'s
+                            // resize wait; if ready-marking were deferred there,
+                            // an armed wait would never observe the frame and
+                            // would time out. Marking under the presentation
+                            // queue lock is safe from any thread.
+                            if status == MTLCommandBufferStatus::Completed {
+                                let ready_time = scheduler::Instant::now();
+                                let marked = presented_frames
+                                    .lock()
+                                    .mark_ready_with(submission_order, |frame| {
+                                        frame.ready_time = ready_time;
+                                    });
+                                if !marked {
+                                    log::error!(
+                                        "completed IOSurface submission {} was not found in the presentation queue",
+                                        submission_order
+                                    );
+                                }
+                            } else {
+                                log::error!(
+                                    "failed to render IOSurface frame: Metal command buffer finished with status {:?}",
+                                    status
+                                );
+                                if let Some(frame) =
+                                    presented_frames.lock().remove(submission_order)
+                                {
+                                    fail_iosurface_frame(frame);
+                                } else {
+                                    log::error!(
+                                        "failed IOSurface submission {} was not found in the presentation queue",
+                                        submission_order
+                                    );
+                                }
+                            }
+
                             let armed = resize_frame_wait.inner.lock().armed;
                             if armed {
                                 // The main thread is blocked inside AppKit's
-                                // `displayLayer:` live-resize callback, so the
-                                // main dispatch queue cannot service this
-                                // completion. Update the presentation queue here
-                                // (on the Metal completion thread) and wake the
-                                // waiting main thread, which commits the ready
-                                // frame. Single-process analog of Chromium
-                                // draining the frame-delivery callback via
-                                // `WindowResizeHelperMac::WaitForSingleTaskToRun`.
-                                if status == MTLCommandBufferStatus::Completed {
-                                    let ready_time = scheduler::Instant::now();
-                                    let marked = presented_frames
-                                        .lock()
-                                        .mark_ready_with(submission_order, |frame| {
-                                            frame.ready_time = ready_time;
-                                        });
-                                    if !marked {
-                                        log::error!(
-                                            "completed IOSurface submission {} was not found in the presentation queue",
-                                            submission_order
-                                        );
-                                    }
-                                } else {
-                                    log::error!(
-                                        "failed to render IOSurface frame: Metal command buffer finished with status {:?}",
-                                        status
-                                    );
-                                    if let Some(frame) =
-                                        presented_frames.lock().remove(submission_order)
-                                    {
-                                        fail_iosurface_frame(frame);
-                                    } else {
-                                        log::error!(
-                                            "failed IOSurface submission {} was not found in the presentation queue",
-                                            submission_order
-                                        );
-                                    }
-                                }
+                                // displayLayer: live-resize callback and cannot
+                                // service the main queue. Signal the condvar so
+                                // it drains and commits the ready frame.
+                                // Single-process analog of Chromium draining the
+                                // frame-delivery callback via
+                                // WindowResizeHelperMac::WaitForSingleTaskToRun.
                                 let mut state = resize_frame_wait.inner.lock();
                                 state.notifications = state.notifications.saturating_add(1);
                                 resize_frame_wait.cond.notify_one();
-                            } else {
-                                let completion = IosurfaceFrameCompletion {
-                                    presented_frames: presented_frames.clone(),
-                                    submission_order,
-                                    status,
-                                };
-                                let context = Box::into_raw(Box::new(completion))
+                            } else if status == MTLCommandBufferStatus::Completed {
+                                // Commit the ready frame on the main queue
+                                // (ready-marking already happened above). Commits
+                                // run on the main thread because they mutate the
+                                // CoreAnimation layer tree.
+                                let presented_frames = presented_frames.clone();
+                                let context = Box::into_raw(Box::new(presented_frames))
                                     as *mut c_void;
                                 unsafe {
                                     dispatch2::DispatchQueue::main().exec_async_f(
                                         context,
-                                        complete_presented_iosurface_frame_async,
+                                        commit_ready_iosurface_frame_async,
                                     );
                                 }
                             }
