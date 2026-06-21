@@ -60,11 +60,14 @@ branch.
 | Chromium-style CA/IOSurface presenter (3-buffer, 2-pending) | `crates/gpui_macos/src/metal_renderer.rs` (`PresentedIosurfaceFrame` ~`:186`, `IosurfaceSubmissionQueue`, `mark_buffer_pending` `:552`) |
 | Legacy `CAMetalLayer` escape hatch | `ZED_MACOS_LEGACY_METAL_LAYER=1` |
 | Local `CAContext`/`CALayerHost` topology + fence ports | `crates/gpui_macos/src/remote_layer.rs` |
-| `BeginFrameArgs`/`BeginFrameAck`/`PresentationFeedback`/`SwapCompletionFeedback` types | `crates/gpui/src/platform.rs:612-690` |
-| Scheduler spine embedded in `Window` | `crates/gpui/src/window.rs`: `FrameSchedulerState:1317`, `BeginFrameScheduler:1884`, `on_begin_frame_continuation:1897`, `schedule_begin_frame_deadline:1699/2014`, `on_begin_frame_deadline:2121`, `attempt_draw_and_swap:2140`, `did_finish_frame:2164`, `on_gpu_available:2220`, `on_output_surface_lost:2132` |
-| Deadline-mode enum (prototype) | `crates/gpui/src/window.rs:1799` `enum BeginFrameDeadlineMode { None, Blocked, Immediate, Regular, Late, WaitForScroll }` |
+| `BeginFrameArgs`/`BeginFrameAck`/`PresentationFeedback`/`SwapCompletionFeedback` types | `crates/gpui/src/platform.rs:612-703` |
+| `BeginFrameObserver`/`BeginFrameSource` traits | `crates/gpui/src/platform.rs:655`, `crates/gpui/src/platform.rs:665` |
+| Scheduler spine embedded in `Window` | `crates/gpui/src/window.rs`: `FrameSchedulerState:1331`, `BeginFrameScheduler:1898`, `on_begin_frame_continuation:1921`, `schedule_begin_frame_deadline:1713/2039`, `on_begin_frame_deadline:2146`, `attempt_draw_and_swap:2165`, `did_finish_frame:2189`, `on_gpu_available:2245`, `on_output_surface_lost:2157` |
+| GPUI BeginFrame observer adapters | `InputRateTracker` implements `BeginFrameObserver` at `crates/gpui/src/window.rs:1220`; `BeginFrameScheduler` implements it at `:2285`; source `BeginFrameArgs` are converted to scheduler requests at `:2304` |
+| macOS `DelayBasedBeginFrameSource` analog | `crates/gpui_macos/src/window.rs:485` (`MacBeginFrameSource`), `impl gpui::BeginFrameSource` at `:621`, scheduler observer callback storage at `:487`, input-client delivery at `:601`, source timing request construction at `:3167` |
+| Deadline-mode enum (prototype) | `crates/gpui/src/window.rs:1813` `enum BeginFrameDeadlineMode { None, Blocked, Immediate, Regular, Late, WaitForScroll }` |
 | Scene damage transport | `crates/gpui/src/scene.rs:27` (`damage: Option<Bounds<ScaledPixels>>`, `add_damage:67`) |
-| Bounded dirty-view invalidation | `crates/gpui/src/window.rs:4384` (`mark_view_dirty`) |
+| Bounded dirty-view invalidation | `crates/gpui/src/window.rs:4471` (`mark_view_dirty`) |
 | macOS frame source (`CVDisplayLink` → dispatch) | `crates/gpui_macos/src/display_link.rs`, `window.rs` `step()` |
 
 The feedback-lifecycle drain (swap-completion Ack/Skipped/Failed, presentation
@@ -118,37 +121,59 @@ Phase 9 (CALayerTree align) ◄─────┘
     ordering.
   - `DelayBasedBeginFrameSource::IssueBeginFrameToObserver` (`:476`).
 
-**Zed current state.** The scheduler is a pile of methods on `Window`-owned
-structs: `BeginFrameScheduler` (`window.rs:1884`) and `FrameSchedulerState`
-(`window.rs:1317`). There is no `BeginFrameSource`/`BeginFrameObserver`
-trait split; the macOS `CVDisplayLink` calls directly into `step()`. The
-`on_begin_frame_for_input` observer exists (`platform.rs:728`) but is a
-single hook, not the observer-list model.
+**Zed current state.** The scheduler is still a pile of methods on
+`Window`-owned structs: `BeginFrameScheduler` (`window.rs:1898`) and
+`FrameSchedulerState` (`window.rs:1331`). The GPUI platform layer now has
+`BeginFrameObserver`/`BeginFrameSource` traits (`platform.rs:655`/`:665`), and
+macOS has a `DelayBasedBeginFrameSource` analog in `MacBeginFrameSource`
+(`gpui_macos/src/window.rs:485`) that owns scheduler observer registration,
+the scheduler observer callback, `DidFinishFrame` ack state, missed-frame replay
+continuity, and input-client-before-scheduler delivery (`:487`, `:601`, `:621`,
+`:3322`). `InputRateTracker` and `BeginFrameScheduler` now implement
+`BeginFrameObserver` (`gpui/src/window.rs:1220`, `:2285`), and source
+BeginFrames are routed through those observer methods (`:4083`, `:4189`). The
+remaining gap is that the public GPUI platform boundary is still named
+`on_request_frame`/`set_needs_begin_frame` rather than a true
+`AddObserver`/`RemoveObserver` list exposed through `PlatformWindow`.
 
 **Work items.**
-1. Introduce `trait BeginFrameObserver` with `on_begin_frame(&self, args)` and
+1. **Mostly done; shared observer-base continuity remains local to sources.**
+   Introduce `trait BeginFrameObserver` with `on_begin_frame(&self, args)` and
    `did_finish_frame(...)` matching `BeginFrameObserver` (`begin_frame_source.h:38`)
    and `BeginFrameObserverBase` (`:90`), including the continuity check from
    `CheckBeginFrameContinuity` (`begin_frame_source.cc:57`) implemented once in
-   the base.
-2. Introduce `trait BeginFrameSource` with `add_observer`/`remove_observer`/
+   the base. Current code: `platform.rs:655`, with macOS continuity state in
+   `MacBeginFrameSource` (`gpui_macos/src/window.rs:485`), and observer impls for
+   input and scheduler at `gpui/src/window.rs:1220`/`:2285`.
+2. **Done for the macOS scheduler observer.** Introduce `trait BeginFrameSource`
+   with `add_observer`/`remove_observer`/
    `did_finish_frame` mirroring `BeginFrameSource` (`begin_frame_source.h:137`,
-   `:228-229`, `:224`).
-3. Implement `DelayBasedBeginFrameSource` as a struct wrapping the existing
+   `:228-229`, `:224`). Current code: `platform.rs:665`; macOS implements it at
+   `gpui_macos/src/window.rs:621`.
+3. **Partially done.** Implement `DelayBasedBeginFrameSource` as a struct wrapping the existing
    macOS `DisplayLink` (`crates/gpui_macos/src/display_link.rs`), exposing
    `IssueBeginFrameToSchedulerClient` + `IssueBeginFrameToInputClient`
    ordering (`begin_frame_source.cc:238-245`). This replaces the direct
-   `step()` → callback call.
-4. Move `FrameSchedulerState` to register itself as the observer (analog of
+   `step()` → callback call. Current code routes `step()` through
+   `MacBeginFrameSource` state, input-client delivery, and scheduler observer
+   callback storage, but `step()` still enters through the local platform
+   callback shape (`gpui_macos/src/window.rs:3120`, `:3134`, `:3297`).
+4. **Partially done.** Move `FrameSchedulerState` to register itself as the observer (analog of
    `DisplayScheduler::BeginFrameObserver`, see Phase 2). `InputRateTracker`
    (`window.rs:1116`) becomes a second observer consuming
    `IssueBeginFrameToInputClient`, replacing the current single
-   `on_begin_frame_for_input` hook (`platform.rs:728`).
-5. `set_needs_begin_frame` (`platform.rs:729`) becomes
+   `on_begin_frame_for_input` hook (`platform.rs:747`). Current code has
+   `BeginFrameScheduler` as the scheduler observer adapter
+   (`gpui/src/window.rs:2285`) and `InputRateTracker` as the input observer
+   (`:1220`), but `PlatformWindow` still exposes callback registration rather
+   than an observer-list API.
+5. **Partially done.** `set_needs_begin_frame` (`platform.rs:748`) becomes
    `AddObserver`/`RemoveObserver` on the source
    (`begin_frame_source.h:228-229`), including the missed-frame replay on
    `AddObserver` (the "gets missed BeginFrameArgs for the given observer"
-   behavior documented at `begin_frame_source.h:490`).
+   behavior documented at `begin_frame_source.h:490`). Current macOS code maps
+   `set_needs_begin_frame` to `MacBeginFrameSource::add_observer`/
+   `remove_observer` (`gpui_macos/src/window.rs:1921`).
 
 **Acceptance.** A single `DelayBasedBeginFrameSource` instance feeds both the
 scheduler and the input tracker via the observer list; no production code path
@@ -192,12 +217,12 @@ calls the frame callback except through `IssueBeginFrameToSchedulerClient`/
   is the model for making deadline-mode selection an explicit transition
   rather than ad-hoc branches.
 
-**Zed current state.** `FrameSchedulerState` (`window.rs:1317`) holds the
+**Zed current state.** `FrameSchedulerState` (`window.rs:1331`) holds the
 state as a bag of `Rc<Cell<…>>` fields. The methods exist
-(`on_begin_frame_continuation:1897`, `schedule_begin_frame_deadline:2014`,
-`on_begin_frame_deadline:2121`, `attempt_draw_and_swap:2140`,
-`did_finish_frame:2164`) but the deadline-mode selection
-(`window.rs:1799-1853`) is a free function returning a mode, not a state
+(`on_begin_frame_continuation:1921`, `schedule_begin_frame_deadline:2039`,
+`on_begin_frame_deadline:2146`, `attempt_draw_and_swap:2165`,
+`did_finish_frame:2189`) but the deadline-mode selection
+(`window.rs:1813-1867`) is a free function returning a mode, not a state
 transition. `ShouldDraw` is implicit across several branches
 (`output_surface_lost:1333/1933/2045`, `platform_swap_backpressured`).
 
@@ -206,7 +231,7 @@ transition. `ShouldDraw` is implicit across several branches
    `display_scheduler.h:171-200` (`visible`, `output_surface_lost`,
    `inside_begin_frame_deadline_interval`, `needs_draw`, `pending_swaps`,
    `observing_begin_frame_source`, `last_targeted_latch_time`).
-2. Promote `BeginFrameDeadlineMode` selection (`window.rs:1799-1853`) into a
+2. Promote `BeginFrameDeadlineMode` selection (`window.rs:1813-1867`) into a
    `DesiredBeginFrameDeadlineMode` (`display_scheduler.h:145`) +
    `AdjustedBeginFrameDeadlineMode` (`:144`) pair. Keep Zed's local `Blocked`
    and `WaitForScroll` modes but document them as single-process additions
@@ -215,7 +240,7 @@ transition. `ShouldDraw` is implicit across several branches
 3. Implement `ShouldDraw` as one method matching `display_scheduler.cc:569`.
 4. Implement `SetVisible`/`OutputSurfaceLost`/`ForceImmediateSwapIfPossible`
    as explicit state transitions with the `display_scheduler.cc:215`/
-   `:195`/`:155` semantics. The existing `on_output_surface_lost:2132` and
+   `:195`/`:155` semantics. The existing `on_output_surface_lost:2157` and
    resize force path become calls into these.
 5. Encode the legal mode transitions in a table or match (style of
    `cc/scheduler/scheduler_state_machine.cc`) rather than scattered branches,
@@ -254,10 +279,10 @@ to pass, and new tests assert the transition table is exhaustive.
 
 **Zed current state.** `BeginFrameArgs` (`platform.rs:638`) has `frame_time`,
 `deadline`, `interval`, `missed` — but **no `PossibleDeadlines`**. Deadline
-selection is the `BeginFrameDeadlineMode` function (`window.rs:1799-1853`),
+selection is the `BeginFrameDeadlineMode` function (`window.rs:1813-1867`),
 which produces one deadline, not a selected-from-many decision. The "future
 latch advancement" for presentation groups
-(`window.rs:1253 presentation_group_timing_for_request`) is a hand-rolled
+(`window.rs:1267 presentation_group_timing_for_request`) is a hand-rolled
 approximation of `SelectDeadline`.
 
 **Work items.**
@@ -273,7 +298,7 @@ approximation of `SelectDeadline`.
 3. Port `FrameDeadlineDecider` (`frame_deadline_decider.h/.cc`) as a Rust
    struct. `SelectDeadline` (`:25`) becomes the method that replaces today's
    `presentation_group_timing_for_request` future-latch advancement
-   (`window.rs:1253`). Keep the in-sequence stickiness
+   (`window.rs:1267`). Keep the in-sequence stickiness
    (`FindClosestDeadlineByPresentation:143`) and the `OnGoIdle` reset
    (`:115`).
 4. Port the **input-aware perceptible-latency cap**
@@ -312,25 +337,25 @@ timestamp. The decider's source maps 1:1 to `frame_deadline_decider.cc`.
   `OnPresentationFeedback` consumes the matched feedback.
 
 **Zed current state.** `pending_presentation_groups`
-(`window.rs:1336`) is a `VecDeque` drained FIFO by
-`take_pending_presentation_group` (`window.rs:1539`). The feedback-lifecycle
+(`window.rs:1350`) is a `VecDeque` drained FIFO by
+`take_pending_presentation_group` (`window.rs:1553`). The feedback-lifecycle
 audit proved this drains correctly, but identified one soft mis-attribution:
 when a newer frame fails (feedback from the Metal completion thread) before an
 older frame completes, the older group's metadata is popped for the newer
-frame's feedback. Today's `PresentationFeedback` (`platform.rs:656`) carries
+frame's feedback. Today's `PresentationFeedback` (`platform.rs:675`) carries
 no id.
 
 **Work items.**
 1. Add a monotonically increasing `swap_id` to `SwapCompletionFeedback` and
-   `PresentationFeedback` (`platform.rs:669/656`), analog of `display.h`
+   `PresentationFeedback` (`platform.rs:688/675`), analog of `display.h`
    `swap_n`. The macOS presenter already has `next_submission_order`
    (`metal_renderer.rs`); reuse it as the swap id stamped onto both the
    `PresentedIosurfaceFrame` and its emitted feedback.
-2. Change `record_pending_presentation_group` (`window.rs:1526`) to key the
-   group by swap id, and change `on_presentation_feedback` (`window.rs:1502`)
+2. Change `record_pending_presentation_group` (`window.rs:1540`) to key the
+   group by swap id, and change `on_presentation_feedback` (`window.rs:1516`)
    to match by id (like `display.h` swap_n matching) instead of FIFO pop.
 3. Keep the FIFO drain as a fallback only for platforms that do not stamp a
-   swap id (`supports_swap_completion_feedback` false, `platform.rs:735`).
+   swap id (`supports_swap_completion_feedback` false, `platform.rs:754`).
 4. Audit every submitted-but-not-presented path (Failed, Skipped,
    Deferred-then-later) still drains, reusing the verification from the prior
    audit but now keyed by id.
@@ -352,7 +377,7 @@ holds.
   cap with the per-deadline cap (`MaxPendingSwapsForDeadline`, `:474`,
   ported in Phase 3) and the allocated-buffer fallback.
 
-**Zed current state.** `max_pending_swaps` (`platform.rs:738`) returns the
+**Zed current state.** `max_pending_swaps` (`platform.rs:757`) returns the
 static `IOSURFACE_MAX_PENDING_SWAPS`. The scheduler reads it once into
 `max_pending_platform_swaps` (`window.rs:1080`). No refresh-rate dependence.
 
@@ -361,11 +386,11 @@ static `IOSURFACE_MAX_PENDING_SWAPS`. The scheduler reads it once into
    presenter config, mirroring `PendingSwapParams` (`display_scheduler.h:38-52`).
 2. Port `MaxPendingSwapsForRefreshRate` (`display_scheduler.cc:455`) keyed off
    `current_begin_frame_args_.interval`. Expose it through
-   `max_pending_swaps` (`platform.rs:738`) returning the current value rather
+   `max_pending_swaps` (`platform.rs:757`) returning the current value rather
    than a static constant.
 3. The scheduler re-reads the cap when the BeginFrame interval changes (new
    display, ProMotion throttle), not just at window creation
-   (`window.rs:4318`).
+   (`window.rs:4405`).
 
 **Acceptance.** On a 120 Hz display, the pending-swap cap is the 120 Hz tier,
 not the 60 Hz default. Verified with a unit test feeding a 8.5 ms interval.
@@ -429,7 +454,7 @@ this plan before Phase 6 begins.
 (`metal_renderer.rs` `update_buffer_damage`/`buffer_damage`/`clear_buffer_damage`,
 already matching `BufferQueue`). But damage *propagation* (which invalidations
 affect which buffers, interaction damage, resize-expected damage) is spread
-across `scene.rs:67` (`add_damage`), `window.rs:4384` (`mark_view_dirty`), and
+across `scene.rs:67` (`add_damage`), `window.rs:4471` (`mark_view_dirty`), and
 conservative full-frame fallbacks for global refresh and unbounded
 invalidations (`research.md` "Open questions" flags this). There is no
 analog of `HasDamageDueToInteraction` or
@@ -439,7 +464,7 @@ deadline needs.
 **Work items.**
 1. Introduce a single-process `DisplayDamageTracker` analog. Zed has no
    `SurfaceId`/surface tree (Half A), so the "surface" granularity is the GPUI
-   **view** (`window.rs:4384 mark_view_dirty` already keys by `EntityId`).
+   **view** (`window.rs:4471 mark_view_dirty` already keys by `EntityId`).
    The tracker owns: pending-damage-per-view, `root_frame_missing`,
    `expecting_root_surface_damage_because_of_resize`, `has_surface_damage_due_to_interaction`,
    and `earliest_input_timestamp` — direct mirrors of

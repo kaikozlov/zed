@@ -481,6 +481,169 @@ struct TrafficLightButtons {
     zoom: Retained<Objc2NSButton>,
 }
 
+#[derive(Default)]
+struct MacBeginFrameSource {
+    scheduler_observer_registered: bool,
+    scheduler_observer_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
+    last_display_link_timing: Option<DisplayLinkTiming>,
+    last_used_begin_frame: Option<BeginFrameArgs>,
+    last_begin_frame_ack: Option<BeginFrameAck>,
+    input_client_callback: Option<Box<dyn FnMut(BeginFrameArgs)>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MacBeginFrameObserverId {
+    Scheduler,
+}
+
+impl MacBeginFrameSource {
+    fn set_scheduler_observer_registered(&mut self, registered: bool) -> bool {
+        if self.scheduler_observer_registered == registered {
+            return false;
+        }
+        if registered {
+            <Self as gpui::BeginFrameSource>::add_observer(
+                self,
+                MacBeginFrameObserverId::Scheduler,
+            );
+        } else {
+            <Self as gpui::BeginFrameSource>::remove_observer(
+                self,
+                MacBeginFrameObserverId::Scheduler,
+            );
+        }
+        true
+    }
+
+    fn has_scheduler_observer(&self) -> bool {
+        self.scheduler_observer_registered
+    }
+
+    fn set_scheduler_observer_callback(&mut self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
+        self.scheduler_observer_callback = Some(callback);
+    }
+
+    fn has_scheduler_observer_callback(&self) -> bool {
+        self.scheduler_observer_callback.is_some()
+    }
+
+    fn take_scheduler_observer_callback(&mut self) -> Option<Box<dyn FnMut(RequestFrameOptions)>> {
+        self.scheduler_observer_callback.take()
+    }
+
+    fn restore_scheduler_observer_callback(
+        &mut self,
+        callback: Box<dyn FnMut(RequestFrameOptions)>,
+    ) {
+        self.scheduler_observer_callback = Some(callback);
+    }
+
+    fn set_input_client(&mut self, callback: Box<dyn FnMut(BeginFrameArgs)>) {
+        self.input_client_callback = Some(callback);
+    }
+
+    fn record_completed_frame(&mut self, ack: Option<BeginFrameAck>) {
+        let Some(ack) = ack else {
+            return;
+        };
+
+        self.last_begin_frame_ack = Some(ack);
+        if self
+            .last_display_link_timing
+            .is_some_and(|timing| timing.begin_frame.id == ack.frame_id)
+        {
+            self.last_display_link_timing = None;
+        }
+    }
+
+    fn record_used_begin_frame(&mut self, begin_frame: Option<BeginFrameArgs>) {
+        if let Some(begin_frame) = begin_frame {
+            self.last_used_begin_frame = Some(begin_frame);
+        }
+    }
+
+    fn record_display_link_timing(&mut self, timing: DisplayLinkTiming) {
+        self.last_display_link_timing = Some(timing);
+    }
+
+    fn last_display_link_timing(&self) -> Option<DisplayLinkTiming> {
+        self.last_display_link_timing
+    }
+
+    fn last_sequence_number(&self) -> u64 {
+        self.last_display_link_timing
+            .map(|timing| timing.begin_frame.id.sequence_number)
+            .unwrap_or_default()
+    }
+
+    fn missed_timing(&self, timing: DisplayLinkTiming) -> Option<DisplayLinkTiming> {
+        missed_display_link_timing_if_observing(
+            self.scheduler_observer_registered,
+            timing,
+            self.last_used_begin_frame,
+            self.last_begin_frame_ack,
+        )
+    }
+
+    fn should_issue_to_scheduler_observer(
+        &self,
+        kind: FrameRequestDeliveryKind,
+        options: RequestFrameOptions,
+    ) -> bool {
+        should_deliver_frame_request(
+            kind,
+            options,
+            self.last_used_begin_frame,
+            self.last_begin_frame_ack,
+        )
+    }
+
+    fn take_input_client_for_begin_frame(
+        &mut self,
+        kind: FrameRequestDeliveryKind,
+        options: RequestFrameOptions,
+    ) -> Option<(Box<dyn FnMut(BeginFrameArgs)>, BeginFrameArgs)> {
+        if kind != FrameRequestDeliveryKind::SourceBeginFrame {
+            return None;
+        }
+
+        let begin_frame = options.begin_frame?;
+        self.input_client_callback
+            .take()
+            .map(|callback| (callback, begin_frame))
+    }
+
+    fn restore_input_client(&mut self, callback: Box<dyn FnMut(BeginFrameArgs)>) {
+        self.input_client_callback = Some(callback);
+    }
+}
+
+impl gpui::BeginFrameSource for MacBeginFrameSource {
+    type ObserverId = MacBeginFrameObserverId;
+
+    fn add_observer(&mut self, observer_id: Self::ObserverId) {
+        match observer_id {
+            MacBeginFrameObserverId::Scheduler => {
+                self.scheduler_observer_registered = true;
+            }
+        }
+    }
+
+    fn remove_observer(&mut self, observer_id: Self::ObserverId) {
+        match observer_id {
+            MacBeginFrameObserverId::Scheduler => {
+                self.scheduler_observer_registered = false;
+            }
+        }
+    }
+
+    fn did_finish_frame(&mut self, observer_id: Self::ObserverId, ack: Option<BeginFrameAck>) {
+        match observer_id {
+            MacBeginFrameObserverId::Scheduler => self.record_completed_frame(ack),
+        }
+    }
+}
+
 struct MacWindowState {
     handle: AnyWindowHandle,
     foreground_executor: ForegroundExecutor,
@@ -493,13 +656,8 @@ struct MacWindowState {
     cursor_visible: Arc<AtomicBool>,
     display_link: Option<DisplayLink>,
     display_link_running: bool,
-    needs_begin_frame: bool,
-    last_display_link_timing: Option<DisplayLinkTiming>,
-    last_used_begin_frame: Option<BeginFrameArgs>,
-    last_begin_frame_ack: Option<BeginFrameAck>,
+    begin_frame_source: MacBeginFrameSource,
     renderer: renderer::Renderer,
-    request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
-    begin_frame_input_callback: Option<Box<dyn FnMut(BeginFrameArgs)>>,
     swap_completion_callback: Option<Box<dyn FnMut(SwapCompletionFeedback)>>,
     presentation_feedback_callback: Option<Box<dyn FnMut(PresentationFeedback)>>,
     event_callback: Option<Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>>,
@@ -562,23 +720,15 @@ enum FrameRequestDeliveryKind {
 
 impl MacWindowState {
     fn record_completed_begin_frame_ack(&mut self, ack: Option<BeginFrameAck>) {
-        let Some(ack) = ack else {
-            return;
-        };
-
-        self.last_begin_frame_ack = Some(ack);
-        if self
-            .last_display_link_timing
-            .is_some_and(|timing| timing.begin_frame.id == ack.frame_id)
-        {
-            self.last_display_link_timing = None;
-        }
+        <MacBeginFrameSource as gpui::BeginFrameSource>::did_finish_frame(
+            &mut self.begin_frame_source,
+            MacBeginFrameObserverId::Scheduler,
+            ack,
+        );
     }
 
     fn record_used_begin_frame(&mut self, begin_frame: Option<BeginFrameArgs>) {
-        if let Some(begin_frame) = begin_frame {
-            self.last_used_begin_frame = Some(begin_frame);
-        }
+        self.begin_frame_source.record_used_begin_frame(begin_frame);
     }
 
     fn move_traffic_light(&mut self) {
@@ -700,7 +850,7 @@ impl MacWindowState {
     }
 
     fn update_display_link_subscription(&mut self) {
-        if self.needs_begin_frame {
+        if self.begin_frame_source.has_scheduler_observer() {
             self.start_display_link();
         } else {
             self.stop_display_link();
@@ -744,10 +894,7 @@ impl MacWindowState {
             return;
         }
 
-        let initial_sequence_number = self
-            .last_display_link_timing
-            .map(|timing| timing.begin_frame.id.sequence_number)
-            .unwrap_or_default();
+        let initial_sequence_number = self.begin_frame_source.last_sequence_number();
         if let Some(mut display_link) = DisplayLink::new(
             display_id,
             self.native_view.as_ptr() as *mut c_void,
@@ -767,7 +914,7 @@ impl MacWindowState {
         if let Some(display_link) = &self.display_link
             && let Some(timing) = display_link.latest_timing()
         {
-            self.last_display_link_timing = Some(timing);
+            self.begin_frame_source.record_display_link_timing(timing);
         }
         if self.display_link_running {
             if let Some(display_link) = &mut self.display_link {
@@ -990,10 +1137,7 @@ impl MacWindow {
                 cursor_visible,
                 display_link: None,
                 display_link_running: false,
-                needs_begin_frame: false,
-                last_display_link_timing: None,
-                last_used_begin_frame: None,
-                last_begin_frame_ack: None,
+                begin_frame_source: MacBeginFrameSource::default(),
                 renderer: renderer::new_renderer(
                     renderer_context,
                     native_window as *mut _,
@@ -1001,8 +1145,6 @@ impl MacWindow {
                     bounds.size.map(|pixels| pixels.as_f32()),
                     false,
                 ),
-                request_frame_callback: None,
-                begin_frame_input_callback: None,
                 swap_completion_callback: None,
                 presentation_feedback_callback: None,
                 event_callback: None,
@@ -1761,7 +1903,8 @@ impl PlatformWindow for MacWindow {
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
         let window_state = Arc::downgrade(&self.0);
         let mut lock = self.0.as_ref().lock();
-        lock.request_frame_callback = Some(callback);
+        lock.begin_frame_source
+            .set_scheduler_observer_callback(callback);
         lock.renderer
             .set_deferred_frame_callback(Some(Arc::new(move || {
                 let context = Box::into_raw(Box::new(window_state.clone())) as *mut c_void;
@@ -1772,16 +1915,18 @@ impl PlatformWindow for MacWindow {
     }
 
     fn on_begin_frame_for_input(&self, callback: Box<dyn FnMut(BeginFrameArgs)>) {
-        self.0.lock().begin_frame_input_callback = Some(callback);
+        self.0.lock().begin_frame_source.set_input_client(callback);
     }
 
     fn set_needs_begin_frame(&self, needs_begin_frame: bool) {
         let window_state = Arc::downgrade(&self.0);
         let mut lock = self.0.as_ref().lock();
-        if lock.needs_begin_frame == needs_begin_frame {
+        if !lock
+            .begin_frame_source
+            .set_scheduler_observer_registered(needs_begin_frame)
+        {
             return;
         }
-        lock.needs_begin_frame = needs_begin_frame;
         lock.update_display_link_subscription();
         drop(lock);
 
@@ -2754,14 +2899,15 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
         let mut lock = window_state.lock();
 
         if lock.activated_least_once {
-            if let Some(mut callback) = lock.request_frame_callback.take() {
+            if let Some(mut callback) = lock.begin_frame_source.take_scheduler_observer_callback() {
                 lock.renderer.set_presents_with_transaction(true);
                 lock.stop_display_link();
                 drop(lock);
                 callback(Default::default());
 
                 let mut lock = window_state.lock();
-                lock.request_frame_callback = Some(callback);
+                lock.begin_frame_source
+                    .restore_scheduler_observer_callback(callback);
                 lock.renderer.set_presents_with_transaction(false);
                 lock.update_display_link_subscription();
             }
@@ -2963,23 +3109,19 @@ extern "C" fn step(view: *mut c_void) {
         .and_then(DisplayLink::latest_timing);
     let mut committed_ready_iosurface_frame = false;
     if let Some(display_link_timing) = display_link_timing {
-        lock.last_display_link_timing = Some(display_link_timing);
+        lock.begin_frame_source
+            .record_display_link_timing(display_link_timing);
         committed_ready_iosurface_frame = lock.renderer.set_display_timing(
             display_link_timing.predicted_display_time,
             display_link_timing.frame_interval,
         );
     }
 
-    if committed_ready_iosurface_frame && lock.request_frame_callback.is_some() {
+    if committed_ready_iosurface_frame && lock.begin_frame_source.has_scheduler_observer_callback()
+    {
         drop(lock);
-        let mut request_frame_options = RequestFrameOptions::default();
-        if let Some(display_link_timing) = display_link_timing {
-            request_frame_options.begin_frame = Some(display_link_timing.begin_frame);
-            request_frame_options.predicted_display_time =
-                Some(display_link_timing.predicted_display_time);
-            request_frame_options.frame_interval = display_link_timing.frame_interval;
-            request_frame_options.frame_deadline = Some(display_link_timing.frame_deadline);
-        }
+        let request_frame_options =
+            request_frame_options_for_display_link_timing(display_link_timing);
         dispatch_frame_request(
             Arc::downgrade(&window_state),
             request_frame_options,
@@ -2989,16 +3131,10 @@ extern "C" fn step(view: *mut c_void) {
         return;
     }
 
-    if lock.request_frame_callback.is_some() {
+    if lock.begin_frame_source.has_scheduler_observer_callback() {
         drop(lock);
-        let mut request_frame_options = RequestFrameOptions::default();
-        if let Some(display_link_timing) = display_link_timing {
-            request_frame_options.begin_frame = Some(display_link_timing.begin_frame);
-            request_frame_options.predicted_display_time =
-                Some(display_link_timing.predicted_display_time);
-            request_frame_options.frame_interval = display_link_timing.frame_interval;
-            request_frame_options.frame_deadline = Some(display_link_timing.frame_deadline);
-        }
+        let request_frame_options =
+            request_frame_options_for_display_link_timing(display_link_timing);
         request_frame(
             Arc::downgrade(&window_state),
             request_frame_options,
@@ -3026,6 +3162,20 @@ extern "C" fn request_frame_async(context: *mut c_void) {
         delivery.apply_display_timing,
         delivery.kind,
     );
+}
+
+fn request_frame_options_for_display_link_timing(
+    display_link_timing: Option<DisplayLinkTiming>,
+) -> RequestFrameOptions {
+    let mut request_frame_options = RequestFrameOptions::default();
+    if let Some(display_link_timing) = display_link_timing {
+        request_frame_options.begin_frame = Some(display_link_timing.begin_frame);
+        request_frame_options.predicted_display_time =
+            Some(display_link_timing.predicted_display_time);
+        request_frame_options.frame_interval = display_link_timing.frame_interval;
+        request_frame_options.frame_deadline = Some(display_link_timing.frame_deadline);
+    }
+    request_frame_options
 }
 
 fn missed_display_link_timing(last_timing: DisplayLinkTiming) -> Option<DisplayLinkTiming> {
@@ -3110,21 +3260,6 @@ fn should_deliver_frame_request(
     }
 }
 
-fn take_begin_frame_input_callback(
-    lock: &mut MacWindowState,
-    kind: FrameRequestDeliveryKind,
-    options: RequestFrameOptions,
-) -> Option<(Box<dyn FnMut(BeginFrameArgs)>, BeginFrameArgs)> {
-    if kind != FrameRequestDeliveryKind::SourceBeginFrame {
-        return None;
-    }
-
-    let begin_frame = options.begin_frame?;
-    lock.begin_frame_input_callback
-        .take()
-        .map(|callback| (callback, begin_frame))
-}
-
 #[cfg(test)]
 fn record_completed_begin_frame_ack(
     last_ack: &mut Option<BeginFrameAck>,
@@ -3175,22 +3310,21 @@ fn request_frame(
         FrameRequestDeliveryKind::SourceBeginFrame
             | FrameRequestDeliveryKind::SourceBeginFrameAfterInput
     );
-    if !should_deliver_frame_request(
-        kind,
-        options,
-        lock.last_used_begin_frame,
-        lock.last_begin_frame_ack,
-    ) {
+    if !lock
+        .begin_frame_source
+        .should_issue_to_scheduler_observer(kind, options)
+    {
         return;
     }
 
-    if let Some((mut input_callback, begin_frame)) =
-        take_begin_frame_input_callback(&mut lock, kind, options)
+    if let Some((mut input_callback, begin_frame)) = lock
+        .begin_frame_source
+        .take_input_client_for_begin_frame(kind, options)
     {
         drop(lock);
         input_callback(begin_frame);
         lock = window_state.lock();
-        lock.begin_frame_input_callback = Some(input_callback);
+        lock.begin_frame_source.restore_input_client(input_callback);
     }
 
     if apply_display_timing
@@ -3198,7 +3332,7 @@ fn request_frame(
         && lock
             .renderer
             .set_display_timing(predicted_display_time, options.frame_interval)
-        && lock.request_frame_callback.is_some()
+        && lock.begin_frame_source.has_scheduler_observer_callback()
     {
         drop(lock);
         let kind = if kind == FrameRequestDeliveryKind::SourceBeginFrame {
@@ -3209,7 +3343,7 @@ fn request_frame(
         dispatch_frame_request(Arc::downgrade(&window_state), options, false, kind);
         return;
     }
-    let Some(mut callback) = lock.request_frame_callback.take() else {
+    let Some(mut callback) = lock.begin_frame_source.take_scheduler_observer_callback() else {
         return;
     };
     lock.record_used_begin_frame(options.begin_frame);
@@ -3217,7 +3351,10 @@ fn request_frame(
 
     callback(options);
 
-    window_state.lock().request_frame_callback = Some(callback);
+    window_state
+        .lock()
+        .begin_frame_source
+        .restore_scheduler_observer_callback(callback);
 }
 
 fn request_begin_frame(window_state: Weak<Mutex<MacWindowState>>) {
@@ -3233,14 +3370,12 @@ fn request_begin_frame(window_state: Weak<Mutex<MacWindowState>>) {
     else {
         return;
     };
-    lock.last_display_link_timing = Some(display_link_timing);
+    lock.begin_frame_source
+        .record_display_link_timing(display_link_timing);
     drop(lock);
 
-    let mut request_frame_options = RequestFrameOptions::default();
-    request_frame_options.begin_frame = Some(display_link_timing.begin_frame);
-    request_frame_options.predicted_display_time = Some(display_link_timing.predicted_display_time);
-    request_frame_options.frame_interval = display_link_timing.frame_interval;
-    request_frame_options.frame_deadline = Some(display_link_timing.frame_deadline);
+    let request_frame_options =
+        request_frame_options_for_display_link_timing(Some(display_link_timing));
     request_frame(
         Arc::downgrade(&window_state),
         request_frame_options,
@@ -3259,24 +3394,15 @@ fn request_missed_frame(window_state: Weak<Mutex<MacWindowState>>) {
         .display_link
         .as_ref()
         .and_then(DisplayLink::latest_timing)
-        .or(lock.last_display_link_timing)
-        .and_then(|timing| {
-            missed_display_link_timing_if_observing(
-                lock.needs_begin_frame,
-                timing,
-                lock.last_used_begin_frame,
-                lock.last_begin_frame_ack,
-            )
-        });
+        .or(lock.begin_frame_source.last_display_link_timing())
+        .and_then(|timing| lock.begin_frame_source.missed_timing(timing));
     let Some(display_link_timing) = display_link_timing else {
         return;
     };
-    lock.last_display_link_timing = Some(display_link_timing);
-    let mut request_frame_options = RequestFrameOptions::default();
-    request_frame_options.begin_frame = Some(display_link_timing.begin_frame);
-    request_frame_options.predicted_display_time = Some(display_link_timing.predicted_display_time);
-    request_frame_options.frame_interval = display_link_timing.frame_interval;
-    request_frame_options.frame_deadline = Some(display_link_timing.frame_deadline);
+    lock.begin_frame_source
+        .record_display_link_timing(display_link_timing);
+    let request_frame_options =
+        request_frame_options_for_display_link_timing(Some(display_link_timing));
     drop(lock);
 
     request_frame(
@@ -3907,6 +4033,124 @@ mod tests {
 
         assert!(missed_display_link_timing_if_observing(false, last_timing, None, None).is_none());
         assert!(missed_display_link_timing_if_observing(true, last_timing, None, None).is_some());
+    }
+
+    #[test]
+    fn begin_frame_source_observer_registration_controls_missed_replay() {
+        let frame_time = scheduler::Instant::now();
+        let predicted_display_time = frame_time + Duration::from_millis(16);
+        let timing = DisplayLinkTiming {
+            begin_frame: gpui::BeginFrameArgs {
+                id: gpui::BeginFrameId {
+                    source_id: 7,
+                    sequence_number: 42,
+                },
+                frame_time,
+                deadline: predicted_display_time,
+                interval: Duration::from_millis(16),
+                missed: false,
+            },
+            predicted_display_time,
+            frame_interval: Some(Duration::from_millis(16)),
+            frame_deadline: predicted_display_time,
+        };
+        let mut source = MacBeginFrameSource::default();
+
+        source.record_display_link_timing(timing);
+        assert!(source.missed_timing(timing).is_none());
+
+        gpui::BeginFrameSource::add_observer(&mut source, MacBeginFrameObserverId::Scheduler);
+        let missed_timing = source.missed_timing(timing).unwrap();
+        assert!(missed_timing.begin_frame.missed);
+        assert_eq!(missed_timing.begin_frame.id, timing.begin_frame.id);
+
+        gpui::BeginFrameSource::remove_observer(&mut source, MacBeginFrameObserverId::Scheduler);
+        assert!(source.missed_timing(timing).is_none());
+    }
+
+    #[test]
+    fn begin_frame_source_did_finish_frame_suppresses_same_frame_replay() {
+        let frame_time = scheduler::Instant::now();
+        let predicted_display_time = frame_time + Duration::from_millis(16);
+        let timing = DisplayLinkTiming {
+            begin_frame: gpui::BeginFrameArgs {
+                id: gpui::BeginFrameId {
+                    source_id: 7,
+                    sequence_number: 42,
+                },
+                frame_time,
+                deadline: predicted_display_time,
+                interval: Duration::from_millis(16),
+                missed: false,
+            },
+            predicted_display_time,
+            frame_interval: Some(Duration::from_millis(16)),
+            frame_deadline: predicted_display_time,
+        };
+        let mut source = MacBeginFrameSource::default();
+        gpui::BeginFrameSource::add_observer(&mut source, MacBeginFrameObserverId::Scheduler);
+        source.record_display_link_timing(timing);
+
+        gpui::BeginFrameSource::did_finish_frame(
+            &mut source,
+            MacBeginFrameObserverId::Scheduler,
+            Some(gpui::BeginFrameAck {
+                frame_id: timing.begin_frame.id,
+                frame_time: timing.begin_frame.frame_time,
+                has_damage: true,
+            }),
+        );
+
+        assert!(source.last_display_link_timing().is_none());
+        assert!(source.missed_timing(timing).is_none());
+    }
+
+    #[test]
+    fn begin_frame_source_issues_input_client_before_scheduler_observer_consumes_frame() {
+        let frame_time = scheduler::Instant::now();
+        let predicted_display_time = frame_time + Duration::from_millis(16);
+        let begin_frame = gpui::BeginFrameArgs {
+            id: gpui::BeginFrameId {
+                source_id: 7,
+                sequence_number: 42,
+            },
+            frame_time,
+            deadline: predicted_display_time,
+            interval: Duration::from_millis(16),
+            missed: false,
+        };
+        let options = RequestFrameOptions {
+            begin_frame: Some(begin_frame),
+            predicted_display_time: Some(predicted_display_time),
+            frame_interval: Some(Duration::from_millis(16)),
+            frame_deadline: Some(predicted_display_time),
+            ..Default::default()
+        };
+        let observed_begin_frame = Rc::new(Cell::new(None));
+        let mut source = MacBeginFrameSource::default();
+        source.set_input_client(Box::new({
+            let observed_begin_frame = observed_begin_frame.clone();
+            move |begin_frame| observed_begin_frame.set(Some(begin_frame))
+        }));
+
+        let Some((mut input_client, input_begin_frame)) = source
+            .take_input_client_for_begin_frame(FrameRequestDeliveryKind::SourceBeginFrame, options)
+        else {
+            panic!("source BeginFrame should issue to input client");
+        };
+        input_client(input_begin_frame);
+        source.restore_input_client(input_client);
+        assert_eq!(observed_begin_frame.get(), Some(begin_frame));
+
+        assert!(source.should_issue_to_scheduler_observer(
+            FrameRequestDeliveryKind::SourceBeginFrame,
+            options,
+        ));
+        source.record_used_begin_frame(options.begin_frame);
+        assert!(!source.should_issue_to_scheduler_observer(
+            FrameRequestDeliveryKind::SourceBeginFrameAfterInput,
+            options,
+        ));
     }
 
     #[test]

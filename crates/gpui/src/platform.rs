@@ -651,6 +651,25 @@ pub struct BeginFrameAck {
     pub has_damage: bool,
 }
 
+#[expect(missing_docs)]
+pub trait BeginFrameObserver {
+    fn on_begin_frame(&mut self, args: BeginFrameArgs) -> bool;
+    fn last_used_begin_frame(&self) -> Option<BeginFrameArgs>;
+    fn on_begin_frame_source_paused_changed(&mut self, _paused: bool) {}
+    fn wants_animate_only_begin_frames(&self) -> bool {
+        false
+    }
+}
+
+#[expect(missing_docs)]
+pub trait BeginFrameSource {
+    type ObserverId: Copy + Eq;
+
+    fn add_observer(&mut self, observer_id: Self::ObserverId);
+    fn remove_observer(&mut self, observer_id: Self::ObserverId);
+    fn did_finish_frame(&mut self, observer_id: Self::ObserverId, ack: Option<BeginFrameAck>);
+}
+
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 #[expect(missing_docs)]
 pub struct PresentationFeedback {

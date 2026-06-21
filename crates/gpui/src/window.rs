@@ -1117,6 +1117,7 @@ pub(crate) struct InputRateTracker {
     timestamps: Vec<Instant>,
     window: Duration,
     inputs_per_second: u32,
+    last_used_begin_frame: Option<crate::BeginFrameArgs>,
     sustain_until: Instant,
     sustain_duration: Duration,
     last_scroll_input_at: Option<Instant>,
@@ -1134,6 +1135,7 @@ impl Default for InputRateTracker {
             timestamps: Vec::new(),
             window: Duration::from_millis(100),
             inputs_per_second: 60,
+            last_used_begin_frame: None,
             sustain_until: Instant::now(),
             sustain_duration: Duration::from_secs(1),
             last_scroll_input_at: None,
@@ -1189,6 +1191,7 @@ impl InputRateTracker {
 
     pub fn observe_begin_frame_for_input(&mut self, begin_frame: crate::BeginFrameArgs) {
         self.set_frame_interval(begin_frame.interval);
+        self.last_used_begin_frame = Some(begin_frame);
     }
 
     pub fn record_scroll_input(&mut self) {
@@ -1211,6 +1214,17 @@ impl InputRateTracker {
     fn prune_old_timestamps(&mut self, now: Instant) {
         self.timestamps
             .retain(|&t| now.duration_since(t) <= self.window);
+    }
+}
+
+impl crate::BeginFrameObserver for InputRateTracker {
+    fn on_begin_frame(&mut self, args: crate::BeginFrameArgs) -> bool {
+        self.observe_begin_frame_for_input(args);
+        true
+    }
+
+    fn last_used_begin_frame(&self) -> Option<crate::BeginFrameArgs> {
+        self.last_used_begin_frame
     }
 }
 
@@ -1894,15 +1908,25 @@ struct BeginFrameScheduler {
 }
 
 impl BeginFrameScheduler {
+    fn on_frame_request(&mut self, request_frame_options: crate::RequestFrameOptions) -> bool {
+        if request_frame_options.source_begin_frame
+            && let Some(begin_frame) = request_frame_options.begin_frame
+        {
+            return <Self as crate::BeginFrameObserver>::on_begin_frame(self, begin_frame);
+        }
+
+        self.on_begin_frame_continuation(request_frame_options)
+    }
+
     fn on_begin_frame_continuation(
         &mut self,
         mut request_frame_options: crate::RequestFrameOptions,
-    ) {
+    ) -> bool {
         if let Some(begin_frame) = request_frame_options.begin_frame {
             match self.frame_scheduler.begin_frame_continuation(begin_frame) {
                 BeginFrameContinuation::Older => {
                     self.complete_frame(None);
-                    return;
+                    return false;
                 }
                 BeginFrameContinuation::Current => {}
                 BeginFrameContinuation::New {
@@ -1913,7 +1937,7 @@ impl BeginFrameScheduler {
                             self.deadline_request_for_options(request_frame_options),
                         );
                         self.complete_frame(None);
-                        return;
+                        return true;
                     }
                     if let Some(scheduled_request) = pending_deadline_request {
                         self.on_begin_frame_deadline(
@@ -1972,7 +1996,7 @@ impl BeginFrameScheduler {
                 && frame_time.saturating_duration_since(last_frame) < min_interval
             {
                 self.did_finish_frame(request_frame_options, FrameProductionResult::Idle);
-                return;
+                return true;
             }
         }
         if !self.frame_scheduler.has_presentation_feedback.get() {
@@ -1993,6 +2017,7 @@ impl BeginFrameScheduler {
         let needs_present = self.needs_present_for_options(request_frame_options);
 
         self.schedule_begin_frame_deadline(request_frame_options, needs_present, now);
+        true
     }
 
     fn deadline_request_for_options(
@@ -2257,6 +2282,16 @@ impl BeginFrameScheduler {
     }
 }
 
+impl crate::BeginFrameObserver for BeginFrameScheduler {
+    fn on_begin_frame(&mut self, args: crate::BeginFrameArgs) -> bool {
+        self.on_begin_frame_continuation(request_frame_options_for_begin_frame(args))
+    }
+
+    fn last_used_begin_frame(&self) -> Option<crate::BeginFrameArgs> {
+        self.frame_scheduler.current_begin_frame_args.get()
+    }
+}
+
 fn request_frame_options_for_scheduler_replay(
     request: BeginFrameDeadlineRequest,
 ) -> crate::RequestFrameOptions {
@@ -2264,6 +2299,19 @@ fn request_frame_options_for_scheduler_replay(
     request_frame_options.source_begin_frame = false;
     request_frame_options.require_presentation |= request.needs_present;
     request_frame_options
+}
+
+fn request_frame_options_for_begin_frame(
+    begin_frame: crate::BeginFrameArgs,
+) -> crate::RequestFrameOptions {
+    crate::RequestFrameOptions {
+        begin_frame: Some(begin_frame),
+        source_begin_frame: true,
+        predicted_display_time: Some(begin_frame.deadline),
+        frame_interval: Some(begin_frame.interval),
+        frame_deadline: Some(begin_frame.deadline),
+        ..Default::default()
+    }
 }
 
 fn request_frame_options_for_gpu_available_replay(
@@ -2394,6 +2442,30 @@ mod tests {
         ));
 
         assert!(!replay_options.require_presentation);
+    }
+
+    #[test]
+    fn source_begin_frame_options_are_constructed_from_begin_frame_args() {
+        let begin_frame = begin_frame_args(1);
+
+        let request_frame_options = request_frame_options_for_begin_frame(begin_frame);
+
+        assert_eq!(request_frame_options.begin_frame, Some(begin_frame));
+        assert!(request_frame_options.source_begin_frame);
+        assert_eq!(
+            request_frame_options.predicted_display_time,
+            Some(begin_frame.deadline)
+        );
+        assert_eq!(
+            request_frame_options.frame_interval,
+            Some(begin_frame.interval)
+        );
+        assert_eq!(
+            request_frame_options.frame_deadline,
+            Some(begin_frame.deadline)
+        );
+        assert!(!request_frame_options.require_presentation);
+        assert!(!request_frame_options.force_render);
     }
 
     #[test]
@@ -2567,6 +2639,26 @@ mod tests {
         });
 
         assert_eq!(input_rate_tracker.inputs_per_second, 120);
+    }
+
+    #[test]
+    fn input_rate_tracker_is_begin_frame_observer_for_input_client() {
+        let mut input_rate_tracker = InputRateTracker::default();
+        let begin_frame = crate::BeginFrameArgs {
+            interval: Duration::from_nanos(8_333_333),
+            ..begin_frame_args_at(1, 1, Instant::now())
+        };
+
+        assert!(crate::BeginFrameObserver::on_begin_frame(
+            &mut input_rate_tracker,
+            begin_frame,
+        ));
+
+        assert_eq!(input_rate_tracker.inputs_per_second, 120);
+        assert_eq!(
+            crate::BeginFrameObserver::last_used_begin_frame(&input_rate_tracker),
+            Some(begin_frame)
+        );
     }
 
     #[test]
@@ -3991,9 +4083,10 @@ impl Window {
         platform_window.on_begin_frame_for_input(Box::new({
             let input_rate_tracker = input_rate_tracker.clone();
             move |begin_frame| {
-                input_rate_tracker
-                    .borrow_mut()
-                    .observe_begin_frame_for_input(begin_frame);
+                crate::BeginFrameObserver::on_begin_frame(
+                    &mut *input_rate_tracker.borrow_mut(),
+                    begin_frame,
+                );
             }
         }));
 
@@ -4106,7 +4199,7 @@ impl Window {
                 supports_delayed_begin_frame_scheduling,
             };
             move |request_frame_options| {
-                scheduler.on_begin_frame_continuation(request_frame_options);
+                scheduler.on_frame_request(request_frame_options);
             }
         }));
         platform_window.on_resize(Box::new({
