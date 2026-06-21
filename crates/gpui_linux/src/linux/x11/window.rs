@@ -1695,7 +1695,7 @@ impl PlatformWindow for X11Window {
         if inner.renderer.needs_redraw() {
             inner.force_render_after_recovery = true;
         }
-        PlatformDrawResult::Submitted
+        PlatformDrawResult::Submitted(None)
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {

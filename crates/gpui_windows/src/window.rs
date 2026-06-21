@@ -948,7 +948,7 @@ impl PlatformWindow for WindowsWindow {
             .borrow_mut()
             .draw(scene, self.state.background_appearance.get())
             .log_err();
-        PlatformDrawResult::Submitted
+        PlatformDrawResult::Submitted(None)
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {

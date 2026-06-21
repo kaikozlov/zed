@@ -1314,6 +1314,7 @@ fn presentation_group_timing_for_request(
         interval,
         expected_display_time,
         target_latch_time,
+        swap_id: None,
     }
 }
 
@@ -1380,6 +1381,9 @@ struct PresentationGroupTiming {
     interval: Option<Duration>,
     expected_display_time: Option<Instant>,
     target_latch_time: Option<Instant>,
+    /// Swap id for trace-ID matching (`display.h` `swap_n`). `None` on platforms
+    /// that do not stamp a swap id — the scheduler falls back to FIFO matching.
+    swap_id: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -1555,7 +1559,16 @@ impl FrameSchedulerState {
         mut feedback: crate::PresentationFeedback,
         input_rate_tracker: &Rc<RefCell<InputRateTracker>>,
     ) {
-        if let Some(presentation_group) = self.take_pending_presentation_group() {
+        // Match the feedback to the correct pending presentation group by swap
+        // id (`display.h` swap_n matching, `display.cc:802-812`). Falls back to
+        // FIFO pop when the feedback carries no swap id or no matching group is
+        // found.
+        let presentation_group = if feedback.swap_id.is_some() {
+            self.take_pending_presentation_group_by_swap_id(feedback.swap_id)
+        } else {
+            self.take_pending_presentation_group()
+        };
+        if let Some(presentation_group) = presentation_group {
             feedback.target_latch_time = feedback
                 .target_latch_time
                 .or(presentation_group.target_latch_time);
@@ -1583,6 +1596,7 @@ impl FrameSchedulerState {
         &self,
         request_frame_options: crate::RequestFrameOptions,
         earliest_input_time: Option<Instant>,
+        swap_id: Option<u64>,
     ) {
         let last_targeted_latch_time = self.inner.borrow().last_targeted_latch_time;
 
@@ -1622,6 +1636,7 @@ impl FrameSchedulerState {
                 interval: Some(begin_frame.interval),
                 expected_display_time,
                 target_latch_time,
+                swap_id,
             }
         } else {
             presentation_group_timing_for_request(
@@ -1630,6 +1645,12 @@ impl FrameSchedulerState {
                 Instant::now(),
             )
         };
+
+        // Stamp the swap_id onto the group regardless of which path created it
+        // (the fallback `presentation_group_timing_for_request` creates with
+        // `swap_id: None`, so it must be overwritten here).
+        let mut presentation_group = presentation_group;
+        presentation_group.swap_id = swap_id;
 
         let mut state = self.inner.borrow_mut();
         state.last_targeted_latch_time = presentation_group.target_latch_time;
@@ -1643,6 +1664,28 @@ impl FrameSchedulerState {
             .borrow_mut()
             .pending_presentation_groups
             .pop_front()
+    }
+
+    /// Removes the presentation group whose `swap_id` matches, preserving the
+    /// FIFO order of remaining groups. Mirrors `display.h` swap_n matching
+    /// (`display.cc:802-812`).
+    fn take_pending_presentation_group_by_swap_id(
+        &self,
+        swap_id: Option<u64>,
+    ) -> Option<PresentationGroupTiming> {
+        let Some(swap_id) = swap_id else {
+            return self.take_pending_presentation_group();
+        };
+        let mut state = self.inner.borrow_mut();
+        if let Some(pos) = state
+            .pending_presentation_groups
+            .iter()
+            .position(|group| group.swap_id == Some(swap_id))
+        {
+            return state.pending_presentation_groups.remove(pos);
+        }
+        // No match by id — fall back to FIFO to preserve the drain proof.
+        state.pending_presentation_groups.pop_front()
     }
 
     fn update_frame_interval_from_request(
@@ -2245,7 +2288,7 @@ fn frame_production_result_for_draw_result(
 ) -> FrameProductionResult {
     FrameProductionResult::Drawn {
         started_at,
-        has_damage: matches!(draw_result, crate::PlatformDrawResult::Submitted),
+        has_damage: matches!(draw_result, crate::PlatformDrawResult::Submitted(_)),
     }
 }
 
@@ -3109,6 +3152,7 @@ mod tests {
             presented: true,
             vsync: true,
             hardware_completion: true,
+            swap_id: None,
         };
 
         assert!(presentation_feedback_missed_latch(feedback));
@@ -3126,6 +3170,7 @@ mod tests {
             presented: true,
             vsync: true,
             hardware_completion: true,
+            swap_id: None,
         };
 
         assert!(!presentation_feedback_missed_latch(feedback));
@@ -3143,6 +3188,7 @@ mod tests {
             presented: true,
             vsync: true,
             hardware_completion: true,
+            swap_id: None,
         };
 
         assert!(presentation_feedback_missed_latch(feedback));
@@ -3157,7 +3203,7 @@ mod tests {
             ..Default::default()
         };
 
-        frame_scheduler.record_pending_presentation_group(request_frame_options, None);
+        frame_scheduler.record_pending_presentation_group(request_frame_options, None, None);
 
         assert_eq!(
             frame_scheduler.take_pending_presentation_group(),
@@ -3166,6 +3212,7 @@ mod tests {
                 interval: Some(begin_frame.interval),
                 expected_display_time: Some(begin_frame.deadline),
                 target_latch_time: Some(begin_frame.deadline - Duration::from_micros(1500)),
+                swap_id: None,
             })
         );
     }
@@ -3216,7 +3263,7 @@ mod tests {
             ..Default::default()
         };
 
-        frame_scheduler.record_pending_presentation_group(request_frame_options, None);
+        frame_scheduler.record_pending_presentation_group(request_frame_options, None, None);
 
         // With max_buffers=2 (default fallback), target_present_delta = 2*16ms = 32ms.
         // The decider selects the last candidate with present_delta <= 32ms,
@@ -3232,6 +3279,89 @@ mod tests {
     }
 
     #[test]
+    fn presentation_feedback_matches_by_swap_id_not_fifo() {
+        // Phase 4 acceptance: no presentation-group metadata can be
+        // mis-attributed under out-of-order Metal completion + newer-frame
+        // failure. Two groups are recorded with swap_ids 1 and 2. The
+        // feedback for swap_id 2 arrives *before* swap_id 1 (out of order).
+        // The matching must find the correct group by id, not pop the wrong
+        // one from the FIFO front.
+        let frame_scheduler = FrameSchedulerState::default();
+        let now = Instant::now();
+        let interval = Duration::from_millis(16);
+
+        // Group 1: swap_id=1, display_time at +16ms
+        let begin_frame_1 = crate::BeginFrameArgs {
+            id: crate::BeginFrameId {
+                source_id: 1,
+                sequence_number: 1,
+            },
+            frame_time: now,
+            deadline: now + interval,
+            interval,
+            missed: false,
+            possible_deadlines: None,
+        };
+        frame_scheduler.record_pending_presentation_group(
+            crate::RequestFrameOptions {
+                begin_frame: Some(begin_frame_1.clone()),
+                ..Default::default()
+            },
+            None,
+            Some(1),
+        );
+
+        // Group 2: swap_id=2, display_time at +32ms
+        let begin_frame_2 = crate::BeginFrameArgs {
+            id: crate::BeginFrameId {
+                source_id: 1,
+                sequence_number: 2,
+            },
+            frame_time: now + interval,
+            deadline: now + interval * 2,
+            interval,
+            missed: false,
+            possible_deadlines: None,
+        };
+        frame_scheduler.record_pending_presentation_group(
+            crate::RequestFrameOptions {
+                begin_frame: Some(begin_frame_2.clone()),
+                ..Default::default()
+            },
+            None,
+            Some(2),
+        );
+
+        // Feedback for swap_id 2 arrives FIRST (out of order — newer frame
+        // failed/completed before older frame).
+        let input_rate_tracker = Rc::new(RefCell::new(InputRateTracker::default()));
+        frame_scheduler.on_presentation_feedback(
+            crate::PresentationFeedback {
+                ready_time: now + interval,
+                latch_time: now + interval,
+                display_time: now + interval * 2,
+                target_latch_time: None,
+                interval: Some(interval),
+                presented: false,
+                vsync: false,
+                hardware_completion: true,
+                swap_id: Some(2),
+            },
+            &input_rate_tracker,
+        );
+
+        // The group that was consumed should have been swap_id=2, not
+        // swap_id=1 (the FIFO front). Verify by checking that group 1 is
+        // still pending and can be matched next.
+        let remaining = frame_scheduler.take_pending_presentation_group_by_swap_id(Some(1));
+        assert!(
+            remaining.is_some(),
+            "group for swap_id=1 should still be pending after swap_id=2's feedback"
+        );
+        assert_eq!(remaining.unwrap().swap_id, Some(1));
+    }
+
+    #[test]
     fn presentation_group_advances_duplicate_latch_targets() {
         let frame_scheduler = FrameSchedulerState::default();
         let begin_frame = begin_frame_args(1);
@@ -3240,8 +3370,12 @@ mod tests {
             ..Default::default()
         };
 
-        frame_scheduler.record_pending_presentation_group(request_frame_options.clone(), None);
-        frame_scheduler.record_pending_presentation_group(request_frame_options, None);
+        frame_scheduler.record_pending_presentation_group(
+            request_frame_options.clone(),
+            None,
+            None,
+        );
+        frame_scheduler.record_pending_presentation_group(request_frame_options, None, None);
 
         let first_group = frame_scheduler.take_pending_presentation_group().unwrap();
         let second_group = frame_scheduler.take_pending_presentation_group().unwrap();
@@ -3302,7 +3436,11 @@ mod tests {
         .target_latch_time
         .unwrap();
 
-        frame_scheduler.record_pending_presentation_group(request_frame_options.clone(), None);
+        frame_scheduler.record_pending_presentation_group(
+            request_frame_options.clone(),
+            None,
+            None,
+        );
         frame_scheduler.on_presentation_feedback(
             crate::PresentationFeedback {
                 ready_time: target_latch_time + Duration::from_micros(1),
@@ -3313,6 +3451,7 @@ mod tests {
                 presented: true,
                 vsync: true,
                 hardware_completion: true,
+                swap_id: None,
             },
             &input_rate_tracker,
         );
@@ -3336,7 +3475,11 @@ mod tests {
         };
         let platform_target_latch_time = begin_frame.deadline - Duration::from_micros(3000);
 
-        frame_scheduler.record_pending_presentation_group(request_frame_options.clone(), None);
+        frame_scheduler.record_pending_presentation_group(
+            request_frame_options.clone(),
+            None,
+            None,
+        );
         frame_scheduler.on_presentation_feedback(
             crate::PresentationFeedback {
                 ready_time: platform_target_latch_time + Duration::from_micros(1),
@@ -3347,6 +3490,7 @@ mod tests {
                 presented: true,
                 vsync: true,
                 hardware_completion: true,
+                swap_id: None,
             },
             &input_rate_tracker,
         );
@@ -4171,7 +4315,7 @@ mod tests {
         assert_eq!(
             frame_production_result_for_draw_result(
                 started_at,
-                crate::PlatformDrawResult::Submitted
+                crate::PlatformDrawResult::Submitted(None)
             ),
             FrameProductionResult::Drawn {
                 started_at,
@@ -6306,16 +6450,19 @@ impl Window {
         }
         let draw_result = self.platform_window.draw(&self.rendered_frame.scene);
         if self.uses_platform_swap_completion
-            && !matches!(draw_result, crate::PlatformDrawResult::Submitted)
+            && !matches!(draw_result, crate::PlatformDrawResult::Submitted(_))
         {
             self.frame_scheduler.swap_submission_failed_or_skipped();
         }
         if self.uses_platform_swap_completion
-            && matches!(draw_result, crate::PlatformDrawResult::Submitted)
+            && let crate::PlatformDrawResult::Submitted(swap_id) = draw_result
         {
             let earliest_input_time = self.input_rate_tracker.borrow().earliest_input_time();
-            self.frame_scheduler
-                .record_pending_presentation_group(request_frame_options, earliest_input_time);
+            self.frame_scheduler.record_pending_presentation_group(
+                request_frame_options,
+                earliest_input_time,
+                swap_id,
+            );
         }
         #[cfg(feature = "input-latency-histogram")]
         self.input_latency_tracker.record_frame_presented();

@@ -998,6 +998,11 @@ pub struct PresentationFeedback {
     pub presented: bool,
     pub vsync: bool,
     pub hardware_completion: bool,
+    /// Monotonically increasing swap id stamped by the presenter, analog of
+    /// `display.h` `swap_n`. Used by the scheduler to match feedback to the
+    /// correct pending presentation group (`display.cc:802-812`). `None` on
+    /// platforms that do not stamp a swap id.
+    pub swap_id: Option<u64>,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -1007,6 +1012,8 @@ pub struct SwapCompletionFeedback {
     pub latch_time: Instant,
     pub result: SwapCompletionResult,
     pub presented: bool,
+    /// Swap id matching [`PresentationFeedback::swap_id`].
+    pub swap_id: Option<u64>,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -1020,7 +1027,10 @@ pub enum SwapCompletionResult {
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 #[expect(missing_docs)]
 pub enum PlatformDrawResult {
-    Submitted,
+    /// The frame was submitted for presentation. The inner value is the swap id
+    /// stamped by the presenter (analog of `display.h` `swap_n`), or `None` on
+    /// platforms that do not stamp one.
+    Submitted(Option<u64>),
     Deferred,
     Skipped,
 }

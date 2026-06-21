@@ -299,7 +299,7 @@ impl PlatformWindow for TestWindow {
         if let Some(renderer) = &mut state.renderer {
             renderer.render_scene(scene, device_size).warn_on_err();
         }
-        PlatformDrawResult::Submitted
+        PlatformDrawResult::Submitted(None)
     }
 
     fn sprite_atlas(&self) -> sync::Arc<dyn crate::PlatformAtlas> {

@@ -208,6 +208,9 @@ struct PresentedIosurfaceFrame {
     recreate_ca_context_on_commit: bool,
     layer_tree: Arc<Mutex<CoreAnimationLayerTree>>,
     drawable_size: Size<DevicePixels>,
+    /// Monotonically increasing swap id (analog of `display.h` `swap_n`).
+    /// Stamped onto all feedback emitted for this frame.
+    swap_id: u64,
 }
 
 #[derive(Clone)]
@@ -694,6 +697,7 @@ fn presentation_feedback_from_ca_time(ca_time: f64) -> PresentationFeedback {
         presented: true,
         vsync: true,
         hardware_completion: true,
+        swap_id: None,
     }
 }
 
@@ -701,6 +705,7 @@ fn presentation_feedback_for_iosurface_frame(
     ready_time: scheduler::Instant,
     latch_time: scheduler::Instant,
     display_timing: Option<FrameDisplayTiming>,
+    swap_id: Option<u64>,
 ) -> PresentationFeedback {
     let (display_time, target_latch_time, interval) = if let Some(display_timing) = display_timing {
         let display_time = estimated_display_time_for_latch(display_timing, latch_time);
@@ -722,6 +727,7 @@ fn presentation_feedback_for_iosurface_frame(
         presented: true,
         vsync: true,
         hardware_completion: true,
+        swap_id,
     }
 }
 
@@ -803,12 +809,14 @@ fn apply_iosurface_backpressure_fence(fence: &IosurfaceBackpressureFence) {
 
 fn complete_iosurface_frame(frame: Box<PresentedIosurfaceFrame>, presented: bool) {
     let latch_time = scheduler::Instant::now();
+    let swap_id = Some(frame.swap_id);
     if let Some(callback) = &frame.swap_completion_callback {
         callback(SwapCompletionFeedback {
             ready_time: frame.ready_time,
             latch_time,
             result: swap_completion_result_for_iosurface_frame(presented),
             presented,
+            swap_id,
         });
     }
     if let Some(callback) = &frame.presentation_feedback_callback {
@@ -817,6 +825,7 @@ fn complete_iosurface_frame(frame: Box<PresentedIosurfaceFrame>, presented: bool
                 frame.ready_time,
                 latch_time,
                 frame.committed_display_timing,
+                swap_id,
             ));
         } else {
             callback(PresentationFeedback {
@@ -828,6 +837,7 @@ fn complete_iosurface_frame(frame: Box<PresentedIosurfaceFrame>, presented: bool
                 presented: false,
                 vsync: false,
                 hardware_completion: true,
+                swap_id,
             });
         }
     }
@@ -858,6 +868,7 @@ fn supports_ca_transaction_phase_handlers() -> bool {
 
 fn fail_iosurface_frame(frame: Box<PresentedIosurfaceFrame>) {
     let latch_time = scheduler::Instant::now();
+    let swap_id = Some(frame.swap_id);
     restore_failed_buffer_damage(&frame.buffer_damage, frame.submitted_damage);
     if let Some(callback) = &frame.swap_completion_callback {
         callback(SwapCompletionFeedback {
@@ -865,6 +876,7 @@ fn fail_iosurface_frame(frame: Box<PresentedIosurfaceFrame>) {
             latch_time,
             result: SwapCompletionResult::Failed,
             presented: false,
+            swap_id,
         });
     }
     if let Some(callback) = &frame.presentation_feedback_callback {
@@ -877,6 +889,7 @@ fn fail_iosurface_frame(frame: Box<PresentedIosurfaceFrame>) {
             presented: false,
             vsync: false,
             hardware_completion: true,
+            swap_id,
         });
     }
     frame.buffer_pending.store(false, Ordering::Release);
@@ -1608,7 +1621,7 @@ impl MetalRenderer {
                         command_buffer.present_drawable(drawable);
                         command_buffer.commit();
                     }
-                    return PlatformDrawResult::Submitted;
+                    return PlatformDrawResult::Submitted(None);
                 }
                 Err(err) => {
                     log::error!(
@@ -1738,6 +1751,7 @@ impl MetalRenderer {
                         recreate_ca_context_on_commit,
                         layer_tree: presenter.layer_tree.clone(),
                         drawable_size: presenter.drawable_size,
+                        swap_id: submission_order as u64,
                     };
                     let resize_frame_wait = presenter.resize_frame_wait.clone();
                     presented_frames
@@ -1819,7 +1833,7 @@ impl MetalRenderer {
                     let block = block.copy();
                     command_buffer.add_completed_handler(&block);
                     command_buffer.commit();
-                    return PlatformDrawResult::Submitted;
+                    return PlatformDrawResult::Submitted(Some(submission_order as u64));
                 }
                 Err(err) => {
                     log::error!(
@@ -3322,8 +3336,12 @@ mod tests {
             frame_interval: Some(Duration::from_millis(16)),
         };
 
-        let feedback =
-            presentation_feedback_for_iosurface_frame(ready_time, latch_time, Some(display_timing));
+        let feedback = presentation_feedback_for_iosurface_frame(
+            ready_time,
+            latch_time,
+            Some(display_timing),
+            None,
+        );
 
         assert_eq!(feedback.ready_time, ready_time);
         assert_eq!(feedback.latch_time, latch_time);
@@ -3349,8 +3367,12 @@ mod tests {
             frame_interval: Some(frame_interval),
         };
 
-        let feedback =
-            presentation_feedback_for_iosurface_frame(ready_time, latch_time, Some(display_timing));
+        let feedback = presentation_feedback_for_iosurface_frame(
+            ready_time,
+            latch_time,
+            Some(display_timing),
+            None,
+        );
 
         assert_eq!(feedback.display_time, first_display_time + frame_interval);
         assert_eq!(

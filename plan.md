@@ -388,19 +388,19 @@ frame's feedback. Today's `PresentationFeedback` (`platform.rs:789`) carries
 no id.
 
 **Work items.**
-1. Add a monotonically increasing `swap_id` to `SwapCompletionFeedback` and
-   `PresentationFeedback` (`platform.rs:802/789`), analog of `display.h`
-   `swap_n`. The macOS presenter already has `next_submission_order`
-   (`metal_renderer.rs`); reuse it as the swap id stamped onto both the
-   `PresentedIosurfaceFrame` and its emitted feedback.
-2. Change `record_pending_presentation_group` (`window.rs:1562`) to key the
-   group by swap id, and change `on_presentation_feedback` (`window.rs:1533`)
-   to match by id (like `display.h` swap_n matching) instead of FIFO pop.
-3. Keep the FIFO drain as a fallback only for platforms that do not stamp a
-   swap id (`supports_swap_completion_feedback` false, `platform.rs:892`).
-4. Audit every submitted-but-not-presented path (Failed, Skipped,
-   Deferred-then-later) still drains, reusing the verification from the prior
-   audit but now keyed by id.
+1. [x] Add a monotonically increasing `swap_id` to `SwapCompletionFeedback` and
+   `PresentationFeedback` (`platform.rs`), analog of `display.h` `swap_n`. The
+   macOS presenter stamps `next_submission_order` onto `PresentedIosurfaceFrame`
+   and its emitted feedback. `PlatformDrawResult::Submitted(Option<u64>)` carries
+   the swap id from the draw path to the scheduler.
+2. [x] Change `record_pending_presentation_group` (`window.rs`) to key the
+   group by swap id, and change `on_presentation_feedback` (`window.rs`) to match
+   by id via `take_pending_presentation_group_by_swap_id` instead of FIFO pop.
+3. [x] Keep the FIFO drain as a fallback for platforms that do not stamp a
+   swap id (`swap_id: None` on feedback, `Submitted(None)` from draw).
+4. [x] All submitted-but-not-presented paths (Failed, Skipped, Deferred) still
+   drain: they carry the same swap_id on both `SwapCompletionFeedback` and
+   `PresentationFeedback`, so the id-based match applies uniformly.
 
 **Acceptance.** No presentation-group metadata can be mis-attributed under
 out-of-order Metal completion + newer-frame failure. The drain proof still

@@ -686,7 +686,7 @@ impl PlatformWindow for WebWindow {
         }
 
         self.inner.state.borrow_mut().renderer.draw(scene);
-        PlatformDrawResult::Submitted
+        PlatformDrawResult::Submitted(None)
     }
 
     fn completed_frame(&self) {
