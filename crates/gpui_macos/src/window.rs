@@ -2868,9 +2868,9 @@ extern "C" fn set_frame_size(this: &Object, _: Sel, size: NSSize) {
     // AppKit's displayLayer: callback. Chromium kicks off the resize frame as
     // soon as the size changes so it is already in flight by the time the
     // commit-boundary wait runs. The request is dispatched asynchronously; if
-    // it has not run yet by the time displayLayer: fires, displayLayer: falls
-    // back to triggering a render itself, so this is purely an optimization
-    // (earlier GPU start, shorter wait) and never a missed frame.
+    // it has not run yet by the time displayLayer: fires, displayLayer: leaves
+    // AppKit's resize tracking loop unblocked and lets the async request
+    // produce the next correctly-sized frame.
     dispatch_frame_request(
         Arc::downgrade(&window_state),
         RequestFrameOptions::default(),
@@ -2882,15 +2882,17 @@ extern "C" fn set_frame_size(this: &Object, _: Sel, size: NSSize) {
 extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
 
-    // Arm the resize wait. A current-generation frame may already be in
-    // flight: set_frame_size dispatches the resize render on the resize event
-    // (matching Chromium starting it early), so by the time displayLayer: runs
-    // a correctly-sized frame may already be pending or even ready. Only
-    // trigger a render here as a fallback when no current-generation frame is
-    // pending (initial display, or the early dispatch lost the race). This
-    // avoids a redundant render when set_frame_size already started one. When
-    // skipped, the request_frame_callback is left untouched in the window
-    // state; when triggered, it is taken, invoked, and restored here.
+    // A current-generation frame may already be in flight: set_frame_size
+    // dispatches the resize render on the resize event (matching Chromium
+    // starting it early), so by the time displayLayer: runs a correctly-sized
+    // frame may already be pending or even ready. Only wait in that case.
+    //
+    // Chromium's live-resize wait can run compositor tasks through
+    // WindowResizeHelperMac while AppKit is inside displayLayer:. GPUI's wait
+    // is a plain condition-variable park, so rendering inline here would block
+    // AppKit's resize tracking and make the window frame lag the cursor. When
+    // the early resize request has not submitted a current-generation frame
+    // yet, request one and return; the next displayLayer: tick can consume it.
     //
     // No CaActionsDisabled guard is held across the wait: every layer mutation
     // (commit_iosurface_frame's contents swap, set_drawable_size's bounds
@@ -2899,21 +2901,22 @@ extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
     // window transaction while the main thread is parked. Chromium holds its
     // ScopedCAActionDisabler across the wait because its coordinator mutates
     // the layer tree during the wait; Zed's wait does not mutate anything.
-    let triggered_render = {
+    {
         let mut lock = window_state.lock();
+        if !lock.renderer.has_current_generation_submission() {
+            drop(lock);
+            dispatch_frame_request(
+                Arc::downgrade(&window_state),
+                RequestFrameOptions::default(),
+                false,
+                FrameRequestDeliveryKind::Native,
+            );
+            return;
+        }
+
         lock.renderer.arm_resize_frame_wait();
         lock.renderer.set_presents_with_transaction(true);
         lock.stop_display_link();
-        !lock.renderer.has_current_generation_submission()
-    };
-    if triggered_render {
-        let mut callback = window_state.lock().request_frame_callback.take();
-        if let Some(callback) = callback.as_mut() {
-            (**callback)(Default::default());
-        }
-        if let Some(callback) = callback {
-            window_state.lock().request_frame_callback = Some(callback);
-        }
     }
 
     // Block at the commit boundary for a frame produced in parallel by the

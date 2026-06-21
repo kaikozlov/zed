@@ -63,10 +63,11 @@ const IOSURFACE_MAX_PENDING_SWAPS: usize = IOSURFACE_BUFFER_COUNT - 1;
 const CA_TRANSACTION_PHASE_POST_COMMIT: usize = 2;
 const NO_CURRENT_BUFFER: usize = usize::MAX;
 const IOSURFACE_LATCH_BUFFER: Duration = Duration::from_micros(1500);
-/// Bounded wait for a parallel-produced resize frame, matching Chromium's
-/// `kPostCommitTimeout`. If the GPU has not produced a current-generation frame
-/// within this window, AppKit composites the existing layer for this tick.
-pub(crate) const RESIZE_FRAME_WAIT_TIMEOUT: Duration = Duration::from_millis(50);
+/// Bounded wait for a parallel-produced resize frame. Chromium can afford a
+/// longer timeout because its wait pumps `WindowResizeHelperMac` tasks; this
+/// single-process path parks AppKit's resize callback, so keep the bound short
+/// enough that the window frame keeps tracking the cursor.
+pub(crate) const RESIZE_FRAME_WAIT_TIMEOUT: Duration = Duration::from_millis(8);
 const BGRA_IOSURFACE_PIXEL_FORMAT: i32 = i32::from_be_bytes(*b"BGRA");
 
 pub(crate) type Context = Arc<Mutex<InstanceBufferPool>>;
@@ -110,8 +111,9 @@ pub(crate) struct InstanceBuffer {
 /// the resize frame. While armed, completions bypass the (blocked) main
 /// dispatch queue, update the presentation queue on the Metal thread, and
 /// signal this condvar so the main thread can drain and commit the ready
-/// frame. This is the single-process analog of Chromium's
-/// `WindowResizeHelperMac::WaitForSingleTaskToRun` pre-commit pump.
+/// frame. Unlike Chromium's `WindowResizeHelperMac::WaitForSingleTaskToRun`,
+/// this does not pump compositor work while AppKit is blocked, so callers must
+/// only wait for work that is already in flight.
 struct ResizeFrameWait {
     inner: Mutex<ResizeFrameWaitState>,
     cond: Condvar,

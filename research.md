@@ -294,9 +294,14 @@ ZED_MACOS_LEGACY_METAL_LAYER=1 cargo run -p zed
   `DidFinishFrame()` immediately. A pending rescheduled deadline for the current
   BeginFrame is consumed before the fallback current request, matching
   Chromium's "force the current scheduler interval" behavior before resize
-  suppression. The macOS `displayLayer:` fallback render remains only for cases
-  where there is no active BeginFrame interval to flush or the early resize
-  render loses the race.
+  suppression. The macOS `displayLayer:` callback no longer renders inline when
+  the early resize request loses the race; Chromium can pump compositor tasks
+  through `WindowResizeHelperMac` during live resize, but Zed's local wait is a
+  blocking condition-variable wait. Rendering inline there parks AppKit's
+  resize tracking loop and makes the window border lag the cursor, especially
+  on corner drags. `displayLayer:` now waits only for an already-submitted
+  current-generation frame; otherwise it requests an async native frame and
+  returns to AppKit.
 - GPUI now carries an explicit local equivalent of Chromium's
   `output_surface_lost_` scheduler bit. A failed IOSurface swap completion marks
   the output surface lost, requests refresh work, and immediately flushes any
