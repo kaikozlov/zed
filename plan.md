@@ -335,22 +335,21 @@ hand-rolled approximation of `SelectDeadline`.
    each carrying its `vsync_id` (the display's vsync counter) and deltas from
    `frame_time`.
 3. [x] Port `FrameDeadlineDecider` (`frame_deadline_decider.h/.cc`) as a Rust
-   struct (`platform.rs` `FrameDeadlineDecider`). `select_deadline` mirrors
-   `SelectDeadline` (`:24`) including the in-sequence stickiness
-   (`find_closest_deadline_by_presentation`, `:142`) and the `on_go_idle` reset
-   (`:134`). The decider is not yet wired into the scheduler's
-   `presentation_group_timing_for_request` future-latch advancement — that
-   integration replaces the hand-rolled approximation once the scheduler calls
-   `select_deadline` instead of computing a single timestamp.
+   struct (`platform.rs` `FrameDeadlineDecider`), wired into the scheduler via
+   `FrameSchedulerData::frame_deadline_decider`. `record_pending_presentation_group`
+   calls `select_deadline` when `possible_deadlines` is present, replacing the
+   hand-rolled `presentation_group_timing_for_request` loop. `stop_observing_begin_frames`
+   calls `on_go_idle` to reset sequence stickiness.
 4. [x] Port the **input-aware perceptible-latency cap**
-   (`frame_deadline_decider.cc:84-100`): when `earliest_input_time` is known,
-   `select_deadline` clamps `target_present_delta` to
-   `100 ms − vsync_interval − 0.25·vsync_interval − input_delta`.
+   (`frame_deadline_decider.cc:84-100`): `select_deadline` clamps
+   `target_present_delta` using `earliest_input_time` sourced from
+   `InputRateTracker::earliest_input_time()`, fed into
+   `record_pending_presentation_group` at the production call site.
 5. [x] Port `MaxPendingSwapsForDeadline` (`display_scheduler.cc:479`) as
-   `max_pending_swaps_for_deadline(present_delta, interval)` (`platform.rs`).
-   The function is not yet wired into the scheduler's swap cap — that
-   integration replaces the static `IOSURFACE_MAX_PENDING_SWAPS` read once the
-   scheduler consumes the decider's selected deadline.
+   `max_pending_swaps_for_deadline` (`platform.rs`), wired into the scheduler
+   via `FrameSchedulerState::max_pending_swaps_for_current_frame`. The
+   `Window::platform_swap_backpressured` path prefers the per-deadline cap over
+   the static `max_pending_platform_swaps` when `possible_deadlines` is present.
 
 **Acceptance.** A frame's selected deadline is an index into a
 `PossibleDeadlines` vector chosen by the ported decider, not a single computed

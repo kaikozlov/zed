@@ -1177,6 +1177,14 @@ impl InputRateTracker {
         Instant::now() < self.sustain_until
     }
 
+    /// Returns the earliest input timestamp in the tracking window, for the
+    /// `FrameDeadlineDecider`'s input-aware latency cap
+    /// (`frame_deadline_decider.cc:84`). `None` when no input has arrived
+    /// recently enough to be relevant.
+    pub fn earliest_input_time(&self) -> Option<Instant> {
+        self.timestamps.first().copied()
+    }
+
     pub fn should_keep_frame_source_active(&self) -> bool {
         let now = Instant::now();
         now < self.frame_source_sustain_until || now < self.post_draw_frame_source_sustain_until
@@ -1363,6 +1371,7 @@ struct FrameSchedulerData {
     draw_duration_estimate: Duration,
     last_targeted_latch_time: Option<Instant>,
     pending_presentation_groups: VecDeque<PresentationGroupTiming>,
+    frame_deadline_decider: crate::FrameDeadlineDecider,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1527,6 +1536,7 @@ impl Default for FrameSchedulerData {
             draw_duration_estimate: Duration::from_micros(1000),
             last_targeted_latch_time: None,
             pending_presentation_groups: VecDeque::new(),
+            frame_deadline_decider: crate::FrameDeadlineDecider::new(false),
         }
     }
 }
@@ -1569,13 +1579,58 @@ impl FrameSchedulerState {
             presentation_feedback_missed_latch(feedback);
     }
 
-    fn record_pending_presentation_group(&self, request_frame_options: crate::RequestFrameOptions) {
+    fn record_pending_presentation_group(
+        &self,
+        request_frame_options: crate::RequestFrameOptions,
+        earliest_input_time: Option<Instant>,
+    ) {
         let last_targeted_latch_time = self.inner.borrow().last_targeted_latch_time;
-        let presentation_group = presentation_group_timing_for_request(
-            &request_frame_options,
-            last_targeted_latch_time,
-            Instant::now(),
-        );
+
+        // When the platform provides PossibleDeadlines, use the ported
+        // FrameDeadlineDecider to select the deadline index, then derive the
+        // target latch/display times from the selected candidate's
+        // present_delta. Falls back to the hand-rolled timing function when
+        // no possible_deadlines are present.
+        let presentation_group = if let Some(ref possible_deadlines) = request_frame_options
+            .begin_frame
+            .as_ref()
+            .and_then(|bf| bf.possible_deadlines.as_ref())
+        {
+            let begin_frame = request_frame_options.begin_frame.as_ref().unwrap();
+            let max_buffers = self.max_pending_swaps_for_current_frame().unwrap_or(2);
+
+            let selected_index = {
+                let mut state = self.inner.borrow_mut();
+                state.frame_deadline_decider.select_deadline(
+                    possible_deadlines,
+                    begin_frame.interval,
+                    max_buffers,
+                    begin_frame.frame_time,
+                    earliest_input_time,
+                )
+            };
+
+            let selected = &possible_deadlines.deadlines[selected_index];
+            let expected_display_time = begin_frame.frame_time.checked_add(selected.present_delta);
+            let target_latch_time = begin_frame
+                .frame_time
+                .checked_add(selected.latch_delta)
+                .and_then(|t| target_latch_time_for_display_time(t));
+
+            PresentationGroupTiming {
+                frame_time: Some(begin_frame.frame_time),
+                interval: Some(begin_frame.interval),
+                expected_display_time,
+                target_latch_time,
+            }
+        } else {
+            presentation_group_timing_for_request(
+                &request_frame_options,
+                last_targeted_latch_time,
+                Instant::now(),
+            )
+        };
+
         let mut state = self.inner.borrow_mut();
         state.last_targeted_latch_time = presentation_group.target_latch_time;
         state
@@ -1676,6 +1731,24 @@ impl FrameSchedulerState {
         self.inner.borrow().pending_swaps
     }
 
+    /// Computes the per-deadline buffer cap using
+    /// [`crate::max_pending_swaps_for_deadline`] when the current BeginFrame
+    /// carries `PossibleDeadlines`, falling back to `None` (caller uses the
+    /// static platform cap) when it does not.
+    ///
+    /// Mirrors `DisplayScheduler::MaxPendingSwaps`'s deadline branch
+    /// (`display_scheduler.cc:491`).
+    fn max_pending_swaps_for_current_frame(&self) -> Option<u32> {
+        let state = self.inner.borrow();
+        let begin_frame = state.current_begin_frame_args.as_ref()?;
+        let possible_deadlines = begin_frame.possible_deadlines.as_ref()?;
+        let os_preferred = possible_deadlines.os_preferred_deadline()?;
+        Some(crate::max_pending_swaps_for_deadline(
+            os_preferred.present_delta,
+            begin_frame.interval,
+        ))
+    }
+
     fn did_submit_swap(&self) {
         let mut state = self.inner.borrow_mut();
         state.pending_swaps = state.pending_swaps.saturating_add(1);
@@ -1716,6 +1789,10 @@ impl FrameSchedulerState {
         }
 
         state.observing_begin_frame_source = false;
+        // Reset the deadline decider's in-sequence stickiness when going idle,
+        // mirroring `FrameDeadlineDecider::OnGoIdle`
+        // (`frame_deadline_decider.cc:134`).
+        state.frame_deadline_decider.on_go_idle();
         true
     }
 
@@ -3080,7 +3157,7 @@ mod tests {
             ..Default::default()
         };
 
-        frame_scheduler.record_pending_presentation_group(request_frame_options);
+        frame_scheduler.record_pending_presentation_group(request_frame_options, None);
 
         assert_eq!(
             frame_scheduler.take_pending_presentation_group(),
@@ -3094,6 +3171,67 @@ mod tests {
     }
 
     #[test]
+    fn presentation_group_uses_frame_deadline_decider_when_possible_deadlines_present() {
+        // When the BeginFrame carries PossibleDeadlines, the presentation
+        // group timing must come from the FrameDeadlineDecider's selected
+        // deadline, not the hand-rolled presentation_group_timing_for_request
+        // loop. This is the Phase 3 acceptance criterion: "A frame's selected
+        // deadline is an index into a PossibleDeadlines vector chosen by the
+        // ported decider, not a single computed timestamp."
+        let frame_scheduler = FrameSchedulerState::default();
+        let now = Instant::now();
+        let interval = Duration::from_millis(16);
+        let begin_frame = crate::BeginFrameArgs {
+            id: crate::BeginFrameId {
+                source_id: 1,
+                sequence_number: 1,
+            },
+            frame_time: now,
+            deadline: now + interval,
+            interval,
+            missed: false,
+            possible_deadlines: Some(crate::PossibleDeadlines {
+                os_preferred_index: 0,
+                deadlines: vec![
+                    crate::PossibleDeadline {
+                        vsync_id: 1,
+                        latch_delta: interval,
+                        present_delta: interval,
+                    },
+                    crate::PossibleDeadline {
+                        vsync_id: 2,
+                        latch_delta: interval * 2,
+                        present_delta: interval * 2,
+                    },
+                    crate::PossibleDeadline {
+                        vsync_id: 3,
+                        latch_delta: interval * 3,
+                        present_delta: interval * 3,
+                    },
+                ],
+            }),
+        };
+        let request_frame_options = crate::RequestFrameOptions {
+            begin_frame: Some(begin_frame.clone()),
+            ..Default::default()
+        };
+
+        frame_scheduler.record_pending_presentation_group(request_frame_options, None);
+
+        // With max_buffers=2 (default fallback), target_present_delta = 2*16ms = 32ms.
+        // The decider selects the last candidate with present_delta <= 32ms,
+        // which is index 1 (32ms). So expected_display_time should be
+        // frame_time + 32ms, NOT frame_time + 16ms (which the hand-rolled
+        // loop would produce).
+        let group = frame_scheduler.take_pending_presentation_group().unwrap();
+        assert_eq!(
+            group.expected_display_time,
+            Some(begin_frame.frame_time + interval * 2),
+            "decider should select index 1 (32ms present_delta), not index 0 (16ms)"
+        );
+    }
+
+    #[test]
     fn presentation_group_advances_duplicate_latch_targets() {
         let frame_scheduler = FrameSchedulerState::default();
         let begin_frame = begin_frame_args(1);
@@ -3102,8 +3240,8 @@ mod tests {
             ..Default::default()
         };
 
-        frame_scheduler.record_pending_presentation_group(request_frame_options.clone());
-        frame_scheduler.record_pending_presentation_group(request_frame_options);
+        frame_scheduler.record_pending_presentation_group(request_frame_options.clone(), None);
+        frame_scheduler.record_pending_presentation_group(request_frame_options, None);
 
         let first_group = frame_scheduler.take_pending_presentation_group().unwrap();
         let second_group = frame_scheduler.take_pending_presentation_group().unwrap();
@@ -3164,7 +3302,7 @@ mod tests {
         .target_latch_time
         .unwrap();
 
-        frame_scheduler.record_pending_presentation_group(request_frame_options.clone());
+        frame_scheduler.record_pending_presentation_group(request_frame_options.clone(), None);
         frame_scheduler.on_presentation_feedback(
             crate::PresentationFeedback {
                 ready_time: target_latch_time + Duration::from_micros(1),
@@ -3198,7 +3336,7 @@ mod tests {
         };
         let platform_target_latch_time = begin_frame.deadline - Duration::from_micros(3000);
 
-        frame_scheduler.record_pending_presentation_group(request_frame_options.clone());
+        frame_scheduler.record_pending_presentation_group(request_frame_options.clone(), None);
         frame_scheduler.on_presentation_feedback(
             crate::PresentationFeedback {
                 ready_time: platform_target_latch_time + Duration::from_micros(1),
@@ -5996,8 +6134,12 @@ impl Window {
     }
 
     fn platform_swap_backpressured(&self) -> bool {
+        // Prefer the per-deadline cap (Phase 3) when the current frame carries
+        // PossibleDeadlines; fall back to the static platform cap otherwise.
+        let deadline_cap = self.frame_scheduler.max_pending_swaps_for_current_frame();
+        let effective_cap = deadline_cap.or(self.max_pending_platform_swaps);
         self.frame_scheduler
-            .platform_swap_backpressured(self.max_pending_platform_swaps)
+            .platform_swap_backpressured(effective_cap)
     }
 
     fn should_defer_begin_frame_for_gpu_busy(&mut self) -> bool {
@@ -6171,8 +6313,9 @@ impl Window {
         if self.uses_platform_swap_completion
             && matches!(draw_result, crate::PlatformDrawResult::Submitted)
         {
+            let earliest_input_time = self.input_rate_tracker.borrow().earliest_input_time();
             self.frame_scheduler
-                .record_pending_presentation_group(request_frame_options);
+                .record_pending_presentation_group(request_frame_options, earliest_input_time);
         }
         #[cfg(feature = "input-latency-histogram")]
         self.input_latency_tracker.record_frame_presented();
