@@ -3158,7 +3158,7 @@ fn dispatch_frame_request(
 
 fn request_frame(
     window_state: Weak<Mutex<MacWindowState>>,
-    options: RequestFrameOptions,
+    mut options: RequestFrameOptions,
     apply_display_timing: bool,
     kind: FrameRequestDeliveryKind,
 ) {
@@ -3167,6 +3167,11 @@ fn request_frame(
     };
 
     let mut lock = window_state.lock();
+    options.source_begin_frame = matches!(
+        kind,
+        FrameRequestDeliveryKind::SourceBeginFrame
+            | FrameRequestDeliveryKind::SourceBeginFrameAfterInput
+    );
     if !should_deliver_frame_request(
         kind,
         options,

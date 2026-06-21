@@ -308,6 +308,15 @@ ZED_MACOS_LEGACY_METAL_LAYER=1 cargo run -p zed
   `DesiredBeginFrameDeadlineMode(kImmediate)` / `ShouldDraw() == false`
   sequence without permanently blocking recovery on an external GPU-process
   output-surface recreation.
+- GPUI now has explicit Chromium-style one-shot BeginFrame state. `on_next_frame`
+  and `request_animation_frame()` set a `needs_one_begin_frame` bit, which keeps
+  the platform BeginFrame source subscribed until the next accepted source
+  BeginFrame consumes it. This mirrors Chromium's `SetNeedsOneBeginFrame()`:
+  callback-only frame requests no longer masquerade as durable dirty work or
+  enter the damage-reschedule path for the current BeginFrame interval. The
+  platform request metadata now distinguishes source BeginFrames from scheduler
+  replays, so GPU-available or damage-deadline re-entry cannot accidentally
+  consume a one-shot source request.
 - Important runtime finding: do **not** use `IOSurfaceIsInUse` as the hot-path
   reuse gate in this local process. Without Chromium's full CA/viz presentation
   feedback, that check can report surfaces unavailable long after the local
@@ -752,6 +761,12 @@ ZED_MACOS_LEGACY_METAL_LAYER=1 cargo run -p zed
   without drawing, and keep subsequent deadlines immediate until a forced
   recovery render clears the state. Non-recovery draws are suppressed while the
   bit is set, matching Chromium's `ShouldDraw()` guard.
+- GPUI now models Chromium's `SetNeedsOneBeginFrame()` separately from dirty
+  draw scheduling. `on_next_frame` requests a one-shot BeginFrame, the next
+  accepted source BeginFrame consumes that request, and the source can go idle
+  again after the callback drains if no dirty/present work remains. Scheduler
+  replays explicitly clear the source-BeginFrame marker before re-entering the
+  callback path.
 - `LATE` deadline mode now follows Chromium's
   `DesiredBeginFrameDeadlineTime(kLate)` behavior. Instead of completing
   clean BeginFrames immediately, GPUI waits until the end of the BeginFrame
@@ -792,7 +807,7 @@ ZED_MACOS_LEGACY_METAL_LAYER=1 cargo run -p zed
   Chromium's model, where frame production is tied to an intended display
   deadline rather than merely "the main queue woke up."
 - GPUI now has an explicit platform `set_needs_begin_frame` subscription hook.
-  Dirty windows, pending `on_next_frame` callbacks, pending presentation, and
+  Dirty windows, one-shot `on_next_frame` requests, pending presentation, and
   sustained high-rate input subscribe to BeginFrames; `complete_frame()` drops
   the subscription once there is no remaining work. On macOS this starts/stops
   `CVDisplayLink` instead of running it continuously just because the window is

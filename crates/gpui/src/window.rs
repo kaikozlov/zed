@@ -1274,6 +1274,7 @@ struct FrameSchedulerState {
     current_begin_frame_deadline_request: Rc<Cell<Option<BeginFrameDeadlineRequest>>>,
     drew_current_begin_frame: Rc<Cell<bool>>,
     damage_reschedule_pending: Rc<Cell<bool>>,
+    needs_one_begin_frame: Rc<Cell<bool>>,
     pending_begin_frame_deadline: Rc<Cell<Option<PendingBeginFrameDeadline>>>,
     inside_begin_frame_deadline_interval: Rc<Cell<bool>>,
     last_begin_frame_ack: Rc<Cell<Option<crate::BeginFrameAck>>>,
@@ -1381,6 +1382,7 @@ struct BeginFrameSubscriptionState {
     needs_present: bool,
     has_pending_platform_swaps: bool,
     has_pending_gpu_available_frame: bool,
+    needs_one_begin_frame: bool,
     has_next_frame_callbacks: bool,
     active: bool,
     high_rate_input: bool,
@@ -1393,6 +1395,7 @@ fn needs_begin_frame_subscription(state: BeginFrameSubscriptionState) -> bool {
             || state.needs_present
             || state.has_pending_platform_swaps
             || state.has_pending_gpu_available_frame
+            || state.needs_one_begin_frame
             || state.has_next_frame_callbacks
             || (state.active && state.high_rate_input)
             || (state.active && state.keep_frame_source_active))
@@ -1403,6 +1406,7 @@ fn needs_swap_completion_scheduler_wake(state: BeginFrameSubscriptionState) -> b
         && (state.dirty
             || state.needs_present
             || state.has_pending_gpu_available_frame
+            || state.needs_one_begin_frame
             || state.has_next_frame_callbacks
             || (state.active && state.high_rate_input)
             || (state.active && state.keep_frame_source_active))
@@ -1420,6 +1424,7 @@ impl Default for FrameSchedulerState {
             current_begin_frame_deadline_request: Rc::new(Cell::new(None)),
             drew_current_begin_frame: Rc::new(Cell::new(false)),
             damage_reschedule_pending: Rc::new(Cell::new(false)),
+            needs_one_begin_frame: Rc::new(Cell::new(false)),
             pending_begin_frame_deadline: Rc::new(Cell::new(None)),
             inside_begin_frame_deadline_interval: Rc::new(Cell::new(false)),
             last_begin_frame_ack: Rc::new(Cell::new(None)),
@@ -1491,6 +1496,18 @@ impl FrameSchedulerState {
 
     fn inside_begin_frame_deadline_interval(&self) -> bool {
         self.inside_begin_frame_deadline_interval.get()
+    }
+
+    fn needs_one_begin_frame(&self) -> bool {
+        self.needs_one_begin_frame.get()
+    }
+
+    fn set_needs_one_begin_frame(&self) {
+        self.needs_one_begin_frame.set(true);
+    }
+
+    fn consume_one_begin_frame_request(&self) {
+        self.needs_one_begin_frame.set(false);
     }
 
     fn begin_frame_continuation(
@@ -1821,6 +1838,9 @@ impl BeginFrameScheduler {
                     self.frame_scheduler
                         .accept_begin_frame_request(request_frame_options);
                 }
+            }
+            if request_frame_options.source_begin_frame {
+                self.frame_scheduler.consume_one_begin_frame_request();
             }
         }
 
@@ -2155,6 +2175,7 @@ fn request_frame_options_for_scheduler_replay(
     request: BeginFrameDeadlineRequest,
 ) -> crate::RequestFrameOptions {
     let mut request_frame_options = request.options;
+    request_frame_options.source_begin_frame = false;
     request_frame_options.require_presentation |= request.needs_present;
     request_frame_options
 }
@@ -2259,6 +2280,7 @@ mod tests {
         let begin_frame = begin_frame_args(1);
         let request_frame_options = crate::RequestFrameOptions {
             begin_frame: Some(begin_frame),
+            source_begin_frame: true,
             require_presentation: false,
             ..Default::default()
         };
@@ -2270,6 +2292,7 @@ mod tests {
 
         assert!(replay_options.require_presentation);
         assert_eq!(replay_options.begin_frame, Some(begin_frame));
+        assert!(!replay_options.source_begin_frame);
     }
 
     #[test]
@@ -2375,6 +2398,13 @@ mod tests {
                 ..Default::default()
             }
         ));
+        assert!(needs_begin_frame_subscription(
+            BeginFrameSubscriptionState {
+                visible: true,
+                needs_one_begin_frame: true,
+                ..Default::default()
+            }
+        ));
     }
 
     #[test]
@@ -2405,6 +2435,13 @@ mod tests {
             BeginFrameSubscriptionState {
                 visible: true,
                 has_pending_gpu_available_frame: true,
+                ..Default::default()
+            }
+        ));
+        assert!(needs_swap_completion_scheduler_wake(
+            BeginFrameSubscriptionState {
+                visible: true,
+                needs_one_begin_frame: true,
                 ..Default::default()
             }
         ));
@@ -2969,6 +3006,17 @@ mod tests {
         assert!(frame_scheduler.output_surface_lost());
         frame_scheduler.recover_output_surface();
         assert!(!frame_scheduler.output_surface_lost());
+    }
+
+    #[test]
+    fn one_begin_frame_request_is_explicit_scheduler_state() {
+        let frame_scheduler = FrameSchedulerState::default();
+
+        assert!(!frame_scheduler.needs_one_begin_frame());
+        frame_scheduler.set_needs_one_begin_frame();
+        assert!(frame_scheduler.needs_one_begin_frame());
+        frame_scheduler.consume_one_begin_frame_request();
+        assert!(!frame_scheduler.needs_one_begin_frame());
     }
 
     #[test]
@@ -4447,7 +4495,7 @@ impl Window {
     /// Schedule the given closure to be run directly after the current frame is rendered.
     pub fn on_next_frame(&self, callback: impl FnOnce(&mut Window, &mut App) + 'static) {
         RefCell::borrow_mut(&self.next_frame_callbacks).push(Box::new(callback));
-        self.schedule_frame_after_work();
+        self.schedule_one_begin_frame();
     }
 
     /// Schedule a frame to be drawn on the next animation frame.
@@ -4931,6 +4979,11 @@ impl Window {
         }
     }
 
+    fn schedule_one_begin_frame(&self) {
+        self.frame_scheduler.set_needs_one_begin_frame();
+        self.update_begin_frame_subscription();
+    }
+
     fn force_immediate_swap_if_possible(&mut self, cx: &mut App) -> bool {
         let Some(request) = self.frame_scheduler.force_immediate_deadline_request() else {
             return false;
@@ -5019,6 +5072,7 @@ impl Window {
             has_pending_platform_swaps: self.uses_platform_swap_completion
                 && self.pending_platform_swaps > 0,
             has_pending_gpu_available_frame: self.pending_gpu_available_frame.is_some(),
+            needs_one_begin_frame: self.frame_scheduler.needs_one_begin_frame(),
             has_next_frame_callbacks: !self.next_frame_callbacks.borrow().is_empty(),
             active: self.active.get(),
             high_rate_input: input_rate_tracker.is_high_rate(),

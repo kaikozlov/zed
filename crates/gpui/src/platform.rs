@@ -612,6 +612,8 @@ pub struct A11yCallbacks {
 pub struct RequestFrameOptions {
     /// Platform BeginFrame metadata for this frame, when the platform frame source provides it.
     pub begin_frame: Option<BeginFrameArgs>,
+    /// Whether this request came directly from the platform BeginFrame source.
+    pub source_begin_frame: bool,
     /// Whether a presentation is required.
     pub require_presentation: bool,
     /// Force refresh of all rendering states when true.
