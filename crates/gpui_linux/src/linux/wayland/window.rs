@@ -30,11 +30,11 @@ use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1;
 use crate::linux::wayland::{display::WaylandDisplay, serial::SerialKind};
 use crate::linux::{Globals, Output, WaylandClientStatePtr, get_window};
 use gpui::{
-    AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, GpuSpecs, Modifiers, Pixels,
-    PlatformAtlas, PlatformDisplay, PlatformDrawResult, PlatformInput, PlatformInputHandler,
-    PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size,
-    Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
-    WindowControls, WindowDecorations, WindowKind, WindowParams,
+    AnyWindowHandle, BeginFrameObserverDispatch, Bounds, Capslock, Decorations, DevicePixels,
+    GpuSpecs, Modifiers, Pixels, PlatformAtlas, PlatformDisplay, PlatformDrawResult, PlatformInput,
+    PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
+    ResizeEdge, Scene, Size, Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControlArea, WindowControls, WindowDecorations, WindowKind, WindowParams,
     layer_shell::LayerShellNotSupportedError, px, size,
 };
 use gpui_wgpu::{CompositorGpuHint, WgpuRenderer, WgpuSurfaceConfig, wgpu};
@@ -1360,7 +1360,10 @@ impl PlatformWindow for WaylandWindow {
         self.borrow().fullscreen
     }
 
-    fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
+    fn set_begin_frame_observer(&self, dispatch: BeginFrameObserverDispatch) {
+        let BeginFrameObserverDispatch::Scheduler(callback) = dispatch else {
+            return;
+        };
         self.0.callbacks.borrow_mut().request_frame = Some(callback);
     }
 

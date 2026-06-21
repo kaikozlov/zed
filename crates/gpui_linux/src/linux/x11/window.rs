@@ -3,11 +3,12 @@ use x11rb::connection::RequestConnection;
 
 use crate::linux::X11ClientStatePtr;
 use gpui::{
-    AnyWindowHandle, Bounds, Decorations, DevicePixels, ForegroundExecutor, GpuSpecs, Modifiers,
-    Pixels, PlatformAtlas, PlatformDisplay, PlatformDrawResult, PlatformInput,
-    PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
-    ResizeEdge, ScaledPixels, Scene, Size, Tiling, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControlArea, WindowDecorations, WindowKind, WindowParams, px,
+    AnyWindowHandle, BeginFrameObserverDispatch, Bounds, Decorations, DevicePixels,
+    ForegroundExecutor, GpuSpecs, Modifiers, Pixels, PlatformAtlas, PlatformDisplay,
+    PlatformDrawResult, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton,
+    PromptLevel, RequestFrameOptions, ResizeEdge, ScaledPixels, Scene, Size, Tiling,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
+    WindowDecorations, WindowKind, WindowParams, px,
 };
 use gpui_wgpu::{CompositorGpuHint, WgpuRenderer, WgpuSurfaceConfig};
 
@@ -1620,7 +1621,10 @@ impl PlatformWindow for X11Window {
         self.0.state.borrow().fullscreen
     }
 
-    fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
+    fn set_begin_frame_observer(&self, dispatch: BeginFrameObserverDispatch) {
+        let BeginFrameObserverDispatch::Scheduler(callback) = dispatch else {
+            return;
+        };
         self.0.callbacks.borrow_mut().request_frame = Some(callback);
     }
 

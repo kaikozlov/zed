@@ -1150,7 +1150,7 @@ impl App {
                     window.defer(cx, |window: &mut Window, cx| window.appearance_changed(cx));
 
                     // allow a window to draw at least once before returning
-                    // this didn't cause any issues on non windows platforms as it seems we always won the race to on_request_frame
+                    // this didn't cause any issues on non windows platforms as it seems we always won the race to set_begin_frame_observer
                     // on windows we quite frequently lose the race and return a window that has never rendered, which leads to a crash
                     // where DispatchTree::root_node_id asserts on empty nodes
                     let clear = window.draw(cx);

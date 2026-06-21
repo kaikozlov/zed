@@ -132,9 +132,13 @@ continuity, and input-client-before-scheduler delivery (`:487`, `:601`, `:621`,
 `:3322`). `InputRateTracker` and `BeginFrameScheduler` now implement
 `BeginFrameObserver` (`gpui/src/window.rs:1220`, `:2285`), and source
 BeginFrames are routed through those observer methods (`:4083`, `:4189`). The
-remaining gap is that the public GPUI platform boundary is still named
-`on_request_frame`/`set_needs_begin_frame` rather than a true
-`AddObserver`/`RemoveObserver` list exposed through `PlatformWindow`.
+public GPUI platform boundary is now observer-shaped: `PlatformWindow` exposes
+`set_begin_frame_observer(BeginFrameObserverDispatch)` (the dispatch enum
+carries the `Scheduler`/`Input` kind) plus
+`add_begin_frame_observer(BeginFrameObserverKind)` /
+`remove_begin_frame_observer(BeginFrameObserverKind)`, replacing the old
+`on_request_frame` / `on_begin_frame_for_input` / `set_needs_begin_frame`
+callback-registration methods.
 
 **Work items.**
 1. **Mostly done; shared observer-base continuity remains local to sources.**
@@ -158,22 +162,26 @@ remaining gap is that the public GPUI platform boundary is still named
    `MacBeginFrameSource` state, input-client delivery, and scheduler observer
    callback storage, but `step()` still enters through the local platform
    callback shape (`gpui_macos/src/window.rs:3120`, `:3134`, `:3297`).
-4. **Partially done.** Move `FrameSchedulerState` to register itself as the observer (analog of
+4. **Done.** Move `FrameSchedulerState` to register itself as the observer (analog of
    `DisplayScheduler::BeginFrameObserver`, see Phase 2). `InputRateTracker`
-   (`window.rs:1116`) becomes a second observer consuming
-   `IssueBeginFrameToInputClient`, replacing the current single
-   `on_begin_frame_for_input` hook (`platform.rs:747`). Current code has
-   `BeginFrameScheduler` as the scheduler observer adapter
-   (`gpui/src/window.rs:2285`) and `InputRateTracker` as the input observer
-   (`:1220`), but `PlatformWindow` still exposes callback registration rather
-   than an observer-list API.
-5. **Partially done.** `set_needs_begin_frame` (`platform.rs:748`) becomes
-   `AddObserver`/`RemoveObserver` on the source
-   (`begin_frame_source.h:228-229`), including the missed-frame replay on
-   `AddObserver` (the "gets missed BeginFrameArgs for the given observer"
-   behavior documented at `begin_frame_source.h:490`). Current macOS code maps
-   `set_needs_begin_frame` to `MacBeginFrameSource::add_observer`/
-   `remove_observer` (`gpui_macos/src/window.rs:1921`).
+   (`window.rs:1116`) is a second observer consuming
+   `IssueBeginFrameToInputClient`, installed via
+   `set_begin_frame_observer(BeginFrameObserverDispatch::Input)` (`window.rs:4083`).
+   `BeginFrameScheduler` is the scheduler observer adapter
+   (`gpui/src/window.rs:2285`) and `InputRateTracker` the input observer
+   (`:1220`); both are wired through the `PlatformWindow` observer API, no
+   longer callback registration.
+5. **Done.** `set_needs_begin_frame` (`platform.rs:748`, removed) became
+   `add_begin_frame_observer` / `remove_begin_frame_observer` of
+   `BeginFrameObserverKind` on `PlatformWindow`
+   (`begin_frame_source.h:228-229`), including the missed-frame replay on add
+   (the "gets missed BeginFrameArgs for the given observer" behavior documented
+   at `begin_frame_source.h:490`). macOS maps
+   `add_begin_frame_observer(Scheduler)` /
+   `remove_begin_frame_observer(Scheduler)` onto
+   `MacBeginFrameSource::set_scheduler_observer_registered(true/false)` plus the
+   display-link subscription update and missed-frame replay
+   (`gpui_macos/src/window.rs:1903`).
 
 **Acceptance.** A single `DelayBasedBeginFrameSource` instance feeds both the
 scheduler and the input tracker via the observer list; no production code path

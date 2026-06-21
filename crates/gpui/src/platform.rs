@@ -670,6 +670,34 @@ pub trait BeginFrameSource {
     fn did_finish_frame(&mut self, observer_id: Self::ObserverId, ack: Option<BeginFrameAck>);
 }
 
+/// Identifies a subscriber to a platform window's [`BeginFrameSource`].
+///
+/// Mirrors the observer list on a `viz::BeginFrameSource`
+/// (`components/viz/common/frame_sinks/begin_frame_source.h`): the source issues
+/// [`BeginFrameArgs`] to the scheduler observer before the input observer. The
+/// two delivery paths are `IssueBeginFrameToSchedulerClient` /
+/// `IssueBeginFrameToInputClient` (`begin_frame_source.cc:238-245`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BeginFrameObserverKind {
+    /// The scheduler client. Consumes full frame requests — source begin frames,
+    /// missed-frame replays, and scheduler-driven reschedules.
+    Scheduler,
+    /// The input client. Consumes source-driven [`BeginFrameArgs`] for input-rate
+    /// tracking (`IssueBeginFrameToInputClient`).
+    Input,
+}
+
+/// The dispatch closure a begin-frame observer uses to receive frames. The
+/// variant carries the [`BeginFrameObserverKind`] it is registered for.
+pub enum BeginFrameObserverDispatch {
+    /// Scheduler observer dispatch (`IssueBeginFrameToSchedulerClient`). Broader
+    /// than a single begin frame: GPUI routes missed-frame replays, resize, and
+    /// GPU-available wakeups through the same path.
+    Scheduler(Box<dyn FnMut(RequestFrameOptions)>),
+    /// Input observer dispatch (`IssueBeginFrameToInputClient`).
+    Input(Box<dyn FnMut(BeginFrameArgs)>),
+}
+
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 #[expect(missing_docs)]
 pub struct PresentationFeedback {
@@ -743,9 +771,33 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn zoom(&self);
     fn toggle_fullscreen(&self);
     fn is_fullscreen(&self) -> bool;
-    fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>);
-    fn on_begin_frame_for_input(&self, _callback: Box<dyn FnMut(BeginFrameArgs)>) {}
-    fn set_needs_begin_frame(&self, _needs_begin_frame: bool) {}
+    /// Installs the dispatch closure for a begin-frame observer. The dispatch
+    /// variant carries the observer's [`BeginFrameObserverKind`]; the scheduler
+    /// observer is toggled on/off with [`Self::add_begin_frame_observer`] /
+    /// [`Self::remove_begin_frame_observer`], while the input observer is
+    /// registered implicitly by installing its dispatch (it stays subscribed for
+    /// the window's lifetime).
+    ///
+    /// Mirrors wiring a `BeginFrameObserver` onto a `viz::BeginFrameSource`
+    /// (`components/viz/common/frame_sinks/begin_frame_source.h`): the source
+    /// issues [`BeginFrameArgs`] to the scheduler client before the input client
+    /// (`IssueBeginFrameToSchedulerClient` / `IssueBeginFrameToInputClient`,
+    /// `begin_frame_source.cc:238-245`). On platforms without a structured
+    /// begin-frame source the scheduler variant is the window's frame callback
+    /// and the input variant is ignored.
+    fn set_begin_frame_observer(&self, dispatch: BeginFrameObserverDispatch);
+    /// Adds an observer of `kind` to the begin-frame source. On registering the
+    /// scheduler observer the source replays any missed [`BeginFrameArgs`]
+    /// (`viz::BeginFrameSource::AddObserver`, `begin_frame_source.h:228` /
+    /// `:490`). Re-adding an already-registered observer is a no-op.
+    ///
+    /// Default no-op for platforms without a structured begin-frame source.
+    fn add_begin_frame_observer(&self, _kind: BeginFrameObserverKind) {}
+    /// Removes an observer of `kind` from the begin-frame source
+    /// (`viz::BeginFrameSource::RemoveObserver`, `begin_frame_source.h:229`).
+    ///
+    /// Default no-op for platforms without a structured begin-frame source.
+    fn remove_begin_frame_observer(&self, _kind: BeginFrameObserverKind) {}
     fn request_frame(&self, _options: RequestFrameOptions) {}
     fn request_begin_frame(&self) {}
     fn supports_delayed_begin_frame_scheduling(&self) -> bool {

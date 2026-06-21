@@ -4080,15 +4080,17 @@ impl Window {
                 frame_scheduler.on_presentation_feedback(feedback, &input_rate_tracker);
             }
         }));
-        platform_window.on_begin_frame_for_input(Box::new({
-            let input_rate_tracker = input_rate_tracker.clone();
-            move |begin_frame| {
-                crate::BeginFrameObserver::on_begin_frame(
-                    &mut *input_rate_tracker.borrow_mut(),
-                    begin_frame,
-                );
-            }
-        }));
+        platform_window.set_begin_frame_observer(crate::BeginFrameObserverDispatch::Input(
+            Box::new({
+                let input_rate_tracker = input_rate_tracker.clone();
+                move |begin_frame| {
+                    crate::BeginFrameObserver::on_begin_frame(
+                        &mut *input_rate_tracker.borrow_mut(),
+                        begin_frame,
+                    );
+                }
+            }),
+        ));
 
         match window_bounds {
             WindowBounds::Fullscreen(_) => platform_window.toggle_fullscreen(),
@@ -4186,22 +4188,24 @@ impl Window {
                 });
             }
         }));
-        platform_window.on_request_frame(Box::new({
-            let mut scheduler = BeginFrameScheduler {
-                handle,
-                cx: cx.to_async(),
-                invalidator: invalidator.clone(),
-                active: active.clone(),
-                needs_present: needs_present.clone(),
-                next_frame_callbacks: next_frame_callbacks.clone(),
-                input_rate_tracker: input_rate_tracker.clone(),
-                frame_scheduler: frame_scheduler.clone(),
-                supports_delayed_begin_frame_scheduling,
-            };
-            move |request_frame_options| {
-                scheduler.on_frame_request(request_frame_options);
-            }
-        }));
+        platform_window.set_begin_frame_observer(crate::BeginFrameObserverDispatch::Scheduler(
+            Box::new({
+                let mut scheduler = BeginFrameScheduler {
+                    handle,
+                    cx: cx.to_async(),
+                    invalidator: invalidator.clone(),
+                    active: active.clone(),
+                    needs_present: needs_present.clone(),
+                    next_frame_callbacks: next_frame_callbacks.clone(),
+                    input_rate_tracker: input_rate_tracker.clone(),
+                    frame_scheduler: frame_scheduler.clone(),
+                    supports_delayed_begin_frame_scheduling,
+                };
+                move |request_frame_options| {
+                    scheduler.on_frame_request(request_frame_options);
+                }
+            }),
+        ));
         platform_window.on_resize(Box::new({
             let mut cx = cx.to_async();
             move |_, _| {
@@ -4359,7 +4363,7 @@ impl Window {
         }
 
         platform_window.map_window().unwrap();
-        platform_window.set_needs_begin_frame(true);
+        platform_window.add_begin_frame_observer(crate::BeginFrameObserverKind::Scheduler);
 
         Ok(Window {
             handle,
@@ -5319,7 +5323,8 @@ impl Window {
     }
 
     pub(crate) fn schedule_frame_after_work(&self) {
-        self.platform_window.set_needs_begin_frame(true);
+        self.platform_window
+            .add_begin_frame_observer(crate::BeginFrameObserverKind::Scheduler);
         if let Some(request) = self.frame_scheduler.damage_reschedule_deadline_request() {
             self.platform_window
                 .request_frame(request_frame_options_for_scheduler_replay(request));
@@ -5399,8 +5404,13 @@ impl Window {
     }
 
     fn update_begin_frame_subscription(&self) {
-        self.platform_window
-            .set_needs_begin_frame(self.has_frame_work());
+        if self.has_frame_work() {
+            self.platform_window
+                .add_begin_frame_observer(crate::BeginFrameObserverKind::Scheduler);
+        } else {
+            self.platform_window
+                .remove_begin_frame_observer(crate::BeginFrameObserverKind::Scheduler);
+        }
     }
 
     fn has_frame_work(&self) -> bool {

@@ -1,8 +1,8 @@
 use crate::{
-    AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTile, Bounds, DevicePixels,
-    DispatchEventResult, GpuSpecs, Pixels, PlatformAtlas, PlatformDisplay, PlatformDrawResult,
-    PlatformHeadlessRenderer, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PromptButton, RequestFrameOptions, Scene, Size, TestPlatform, TileId, WindowAppearance,
+    AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTile, BeginFrameObserverDispatch, Bounds,
+    DevicePixels, DispatchEventResult, GpuSpecs, Pixels, PlatformAtlas, PlatformDisplay,
+    PlatformDrawResult, PlatformHeadlessRenderer, PlatformInput, PlatformInputHandler,
+    PlatformWindow, Point, PromptButton, Scene, Size, TestPlatform, TileId, WindowAppearance,
     WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams,
 };
 use collections::HashMap;
@@ -258,7 +258,7 @@ impl PlatformWindow for TestWindow {
         self.0.lock().is_fullscreen
     }
 
-    fn on_request_frame(&self, _callback: Box<dyn FnMut(RequestFrameOptions)>) {}
+    fn set_begin_frame_observer(&self, _dispatch: BeginFrameObserverDispatch) {}
 
     fn on_input(&self, callback: Box<dyn FnMut(crate::PlatformInput) -> DispatchEventResult>) {
         self.0.lock().input_callback = Some(callback)

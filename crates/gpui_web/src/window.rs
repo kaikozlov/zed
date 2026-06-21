@@ -4,11 +4,12 @@ use std::sync::Arc;
 use std::{cell::Cell, cell::RefCell, rc::Rc};
 
 use gpui::{
-    AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, DispatchEventResult, GpuSpecs,
-    Modifiers, MouseButton, Pixels, PlatformAtlas, PlatformDisplay, PlatformDrawResult,
-    PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel,
-    RequestFrameOptions, ResizeEdge, Scene, Size, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControlArea, WindowControls, WindowDecorations, WindowParams, px,
+    AnyWindowHandle, BeginFrameObserverDispatch, Bounds, Capslock, Decorations, DevicePixels,
+    DispatchEventResult, GpuSpecs, Modifiers, MouseButton, Pixels, PlatformAtlas, PlatformDisplay,
+    PlatformDrawResult, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton,
+    PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls, WindowDecorations,
+    WindowParams, px,
 };
 use gpui_wgpu::{WgpuContext, WgpuRenderer, WgpuSurfaceConfig};
 use wasm_bindgen::prelude::*;
@@ -626,7 +627,10 @@ impl PlatformWindow for WebWindow {
         self.inner.state.borrow().is_fullscreen
     }
 
-    fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
+    fn set_begin_frame_observer(&self, dispatch: BeginFrameObserverDispatch) {
+        let BeginFrameObserverDispatch::Scheduler(callback) = dispatch else {
+            return;
+        };
         self.inner.callbacks.borrow_mut().request_frame = Some(callback);
     }
 

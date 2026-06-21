@@ -24,14 +24,14 @@ use cocoa::{
 };
 use dispatch2::DispatchQueue;
 use gpui::{
-    AnyWindowHandle, BackgroundExecutor, BeginFrameAck, BeginFrameArgs, Bounds, Capslock,
-    CursorStyle, ExternalPaths, FileDropEvent, ForegroundExecutor, KeyDownEvent, Keystroke,
-    Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Pixels, PlatformAtlas, PlatformDisplay, PlatformDrawResult, PlatformInput,
-    PlatformInputHandler, PlatformWindow, Point, PresentationFeedback, PromptButton, PromptLevel,
-    RequestFrameOptions, SharedString, Size, SwapCompletionFeedback, SystemWindowTab,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowKind,
-    WindowParams, point, px, size,
+    AnyWindowHandle, BackgroundExecutor, BeginFrameAck, BeginFrameArgs, BeginFrameObserverDispatch,
+    BeginFrameObserverKind, Bounds, Capslock, CursorStyle, ExternalPaths, FileDropEvent,
+    ForegroundExecutor, KeyDownEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PlatformAtlas, PlatformDisplay,
+    PlatformDrawResult, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+    PresentationFeedback, PromptButton, PromptLevel, RequestFrameOptions, SharedString, Size,
+    SwapCompletionFeedback, SystemWindowTab, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowControlArea, WindowKind, WindowParams, point, px, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -484,6 +484,7 @@ struct TrafficLightButtons {
 #[derive(Default)]
 struct MacBeginFrameSource {
     scheduler_observer_registered: bool,
+    input_observer_registered: bool,
     scheduler_observer_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     last_display_link_timing: Option<DisplayLinkTiming>,
     last_used_begin_frame: Option<BeginFrameArgs>,
@@ -494,6 +495,7 @@ struct MacBeginFrameSource {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MacBeginFrameObserverId {
     Scheduler,
+    Input,
 }
 
 impl MacBeginFrameSource {
@@ -540,6 +542,7 @@ impl MacBeginFrameSource {
 
     fn set_input_client(&mut self, callback: Box<dyn FnMut(BeginFrameArgs)>) {
         self.input_client_callback = Some(callback);
+        <Self as gpui::BeginFrameSource>::add_observer(self, MacBeginFrameObserverId::Input);
     }
 
     fn record_completed_frame(&mut self, ack: Option<BeginFrameAck>) {
@@ -603,6 +606,9 @@ impl MacBeginFrameSource {
         kind: FrameRequestDeliveryKind,
         options: RequestFrameOptions,
     ) -> Option<(Box<dyn FnMut(BeginFrameArgs)>, BeginFrameArgs)> {
+        if !self.input_observer_registered {
+            return None;
+        }
         if kind != FrameRequestDeliveryKind::SourceBeginFrame {
             return None;
         }
@@ -626,6 +632,9 @@ impl gpui::BeginFrameSource for MacBeginFrameSource {
             MacBeginFrameObserverId::Scheduler => {
                 self.scheduler_observer_registered = true;
             }
+            MacBeginFrameObserverId::Input => {
+                self.input_observer_registered = true;
+            }
         }
     }
 
@@ -634,12 +643,16 @@ impl gpui::BeginFrameSource for MacBeginFrameSource {
             MacBeginFrameObserverId::Scheduler => {
                 self.scheduler_observer_registered = false;
             }
+            MacBeginFrameObserverId::Input => {
+                self.input_observer_registered = false;
+            }
         }
     }
 
     fn did_finish_frame(&mut self, observer_id: Self::ObserverId, ack: Option<BeginFrameAck>) {
         match observer_id {
             MacBeginFrameObserverId::Scheduler => self.record_completed_frame(ack),
+            MacBeginFrameObserverId::Input => {}
         }
     }
 }
@@ -1900,40 +1913,74 @@ impl PlatformWindow for MacWindow {
         }
     }
 
-    fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
-        let window_state = Arc::downgrade(&self.0);
-        let mut lock = self.0.as_ref().lock();
-        lock.begin_frame_source
-            .set_scheduler_observer_callback(callback);
-        lock.renderer
-            .set_deferred_frame_callback(Some(Arc::new(move || {
-                let context = Box::into_raw(Box::new(window_state.clone())) as *mut c_void;
+    fn set_begin_frame_observer(&self, dispatch: BeginFrameObserverDispatch) {
+        match dispatch {
+            BeginFrameObserverDispatch::Scheduler(callback) => {
+                let window_state = Arc::downgrade(&self.0);
+                let mut lock = self.0.as_ref().lock();
+                lock.begin_frame_source
+                    .set_scheduler_observer_callback(callback);
+                lock.renderer
+                    .set_deferred_frame_callback(Some(Arc::new(move || {
+                        let context = Box::into_raw(Box::new(window_state.clone())) as *mut c_void;
+                        unsafe {
+                            DispatchQueue::main().exec_async_f(context, request_missed_frame_async);
+                        }
+                    })));
+            }
+            BeginFrameObserverDispatch::Input(callback) => {
+                self.0.lock().begin_frame_source.set_input_client(callback);
+            }
+        }
+    }
+
+    fn add_begin_frame_observer(&self, kind: BeginFrameObserverKind) {
+        match kind {
+            BeginFrameObserverKind::Scheduler => {
+                let window_state = Arc::downgrade(&self.0);
+                let mut lock = self.0.as_ref().lock();
+                if !lock
+                    .begin_frame_source
+                    .set_scheduler_observer_registered(true)
+                {
+                    return;
+                }
+                lock.update_display_link_subscription();
+                drop(lock);
+
+                let context = Box::into_raw(Box::new(window_state)) as *mut c_void;
                 unsafe {
                     DispatchQueue::main().exec_async_f(context, request_missed_frame_async);
                 }
-            })));
-    }
-
-    fn on_begin_frame_for_input(&self, callback: Box<dyn FnMut(BeginFrameArgs)>) {
-        self.0.lock().begin_frame_source.set_input_client(callback);
-    }
-
-    fn set_needs_begin_frame(&self, needs_begin_frame: bool) {
-        let window_state = Arc::downgrade(&self.0);
-        let mut lock = self.0.as_ref().lock();
-        if !lock
-            .begin_frame_source
-            .set_scheduler_observer_registered(needs_begin_frame)
-        {
-            return;
+            }
+            BeginFrameObserverKind::Input => {
+                let mut lock = self.0.as_ref().lock();
+                gpui::BeginFrameSource::add_observer(
+                    &mut lock.begin_frame_source,
+                    MacBeginFrameObserverId::Input,
+                );
+            }
         }
-        lock.update_display_link_subscription();
-        drop(lock);
+    }
 
-        if needs_begin_frame {
-            let context = Box::into_raw(Box::new(window_state)) as *mut c_void;
-            unsafe {
-                DispatchQueue::main().exec_async_f(context, request_missed_frame_async);
+    fn remove_begin_frame_observer(&self, kind: BeginFrameObserverKind) {
+        match kind {
+            BeginFrameObserverKind::Scheduler => {
+                let mut lock = self.0.as_ref().lock();
+                if !lock
+                    .begin_frame_source
+                    .set_scheduler_observer_registered(false)
+                {
+                    return;
+                }
+                lock.update_display_link_subscription();
+            }
+            BeginFrameObserverKind::Input => {
+                let mut lock = self.0.as_ref().lock();
+                gpui::BeginFrameSource::remove_observer(
+                    &mut lock.begin_frame_source,
+                    MacBeginFrameObserverId::Input,
+                );
             }
         }
     }
@@ -4151,6 +4198,67 @@ mod tests {
             FrameRequestDeliveryKind::SourceBeginFrameAfterInput,
             options,
         ));
+    }
+
+    #[test]
+    fn begin_frame_source_input_observer_registration_gates_delivery() {
+        let frame_time = scheduler::Instant::now();
+        let predicted_display_time = frame_time + Duration::from_millis(16);
+        let begin_frame = gpui::BeginFrameArgs {
+            id: gpui::BeginFrameId {
+                source_id: 7,
+                sequence_number: 42,
+            },
+            frame_time,
+            deadline: predicted_display_time,
+            interval: Duration::from_millis(16),
+            missed: false,
+        };
+        let options = RequestFrameOptions {
+            begin_frame: Some(begin_frame),
+            predicted_display_time: Some(predicted_display_time),
+            frame_interval: Some(Duration::from_millis(16)),
+            frame_deadline: Some(predicted_display_time),
+            ..Default::default()
+        };
+        let observed_begin_frame = Rc::new(Cell::new(0u32));
+        let mut source = MacBeginFrameSource::default();
+        source.set_input_client(Box::new({
+            let observed_begin_frame = observed_begin_frame.clone();
+            move |_begin_frame| observed_begin_frame.set(observed_begin_frame.get() + 1)
+        }));
+
+        // Installing the input client auto-registers the observer — delivery works.
+        let Some((mut input_client, input_begin_frame)) = source
+            .take_input_client_for_begin_frame(FrameRequestDeliveryKind::SourceBeginFrame, options)
+        else {
+            panic!("source BeginFrame should issue to input client when registered");
+        };
+        input_client(input_begin_frame);
+        source.restore_input_client(input_client);
+        assert_eq!(observed_begin_frame.get(), 1);
+
+        // Removing the observer stops delivery even though the callback is still installed.
+        gpui::BeginFrameSource::remove_observer(&mut source, MacBeginFrameObserverId::Input);
+        assert!(
+            source
+                .take_input_client_for_begin_frame(
+                    FrameRequestDeliveryKind::SourceBeginFrame,
+                    options
+                )
+                .is_none()
+        );
+
+        // Re-adding restores delivery.
+        gpui::BeginFrameSource::add_observer(&mut source, MacBeginFrameObserverId::Input);
+        let Some((mut input_client, input_begin_frame)) = source
+            .take_input_client_for_begin_frame(FrameRequestDeliveryKind::SourceBeginFrame, options)
+        else {
+            panic!("source BeginFrame should issue to input client after re-registration");
+        };
+        input_client(input_begin_frame);
+        source.restore_input_client(input_client);
+        assert_eq!(observed_begin_frame.get(), 2);
     }
 
     #[test]

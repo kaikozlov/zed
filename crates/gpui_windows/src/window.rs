@@ -883,7 +883,10 @@ impl PlatformWindow for WindowsWindow {
         self.state.is_fullscreen()
     }
 
-    fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
+    fn set_begin_frame_observer(&self, dispatch: BeginFrameObserverDispatch) {
+        let BeginFrameObserverDispatch::Scheduler(callback) = dispatch else {
+            return;
+        };
         self.state.callbacks.request_frame.set(Some(callback));
     }
 
