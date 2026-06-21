@@ -1,6 +1,4 @@
-use crate::{
-    ca_time, metal_atlas::MetalAtlas, remote_layer::CoreAnimationLayerTree,
-};
+use crate::{ca_time, metal_atlas::MetalAtlas, remote_layer::CoreAnimationLayerTree};
 use anyhow::Result;
 use block::ConcreteBlock;
 use cocoa::{
@@ -64,6 +62,7 @@ const IOSURFACE_BUFFER_COUNT: usize = 3;
 const IOSURFACE_MAX_PENDING_SWAPS: usize = IOSURFACE_BUFFER_COUNT - 1;
 const CA_TRANSACTION_PHASE_POST_COMMIT: usize = 2;
 const NO_CURRENT_BUFFER: usize = usize::MAX;
+const IOSURFACE_LATCH_BUFFER: Duration = Duration::from_micros(1500);
 /// Bounded wait for a parallel-produced resize frame, matching Chromium's
 /// `kPostCommitTimeout`. If the GPU has not produced a current-generation frame
 /// within this window, AppKit composites the existing layer for this tick.
@@ -169,6 +168,12 @@ struct FrameDisplayTiming {
     frame_interval: Option<Duration>,
 }
 
+impl FrameDisplayTiming {
+    fn target_latch_time(self) -> Option<scheduler::Instant> {
+        self.next_display_time.checked_sub(IOSURFACE_LATCH_BUFFER)
+    }
+}
+
 #[allow(deprecated)]
 struct IosurfaceFrameBuffer {
     surface: io_surface::IOSurface,
@@ -191,6 +196,7 @@ struct PresentedIosurfaceFrame {
     swap_completion_callback: Option<Arc<dyn Fn(SwapCompletionFeedback) + Send + Sync>>,
     presentation_feedback_callback: Option<Arc<dyn Fn(PresentationFeedback) + Send + Sync>>,
     latest_display_timing: Arc<Mutex<Option<FrameDisplayTiming>>>,
+    committed_display_timing: Option<FrameDisplayTiming>,
     ready_time: scheduler::Instant,
     buffer_index: usize,
     buffer_damage: Arc<Mutex<Bounds<DevicePixels>>>,
@@ -299,10 +305,11 @@ impl<T> IosurfaceSubmissionQueue<T> {
     }
 
     fn any(&self, predicate: impl Fn(&T) -> bool) -> bool {
-        self.frames.iter().any(|queued_frame| predicate(&queued_frame.frame))
+        self.frames
+            .iter()
+            .any(|queued_frame| predicate(&queued_frame.frame))
     }
 }
-
 
 impl Drop for PresentedIosurfaceFrame {
     fn drop(&mut self) {
@@ -680,6 +687,7 @@ fn presentation_feedback_from_ca_time(ca_time: f64) -> PresentationFeedback {
         ready_time: display_time,
         latch_time: display_time,
         display_time,
+        target_latch_time: None,
         interval: None,
         presented: true,
         vsync: true,
@@ -692,19 +700,22 @@ fn presentation_feedback_for_iosurface_frame(
     latch_time: scheduler::Instant,
     display_timing: Option<FrameDisplayTiming>,
 ) -> PresentationFeedback {
-    let (display_time, interval) = if let Some(display_timing) = display_timing {
+    let (display_time, target_latch_time, interval) = if let Some(display_timing) = display_timing {
+        let display_time = estimated_display_time_for_latch(display_timing, latch_time);
         (
-            estimated_display_time_for_latch(display_timing, latch_time),
+            display_time,
+            display_timing.target_latch_time(),
             display_timing.frame_interval,
         )
     } else {
-        (latch_time, None)
+        (latch_time, None, None)
     };
 
     PresentationFeedback {
         ready_time,
         latch_time,
         display_time,
+        target_latch_time,
         interval,
         presented: true,
         vsync: true,
@@ -716,9 +727,7 @@ fn estimated_display_time_for_latch(
     display_timing: FrameDisplayTiming,
     latch_time: scheduler::Instant,
 ) -> scheduler::Instant {
-    const LATCH_BUFFER: Duration = Duration::from_micros(1500);
-
-    if let Some(next_latch_deadline) = display_timing.next_display_time.checked_sub(LATCH_BUFFER)
+    if let Some(next_latch_deadline) = display_timing.target_latch_time()
         && latch_time < next_latch_deadline
     {
         return display_timing.next_display_time;
@@ -734,7 +743,7 @@ fn estimated_display_time_for_latch(
     let mut display_time = display_timing.next_display_time;
     for _ in 0..240 {
         let latch_deadline = display_time
-            .checked_sub(LATCH_BUFFER)
+            .checked_sub(IOSURFACE_LATCH_BUFFER)
             .unwrap_or(display_time);
         if latch_time < latch_deadline {
             return display_time;
@@ -805,13 +814,14 @@ fn complete_iosurface_frame(frame: Box<PresentedIosurfaceFrame>, presented: bool
             callback(presentation_feedback_for_iosurface_frame(
                 frame.ready_time,
                 latch_time,
-                *frame.latest_display_timing.lock(),
+                frame.committed_display_timing,
             ));
         } else {
             callback(PresentationFeedback {
                 ready_time: frame.ready_time,
                 latch_time,
                 display_time: latch_time,
+                target_latch_time: None,
                 interval: None,
                 presented: false,
                 vsync: false,
@@ -860,6 +870,7 @@ fn fail_iosurface_frame(frame: Box<PresentedIosurfaceFrame>) {
             ready_time: frame.ready_time,
             latch_time,
             display_time: latch_time,
+            target_latch_time: None,
             interval: None,
             presented: false,
             vsync: false,
@@ -882,6 +893,7 @@ fn commit_iosurface_frame(frame: Box<PresentedIosurfaceFrame>) -> bool {
         return false;
     }
 
+    let display_timing = *frame.latest_display_timing.lock();
     let frame = Rc::new(Cell::new(Some(frame)));
     let post_commit_handler = if supports_ca_transaction_phase_handlers() {
         let frame = frame.clone();
@@ -907,6 +919,8 @@ fn commit_iosurface_frame(frame: Box<PresentedIosurfaceFrame>) -> bool {
             ];
         }
         if let Some(frame_for_contents) = frame.take() {
+            let mut frame_for_contents = frame_for_contents;
+            frame_for_contents.committed_display_timing = display_timing;
             if frame_for_contents.recreate_ca_context_on_commit {
                 let drawable_size = frame_for_contents.drawable_size;
                 frame_for_contents
@@ -1422,12 +1436,12 @@ impl MetalRenderer {
     }
 
     pub(crate) fn resize_frame_wait_handle(&self) -> Option<ResizeFrameWaitHandle> {
-        self.core_animation_presenter.as_ref().map(|presenter| {
-            ResizeFrameWaitHandle {
+        self.core_animation_presenter
+            .as_ref()
+            .map(|presenter| ResizeFrameWaitHandle {
                 presented_frames: presenter.presented_frames.clone(),
                 wait: presenter.resize_frame_wait.clone(),
-            }
-        })
+            })
     }
 
     pub(crate) fn arm_resize_frame_wait(&mut self) {
@@ -1710,6 +1724,7 @@ impl MetalRenderer {
                             .presentation_feedback_callback
                             .clone(),
                         latest_display_timing: presenter.latest_display_timing.clone(),
+                        committed_display_timing: None,
                         ready_time: scheduler::Instant::now(),
                         buffer_index,
                         buffer_damage: buffer.damage.clone(),
@@ -1727,8 +1742,8 @@ impl MetalRenderer {
                         .lock()
                         .push(submission_order, Box::new(presented_frame));
                     let instance_buffer = Cell::new(Some(instance_buffer));
-                    let block =
-                        ConcreteBlock::new(move |command_buffer: &metal::CommandBufferRef| {
+                    let block = ConcreteBlock::new(
+                        move |command_buffer: &metal::CommandBufferRef| {
                             if let Some(instance_buffer) = instance_buffer.take() {
                                 instance_buffer_pool.lock().release(instance_buffer);
                             }
@@ -1743,11 +1758,12 @@ impl MetalRenderer {
                             // queue lock is safe from any thread.
                             if status == MTLCommandBufferStatus::Completed {
                                 let ready_time = scheduler::Instant::now();
-                                let marked = presented_frames
-                                    .lock()
-                                    .mark_ready_with(submission_order, |frame| {
+                                let marked = presented_frames.lock().mark_ready_with(
+                                    submission_order,
+                                    |frame| {
                                         frame.ready_time = ready_time;
-                                    });
+                                    },
+                                );
                                 if !marked {
                                     log::error!(
                                         "completed IOSurface submission {} was not found in the presentation queue",
@@ -1789,16 +1805,15 @@ impl MetalRenderer {
                                 // run on the main thread because they mutate the
                                 // CoreAnimation layer tree.
                                 let presented_frames = presented_frames.clone();
-                                let context = Box::into_raw(Box::new(presented_frames))
-                                    as *mut c_void;
+                                let context =
+                                    Box::into_raw(Box::new(presented_frames)) as *mut c_void;
                                 unsafe {
-                                    dispatch2::DispatchQueue::main().exec_async_f(
-                                        context,
-                                        commit_ready_iosurface_frame_async,
-                                    );
+                                    dispatch2::DispatchQueue::main()
+                                        .exec_async_f(context, commit_ready_iosurface_frame_async);
                                 }
                             }
-                        });
+                        },
+                    );
                     let block = block.copy();
                     command_buffer.add_completed_handler(&block);
                     command_buffer.commit();
@@ -3279,6 +3294,67 @@ mod tests {
         assert!(!iosurface_backpressure_fence_is_signaled(1, 2));
         assert!(iosurface_backpressure_fence_is_signaled(2, 2));
         assert!(iosurface_backpressure_fence_is_signaled(3, 2));
+    }
+
+    #[test]
+    fn iosurface_display_timing_reports_target_latch() {
+        let display_time = scheduler::Instant::now() + Duration::from_millis(16);
+        let display_timing = FrameDisplayTiming {
+            next_display_time: display_time,
+            frame_interval: Some(Duration::from_millis(16)),
+        };
+
+        assert_eq!(
+            display_timing.target_latch_time(),
+            Some(display_time - IOSURFACE_LATCH_BUFFER)
+        );
+    }
+
+    #[test]
+    fn iosurface_feedback_uses_committed_display_timing() {
+        let ready_time = scheduler::Instant::now();
+        let display_time = ready_time + Duration::from_millis(16);
+        let latch_time = display_time - Duration::from_millis(2);
+        let display_timing = FrameDisplayTiming {
+            next_display_time: display_time,
+            frame_interval: Some(Duration::from_millis(16)),
+        };
+
+        let feedback =
+            presentation_feedback_for_iosurface_frame(ready_time, latch_time, Some(display_timing));
+
+        assert_eq!(feedback.ready_time, ready_time);
+        assert_eq!(feedback.latch_time, latch_time);
+        assert_eq!(feedback.display_time, display_time);
+        assert_eq!(
+            feedback.target_latch_time,
+            display_timing.target_latch_time()
+        );
+        assert_eq!(feedback.interval, Some(Duration::from_millis(16)));
+        assert!(feedback.presented);
+        assert!(feedback.vsync);
+        assert!(feedback.hardware_completion);
+    }
+
+    #[test]
+    fn iosurface_feedback_advances_display_time_after_missed_latch() {
+        let ready_time = scheduler::Instant::now();
+        let first_display_time = ready_time + Duration::from_millis(16);
+        let frame_interval = Duration::from_millis(16);
+        let latch_time = first_display_time - Duration::from_micros(500);
+        let display_timing = FrameDisplayTiming {
+            next_display_time: first_display_time,
+            frame_interval: Some(frame_interval),
+        };
+
+        let feedback =
+            presentation_feedback_for_iosurface_frame(ready_time, latch_time, Some(display_timing));
+
+        assert_eq!(feedback.display_time, first_display_time + frame_interval);
+        assert_eq!(
+            feedback.target_latch_time,
+            Some(first_display_time - IOSURFACE_LATCH_BUFFER)
+        );
     }
 
     #[test]

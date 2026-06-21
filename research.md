@@ -499,15 +499,42 @@ ZED_MACOS_LEGACY_METAL_LAYER=1 cargo run -p zed
 **Scheduler-visible presentation feedback**
 
 - GPUI now has a `PresentationFeedback` platform callback with Chromium-like
-  fields: `ready_time`, `latch_time`, `display_time`, `interval`, `presented`,
-  `vsync`, and `hardware_completion`.
+  fields: `ready_time`, `latch_time`, `display_time`, `target_latch_time`,
+  `interval`, `presented`, `vsync`, and `hardware_completion`.
 - The macOS renderer reports feedback from both paths:
   - legacy `CAMetalLayer`: via `MTLDrawable.addPresentedHandler`, converting
     the drawable's CoreAnimation `presentedTime` into `scheduler::Instant`;
   - Chromium pipeline `CALayer`/IOSurface path: records GPU-ready time when the
     Metal command buffer completes, uses the main-thread `CALayer.contents`
-    transaction as latch time, and estimates display time from the latest
-    display-link target timestamp using Chromium's 1.5 ms latch-buffer model.
+    transaction as latch time, and estimates display time from the display-link
+    timing captured on the IOSurface frame at the CA commit point using
+    Chromium's 1.5 ms latch-buffer model.
+- IOSurface presentation feedback is now frame-local instead of reading a
+  mutable "latest display timing" slot when the callback fires. The display-link
+  timing that releases the CA commit is frozen onto the `PresentedIosurfaceFrame`,
+  and the feedback's `target_latch_time` is computed from that frame's targeted
+  display-link latch window. This closes a scheduler feedback hazard
+  where backlog, resize waits, or a later display-link tick could make a
+  committed frame look like it missed a different latch window and push GPUI
+  into unnecessarily immediate/choppy follow-up scheduling.
+- GPUI now has a local equivalent of Chromium's
+  `pending_presentation_group_timings_`. When a platform swap is actually
+  submitted, the scheduler records the BeginFrame frame time, interval, and
+  target latch window for that presentation group. When presentation feedback
+  arrives, GPUI pops the oldest pending group and uses it to fill missing
+  target-latch or interval metadata before updating scheduler pacing. This
+  mirrors Chromium's `Display::PresentationGroupTiming` handoff from
+  `DrawAndSwap()` to `DidReceivePresentationFeedback()` and makes the feedback
+  loop scheduler-owned instead of relying only on platform callbacks to carry
+  every field.
+- The pending presentation group selection now mirrors Chromium's
+  `kSelectFutureFrameDeadline` shape for the local single-deadline source:
+  if a new swap would reuse a latch target that has already been targeted, or
+  if the target latch is already in the past, GPUI advances the group by the
+  retained refresh interval until it targets the next available future latch.
+  This prevents multiple queued swaps from all being accounted against the same
+  latch window, which is one of Chromium's explicit protections against
+  pipeline backlog turning into misleading presentation feedback.
 - The IOSurface path now preserves Chromium's callback ordering at the local
   CA layer-tree commit point: swap completion is delivered first, then
   presentation feedback is delivered with ready/latch/display timestamps. This
@@ -528,13 +555,15 @@ ZED_MACOS_LEGACY_METAL_LAYER=1 cargo run -p zed
   first scheduler-level replacement for Zed's old "draw submitted means frame
   complete" model.
 - GPUI now also feeds presentation feedback back into deadline selection. If a
-  presented frame's GPU-ready time lands after the target latch window
-  (`display_time - 1.5 ms`, matching the Chromium mac latch-buffer model), the
-  next dirty BeginFrame is treated like a missed deadline and takes the
-  `IMMEDIATE` path instead of waiting for the regular delayed draw deadline.
-  This mirrors Chromium's `DisplayScheduler::OnPresentationFeedback()` check
-  for `ready_timestamp > target_latch_time`, adapted to Zed's local
-  display-link display-time estimate.
+  presented frame's GPU-ready time lands after the platform-provided target
+  latch window, the next dirty BeginFrame is treated like a missed deadline and
+  takes the `IMMEDIATE` path instead of waiting for the regular delayed draw
+  deadline. When the platform cannot provide a target latch timestamp, GPUI
+  falls back to `display_time - 1.5 ms`, matching the Chromium mac latch-buffer
+  model. This mirrors Chromium's
+  `DisplayScheduler::OnPresentationFeedback()` check for
+  `ready_timestamp > target_latch_time`, adapted to Zed's local display-link
+  display-time estimate.
 - GPUI now retains the last valid scheduler frame interval from explicit
   BeginFrame/request metadata and from `PresentationFeedback.interval`, using
   that retained interval as the scheduler fallback when a platform frame request
@@ -864,9 +893,11 @@ This is not a full Chromium architecture clone. It does **not** add:
   intentionally submit full-frame damage.
 
 The important practical point: the resource handoff and the scheduler feedback
-surface now both exist. The remaining work is tightening timestamp quality and
-aligning frame production with that feedback, not just swapping the present
-resource.
+surface now both exist, and IOSurface feedback is attached to the frame-local
+CA commit timing rather than a mutable latest display tick. The remaining work
+is aligning more of frame production with that feedback and validating the
+single-process estimates against Chromium/VS Code, not just swapping the
+present resource.
 
 ---
 
@@ -908,15 +939,18 @@ not have Chromium's full `BeginFrame` scheduler.
   scale factors. Those are the highest-risk CALayer integration edges.
 - **Presentation feedback accuracy.** The legacy `CAMetalLayer` path now uses
   `MTLDrawable.presentedTime`, and the CAContext/CALayerHost IOSurface path now
-  reports ready/latch/display/interval feedback using Chromium's display-link
-  latch estimate. The remaining gap is cross-process feedback semantics, not
-  simply adding a callback field.
+  reports ready/latch/display/target-latch/interval feedback from frame-local
+  CA commit timing using Chromium's display-link latch estimate. The remaining
+  gap is cross-process feedback semantics, not simply adding a callback field or
+  feeding a shared latest-timing slot into the scheduler.
 - **BeginFrame alignment.** GPUI now has BeginFrame ids, one-draw-per-frame
   tracking, adjusted draw deadlines, missed-deadline state, a
   WAIT_FOR_SCROLL-style scroll deadline, and demand-driven platform BeginFrame
   subscription. It now routes frame production through explicit `NONE` /
-  `BLOCKED` / `IMMEDIATE` / `REGULAR` / `LATE` / `WAIT_FOR_SCROLL` modes, but
-  still needs Chromium-style observer orchestration and richer scheduler state.
+  `BLOCKED` / `IMMEDIATE` / `REGULAR` / `LATE` / `WAIT_FOR_SCROLL` modes and
+  keeps a Chromium-style pending presentation timing queue with future-latch
+  target advancement, but still needs the full BeginFrame observer
+  orchestration and richer scheduler state.
 - **Damage regions.** The IOSurface queue now carries Chromium-style per-buffer
   accumulated damage and the Metal pass can load/scissor for partial redraws.
   GPUI now submits precise old/new clipped bounds for cached dirty views and

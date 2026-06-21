@@ -45,6 +45,7 @@ use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
     cmp,
+    collections::VecDeque,
     fmt::{Debug, Display},
     hash::{Hash, Hasher},
     marker::PhantomData,
@@ -1234,10 +1235,59 @@ fn presentation_feedback_missed_latch(feedback: crate::PresentationFeedback) -> 
         return false;
     }
 
-    let Some(target_latch_time) = feedback.display_time.checked_sub(LATCH_BUFFER) else {
+    let Some(target_latch_time) = feedback
+        .target_latch_time
+        .or_else(|| feedback.display_time.checked_sub(LATCH_BUFFER))
+    else {
         return false;
     };
     feedback.ready_time > target_latch_time
+}
+
+fn target_latch_time_for_display_time(display_time: Instant) -> Option<Instant> {
+    const LATCH_BUFFER: Duration = Duration::from_micros(1500);
+
+    display_time.checked_sub(LATCH_BUFFER)
+}
+
+fn presentation_group_timing_for_request(
+    request_frame_options: crate::RequestFrameOptions,
+    last_targeted_latch_time: Option<Instant>,
+    now: Instant,
+) -> PresentationGroupTiming {
+    let frame_time = request_frame_options
+        .begin_frame
+        .map(|begin_frame| begin_frame.frame_time);
+    let interval = explicit_frame_interval_for_request(request_frame_options);
+    let mut expected_display_time = predicted_display_time_for_request(request_frame_options);
+    let mut target_latch_time = expected_display_time.and_then(target_latch_time_for_display_time);
+
+    if let (Some(interval), Some(mut display_time), Some(mut latch_time)) =
+        (interval, expected_display_time, target_latch_time)
+    {
+        for _ in 0..240 {
+            let reuses_target = last_targeted_latch_time.is_some_and(|last| latch_time <= last);
+            if !reuses_target && latch_time >= now {
+                break;
+            }
+
+            display_time += interval;
+            let Some(next_latch_time) = target_latch_time_for_display_time(display_time) else {
+                break;
+            };
+            latch_time = next_latch_time;
+        }
+
+        expected_display_time = Some(display_time);
+        target_latch_time = Some(latch_time);
+    }
+
+    PresentationGroupTiming {
+        frame_time,
+        interval,
+        expected_display_time,
+        target_latch_time,
+    }
 }
 
 fn frame_interval_for_request(
@@ -1282,6 +1332,16 @@ struct FrameSchedulerState {
     presentation_missed_last_latch: Rc<Cell<bool>>,
     output_surface_lost: Rc<Cell<bool>>,
     draw_duration_estimate: Rc<Cell<Duration>>,
+    last_targeted_latch_time: Rc<Cell<Option<Instant>>>,
+    pending_presentation_groups: Rc<RefCell<VecDeque<PresentationGroupTiming>>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PresentationGroupTiming {
+    frame_time: Option<Instant>,
+    interval: Option<Duration>,
+    expected_display_time: Option<Instant>,
+    target_latch_time: Option<Instant>,
 }
 
 #[derive(Clone, Copy)]
@@ -1432,6 +1492,8 @@ impl Default for FrameSchedulerState {
             presentation_missed_last_latch: Rc::new(Cell::new(false)),
             output_surface_lost: Rc::new(Cell::new(false)),
             draw_duration_estimate: Rc::new(Cell::new(Duration::from_micros(1000))),
+            last_targeted_latch_time: Rc::new(Cell::new(None)),
+            pending_presentation_groups: Rc::new(RefCell::new(VecDeque::new())),
         }
     }
 }
@@ -1439,9 +1501,16 @@ impl Default for FrameSchedulerState {
 impl FrameSchedulerState {
     fn on_presentation_feedback(
         &self,
-        feedback: crate::PresentationFeedback,
+        mut feedback: crate::PresentationFeedback,
         input_rate_tracker: &Rc<RefCell<InputRateTracker>>,
     ) {
+        if let Some(presentation_group) = self.take_pending_presentation_group() {
+            feedback.target_latch_time = feedback
+                .target_latch_time
+                .or(presentation_group.target_latch_time);
+            feedback.interval = feedback.interval.or(presentation_group.interval);
+        }
+
         if feedback.presented {
             self.has_presentation_feedback.set(true);
             self.last_frame_time.set(Some(feedback.display_time));
@@ -1452,6 +1521,23 @@ impl FrameSchedulerState {
         }
         self.presentation_missed_last_latch
             .set(presentation_feedback_missed_latch(feedback));
+    }
+
+    fn record_pending_presentation_group(&self, request_frame_options: crate::RequestFrameOptions) {
+        let presentation_group = presentation_group_timing_for_request(
+            request_frame_options,
+            self.last_targeted_latch_time.get(),
+            Instant::now(),
+        );
+        self.last_targeted_latch_time
+            .set(presentation_group.target_latch_time);
+        self.pending_presentation_groups
+            .borrow_mut()
+            .push_back(presentation_group);
+    }
+
+    fn take_pending_presentation_group(&self) -> Option<PresentationGroupTiming> {
+        self.pending_presentation_groups.borrow_mut().pop_front()
     }
 
     fn update_frame_interval_from_request(
@@ -2524,6 +2610,7 @@ mod tests {
             ready_time: display_time - Duration::from_micros(1000),
             latch_time: display_time - Duration::from_micros(900),
             display_time,
+            target_latch_time: None,
             interval: Some(Duration::from_millis(16)),
             presented: true,
             vsync: true,
@@ -2540,6 +2627,7 @@ mod tests {
             ready_time: display_time - Duration::from_micros(2000),
             latch_time: display_time - Duration::from_micros(1900),
             display_time,
+            target_latch_time: None,
             interval: Some(Duration::from_millis(16)),
             presented: true,
             vsync: true,
@@ -2547,6 +2635,172 @@ mod tests {
         };
 
         assert!(!presentation_feedback_missed_latch(feedback));
+    }
+
+    #[test]
+    fn presentation_feedback_uses_platform_target_latch_time() {
+        let display_time = Instant::now() + Duration::from_millis(16);
+        let feedback = crate::PresentationFeedback {
+            ready_time: display_time - Duration::from_micros(2500),
+            latch_time: display_time - Duration::from_micros(2400),
+            display_time,
+            target_latch_time: Some(display_time - Duration::from_micros(3000)),
+            interval: Some(Duration::from_millis(16)),
+            presented: true,
+            vsync: true,
+            hardware_completion: true,
+        };
+
+        assert!(presentation_feedback_missed_latch(feedback));
+    }
+
+    #[test]
+    fn presentation_group_records_begin_frame_timing() {
+        let frame_scheduler = FrameSchedulerState::default();
+        let begin_frame = begin_frame_args(1);
+        let request_frame_options = crate::RequestFrameOptions {
+            begin_frame: Some(begin_frame),
+            ..Default::default()
+        };
+
+        frame_scheduler.record_pending_presentation_group(request_frame_options);
+
+        assert_eq!(
+            frame_scheduler.take_pending_presentation_group(),
+            Some(PresentationGroupTiming {
+                frame_time: Some(begin_frame.frame_time),
+                interval: Some(begin_frame.interval),
+                expected_display_time: Some(begin_frame.deadline),
+                target_latch_time: Some(begin_frame.deadline - Duration::from_micros(1500)),
+            })
+        );
+    }
+
+    #[test]
+    fn presentation_group_advances_duplicate_latch_targets() {
+        let frame_scheduler = FrameSchedulerState::default();
+        let begin_frame = begin_frame_args(1);
+        let request_frame_options = crate::RequestFrameOptions {
+            begin_frame: Some(begin_frame),
+            ..Default::default()
+        };
+
+        frame_scheduler.record_pending_presentation_group(request_frame_options);
+        frame_scheduler.record_pending_presentation_group(request_frame_options);
+
+        let first_group = frame_scheduler.take_pending_presentation_group().unwrap();
+        let second_group = frame_scheduler.take_pending_presentation_group().unwrap();
+        assert_eq!(
+            first_group.target_latch_time,
+            Some(begin_frame.deadline - Duration::from_micros(1500))
+        );
+        assert_eq!(
+            second_group.target_latch_time,
+            Some(begin_frame.deadline + begin_frame.interval - Duration::from_micros(1500))
+        );
+        assert_eq!(
+            second_group.expected_display_time,
+            Some(begin_frame.deadline + begin_frame.interval)
+        );
+    }
+
+    #[test]
+    fn presentation_group_advances_stale_latch_targets() {
+        let now = Instant::now();
+        let frame_time = now - Duration::from_millis(100);
+        let begin_frame = begin_frame_args_at(1, 1, frame_time);
+        let request_frame_options = crate::RequestFrameOptions {
+            begin_frame: Some(begin_frame),
+            ..Default::default()
+        };
+
+        let presentation_group =
+            presentation_group_timing_for_request(request_frame_options, None, now);
+
+        assert!(
+            presentation_group
+                .target_latch_time
+                .is_some_and(|target_latch_time| target_latch_time >= now)
+        );
+        assert!(
+            presentation_group
+                .expected_display_time
+                .unwrap_or(begin_frame.deadline)
+                > begin_frame.deadline
+        );
+    }
+
+    #[test]
+    fn presentation_feedback_uses_pending_group_when_platform_target_is_missing() {
+        let frame_scheduler = FrameSchedulerState::default();
+        let input_rate_tracker = Rc::new(RefCell::new(InputRateTracker::default()));
+        let begin_frame = begin_frame_args(1);
+        let request_frame_options = crate::RequestFrameOptions {
+            begin_frame: Some(begin_frame),
+            ..Default::default()
+        };
+        let target_latch_time = presentation_group_timing_for_request(
+            request_frame_options,
+            None,
+            begin_frame.frame_time,
+        )
+        .target_latch_time
+        .unwrap();
+
+        frame_scheduler.record_pending_presentation_group(request_frame_options);
+        frame_scheduler.on_presentation_feedback(
+            crate::PresentationFeedback {
+                ready_time: target_latch_time + Duration::from_micros(1),
+                latch_time: target_latch_time + Duration::from_micros(2),
+                display_time: begin_frame.deadline,
+                target_latch_time: None,
+                interval: None,
+                presented: true,
+                vsync: true,
+                hardware_completion: true,
+            },
+            &input_rate_tracker,
+        );
+
+        assert!(frame_scheduler.presentation_missed_last_latch.get());
+        assert_eq!(
+            frame_scheduler.last_frame_interval.get(),
+            Some(begin_frame.interval)
+        );
+        assert_eq!(frame_scheduler.take_pending_presentation_group(), None);
+    }
+
+    #[test]
+    fn presentation_feedback_prefers_platform_target_over_pending_group() {
+        let frame_scheduler = FrameSchedulerState::default();
+        let input_rate_tracker = Rc::new(RefCell::new(InputRateTracker::default()));
+        let begin_frame = begin_frame_args(1);
+        let request_frame_options = crate::RequestFrameOptions {
+            begin_frame: Some(begin_frame),
+            ..Default::default()
+        };
+        let platform_target_latch_time = begin_frame.deadline - Duration::from_micros(3000);
+
+        frame_scheduler.record_pending_presentation_group(request_frame_options);
+        frame_scheduler.on_presentation_feedback(
+            crate::PresentationFeedback {
+                ready_time: platform_target_latch_time + Duration::from_micros(1),
+                latch_time: platform_target_latch_time + Duration::from_micros(2),
+                display_time: begin_frame.deadline,
+                target_latch_time: Some(platform_target_latch_time),
+                interval: None,
+                presented: true,
+                vsync: true,
+                hardware_completion: true,
+            },
+            &input_rate_tracker,
+        );
+
+        assert!(frame_scheduler.presentation_missed_last_latch.get());
+        assert_eq!(
+            frame_scheduler.last_frame_interval.get(),
+            Some(begin_frame.interval)
+        );
     }
 
     #[test]
@@ -5015,13 +5269,18 @@ impl Window {
         true
     }
 
-    fn draw_and_present(&mut self, force_render: bool, cx: &mut App) -> crate::PlatformDrawResult {
+    fn draw_and_present(
+        &mut self,
+        request_frame_options: crate::RequestFrameOptions,
+        cx: &mut App,
+    ) -> crate::PlatformDrawResult {
+        let force_render = request_frame_options.force_render;
         if force_render {
             // Bypass cached view reuse so GPU recovery does not replay stale atlas tile references.
             self.refresh();
         }
         let arena_clear_needed = self.draw(cx);
-        let draw_result = self.present();
+        let draw_result = self.present(request_frame_options);
         arena_clear_needed.clear();
         draw_result
     }
@@ -5035,11 +5294,11 @@ impl Window {
         if self.invalidator.is_dirty() || request_frame_options.force_render {
             let started_at = Instant::now();
             let draw_result = measure("frame duration", || {
-                self.draw_and_present(request_frame_options.force_render, cx)
+                self.draw_and_present(request_frame_options, cx)
             });
             frame_production_result_for_draw_result(started_at, draw_result)
         } else if needs_present {
-            self.present();
+            self.present(request_frame_options);
             FrameProductionResult::PresentedWithoutDraw
         } else {
             FrameProductionResult::Idle
@@ -5239,7 +5498,10 @@ impl Window {
     }
 
     #[profiling::function]
-    fn present(&mut self) -> crate::PlatformDrawResult {
+    fn present(
+        &mut self,
+        request_frame_options: crate::RequestFrameOptions,
+    ) -> crate::PlatformDrawResult {
         if self.uses_platform_swap_completion {
             self.pending_platform_swaps = self.pending_platform_swaps.saturating_add(1);
         }
@@ -5248,6 +5510,12 @@ impl Window {
             && !matches!(draw_result, crate::PlatformDrawResult::Submitted)
         {
             self.pending_platform_swaps = self.pending_platform_swaps.saturating_sub(1);
+        }
+        if self.uses_platform_swap_completion
+            && matches!(draw_result, crate::PlatformDrawResult::Submitted)
+        {
+            self.frame_scheduler
+                .record_pending_presentation_group(request_frame_options);
         }
         #[cfg(feature = "input-latency-histogram")]
         self.input_latency_tracker.record_frame_presented();
@@ -5265,7 +5533,7 @@ impl Window {
     #[cfg(feature = "bench")]
     pub fn present_if_needed(&mut self) {
         if self.needs_present.get() {
-            self.present();
+            self.present(crate::RequestFrameOptions::default());
         }
     }
 

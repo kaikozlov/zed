@@ -657,6 +657,7 @@ pub struct PresentationFeedback {
     pub ready_time: Instant,
     pub latch_time: Instant,
     pub display_time: Instant,
+    pub target_latch_time: Option<Instant>,
     pub interval: Option<Duration>,
     pub presented: bool,
     pub vsync: bool,
