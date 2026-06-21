@@ -1078,7 +1078,6 @@ pub struct Window {
     pub(crate) needs_present: Rc<Cell<bool>>,
     uses_platform_swap_completion: bool,
     max_pending_platform_swaps: Option<u32>,
-    pending_platform_swaps: u32,
     gpu_busy_response_state: GpuBusyResponseState,
     pending_gpu_available_frame: Option<BeginFrameDeadlineRequest>,
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
@@ -1117,7 +1116,7 @@ pub(crate) struct InputRateTracker {
     timestamps: Vec<Instant>,
     window: Duration,
     inputs_per_second: u32,
-    last_used_begin_frame: Option<crate::BeginFrameArgs>,
+    observer_state: crate::BeginFrameObserverState,
     sustain_until: Instant,
     sustain_duration: Duration,
     last_scroll_input_at: Option<Instant>,
@@ -1135,7 +1134,7 @@ impl Default for InputRateTracker {
             timestamps: Vec::new(),
             window: Duration::from_millis(100),
             inputs_per_second: 60,
-            last_used_begin_frame: None,
+            observer_state: crate::BeginFrameObserverState::default(),
             sustain_until: Instant::now(),
             sustain_duration: Duration::from_secs(1),
             last_scroll_input_at: None,
@@ -1191,7 +1190,6 @@ impl InputRateTracker {
 
     pub fn observe_begin_frame_for_input(&mut self, begin_frame: crate::BeginFrameArgs) {
         self.set_frame_interval(begin_frame.interval);
-        self.last_used_begin_frame = Some(begin_frame);
     }
 
     pub fn record_scroll_input(&mut self) {
@@ -1219,12 +1217,18 @@ impl InputRateTracker {
 
 impl crate::BeginFrameObserver for InputRateTracker {
     fn on_begin_frame(&mut self, args: crate::BeginFrameArgs) -> bool {
-        self.observe_begin_frame_for_input(args);
+        if !self.observer_state.should_issue_begin_frame(&args, false) {
+            self.observer_state.record_begin_frame_result(args, false);
+            return false;
+        }
+
+        self.observe_begin_frame_for_input(args.clone());
+        self.observer_state.record_begin_frame_result(args, true);
         true
     }
 
     fn last_used_begin_frame(&self) -> Option<crate::BeginFrameArgs> {
-        self.last_used_begin_frame
+        self.observer_state.last_used_begin_frame()
     }
 }
 
@@ -1234,12 +1238,12 @@ fn duration_div(duration: Duration, divisor: u32) -> Duration {
     )
 }
 
-fn update_draw_duration_estimate(draw_duration_estimate: &Cell<Duration>, draw_duration: Duration) {
-    let previous_estimate = draw_duration_estimate.get();
+fn updated_draw_duration_estimate(
+    previous_estimate: Duration,
+    draw_duration: Duration,
+) -> Duration {
     let estimated_nanos = (previous_estimate.as_nanos() * 7 + draw_duration.as_nanos()) / 8;
-    draw_duration_estimate.set(Duration::from_nanos(
-        estimated_nanos.min(u128::from(u64::MAX)) as u64,
-    ));
+    Duration::from_nanos(estimated_nanos.min(u128::from(u64::MAX)) as u64)
 }
 
 fn presentation_feedback_missed_latch(feedback: crate::PresentationFeedback) -> bool {
@@ -1265,12 +1269,13 @@ fn target_latch_time_for_display_time(display_time: Instant) -> Option<Instant> 
 }
 
 fn presentation_group_timing_for_request(
-    request_frame_options: crate::RequestFrameOptions,
+    request_frame_options: &crate::RequestFrameOptions,
     last_targeted_latch_time: Option<Instant>,
     now: Instant,
 ) -> PresentationGroupTiming {
     let frame_time = request_frame_options
         .begin_frame
+        .as_ref()
         .map(|begin_frame| begin_frame.frame_time);
     let interval = explicit_frame_interval_for_request(request_frame_options);
     let mut expected_display_time = predicted_display_time_for_request(request_frame_options);
@@ -1305,11 +1310,12 @@ fn presentation_group_timing_for_request(
 }
 
 fn frame_interval_for_request(
-    request_frame_options: crate::RequestFrameOptions,
+    request_frame_options: &crate::RequestFrameOptions,
     last_frame_interval: Option<Duration>,
 ) -> Duration {
     request_frame_options
         .begin_frame
+        .as_ref()
         .map(|begin_frame| begin_frame.interval)
         .or(request_frame_options.frame_interval)
         .or(last_frame_interval)
@@ -1318,10 +1324,11 @@ fn frame_interval_for_request(
 }
 
 fn explicit_frame_interval_for_request(
-    request_frame_options: crate::RequestFrameOptions,
+    request_frame_options: &crate::RequestFrameOptions,
 ) -> Option<Duration> {
     request_frame_options
         .begin_frame
+        .as_ref()
         .map(|begin_frame| begin_frame.interval)
         .or(request_frame_options.frame_interval)
         .filter(|interval| !interval.is_zero())
@@ -1329,25 +1336,33 @@ fn explicit_frame_interval_for_request(
 
 #[derive(Clone)]
 struct FrameSchedulerState {
-    last_frame_time: Rc<Cell<Option<Instant>>>,
-    last_frame_interval: Rc<Cell<Option<Duration>>>,
-    has_presentation_feedback: Rc<Cell<bool>>,
-    current_begin_frame_id: Rc<Cell<Option<crate::BeginFrameId>>>,
-    current_begin_frame_args: Rc<Cell<Option<crate::BeginFrameArgs>>>,
-    current_begin_frame_options: Rc<Cell<Option<crate::RequestFrameOptions>>>,
-    current_begin_frame_deadline_request: Rc<Cell<Option<BeginFrameDeadlineRequest>>>,
-    drew_current_begin_frame: Rc<Cell<bool>>,
-    damage_reschedule_pending: Rc<Cell<bool>>,
-    needs_one_begin_frame: Rc<Cell<bool>>,
-    pending_begin_frame_deadline: Rc<Cell<Option<PendingBeginFrameDeadline>>>,
-    inside_begin_frame_deadline_interval: Rc<Cell<bool>>,
-    last_begin_frame_ack: Rc<Cell<Option<crate::BeginFrameAck>>>,
-    main_thread_missed_last_deadline: Rc<Cell<bool>>,
-    presentation_missed_last_latch: Rc<Cell<bool>>,
-    output_surface_lost: Rc<Cell<bool>>,
-    draw_duration_estimate: Rc<Cell<Duration>>,
-    last_targeted_latch_time: Rc<Cell<Option<Instant>>>,
-    pending_presentation_groups: Rc<RefCell<VecDeque<PresentationGroupTiming>>>,
+    inner: Rc<RefCell<FrameSchedulerData>>,
+}
+
+struct FrameSchedulerData {
+    last_frame_time: Option<Instant>,
+    last_frame_interval: Option<Duration>,
+    has_presentation_feedback: bool,
+    current_begin_frame_id: Option<crate::BeginFrameId>,
+    current_begin_frame_args: Option<crate::BeginFrameArgs>,
+    current_begin_frame_options: Option<crate::RequestFrameOptions>,
+    current_begin_frame_deadline_request: Option<BeginFrameDeadlineRequest>,
+    drew_current_begin_frame: bool,
+    damage_reschedule_pending: bool,
+    needs_draw: bool,
+    needs_one_begin_frame: bool,
+    pending_begin_frame_deadline: Option<PendingBeginFrameDeadline>,
+    inside_begin_frame_deadline_interval: bool,
+    last_begin_frame_ack: Option<crate::BeginFrameAck>,
+    main_thread_missed_last_deadline: bool,
+    presentation_missed_last_latch: bool,
+    visible: bool,
+    output_surface_lost: bool,
+    pending_swaps: u32,
+    observing_begin_frame_source: bool,
+    draw_duration_estimate: Duration,
+    last_targeted_latch_time: Option<Instant>,
+    pending_presentation_groups: VecDeque<PresentationGroupTiming>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1358,20 +1373,20 @@ struct PresentationGroupTiming {
     target_latch_time: Option<Instant>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct PendingBeginFrameDeadline {
     id: crate::BeginFrameId,
     deadline: Instant,
     request: BeginFrameDeadlineRequest,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct BeginFrameDeadlineRequest {
     options: crate::RequestFrameOptions,
     needs_present: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum BeginFrameContinuation {
     Older,
     Current,
@@ -1397,7 +1412,7 @@ enum GpuBusyResponseState {
     Throttled,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum GpuAvailableWake {
     ReplayFrame(BeginFrameDeadlineRequest),
     RescheduleDeadline(BeginFrameDeadlineRequest),
@@ -1486,28 +1501,40 @@ fn needs_swap_completion_scheduler_wake(state: BeginFrameSubscriptionState) -> b
             || (state.active && state.keep_frame_source_active))
 }
 
+impl Default for FrameSchedulerData {
+    fn default() -> Self {
+        Self {
+            last_frame_time: None,
+            last_frame_interval: None,
+            has_presentation_feedback: false,
+            current_begin_frame_id: None,
+            current_begin_frame_args: None,
+            current_begin_frame_options: None,
+            current_begin_frame_deadline_request: None,
+            drew_current_begin_frame: false,
+            damage_reschedule_pending: false,
+            needs_draw: true,
+            needs_one_begin_frame: false,
+            pending_begin_frame_deadline: None,
+            inside_begin_frame_deadline_interval: false,
+            last_begin_frame_ack: None,
+            main_thread_missed_last_deadline: false,
+            presentation_missed_last_latch: false,
+            visible: true,
+            output_surface_lost: false,
+            pending_swaps: 0,
+            observing_begin_frame_source: false,
+            draw_duration_estimate: Duration::from_micros(1000),
+            last_targeted_latch_time: None,
+            pending_presentation_groups: VecDeque::new(),
+        }
+    }
+}
+
 impl Default for FrameSchedulerState {
     fn default() -> Self {
         Self {
-            last_frame_time: Rc::new(Cell::new(None)),
-            last_frame_interval: Rc::new(Cell::new(None)),
-            has_presentation_feedback: Rc::new(Cell::new(false)),
-            current_begin_frame_id: Rc::new(Cell::new(None)),
-            current_begin_frame_args: Rc::new(Cell::new(None)),
-            current_begin_frame_options: Rc::new(Cell::new(None)),
-            current_begin_frame_deadline_request: Rc::new(Cell::new(None)),
-            drew_current_begin_frame: Rc::new(Cell::new(false)),
-            damage_reschedule_pending: Rc::new(Cell::new(false)),
-            needs_one_begin_frame: Rc::new(Cell::new(false)),
-            pending_begin_frame_deadline: Rc::new(Cell::new(None)),
-            inside_begin_frame_deadline_interval: Rc::new(Cell::new(false)),
-            last_begin_frame_ack: Rc::new(Cell::new(None)),
-            main_thread_missed_last_deadline: Rc::new(Cell::new(false)),
-            presentation_missed_last_latch: Rc::new(Cell::new(false)),
-            output_surface_lost: Rc::new(Cell::new(false)),
-            draw_duration_estimate: Rc::new(Cell::new(Duration::from_micros(1000))),
-            last_targeted_latch_time: Rc::new(Cell::new(None)),
-            pending_presentation_groups: Rc::new(RefCell::new(VecDeque::new())),
+            inner: Rc::new(RefCell::new(FrameSchedulerData::default())),
         }
     }
 }
@@ -1526,41 +1553,50 @@ impl FrameSchedulerState {
         }
 
         if feedback.presented {
-            self.has_presentation_feedback.set(true);
-            self.last_frame_time.set(Some(feedback.display_time));
             if let Some(interval) = feedback.interval.filter(|interval| !interval.is_zero()) {
-                self.last_frame_interval.set(Some(interval));
                 input_rate_tracker.borrow_mut().set_frame_interval(interval);
+                let mut state = self.inner.borrow_mut();
+                state.has_presentation_feedback = true;
+                state.last_frame_time = Some(feedback.display_time);
+                state.last_frame_interval = Some(interval);
+            } else {
+                let mut state = self.inner.borrow_mut();
+                state.has_presentation_feedback = true;
+                state.last_frame_time = Some(feedback.display_time);
             }
         }
-        self.presentation_missed_last_latch
-            .set(presentation_feedback_missed_latch(feedback));
+        self.inner.borrow_mut().presentation_missed_last_latch =
+            presentation_feedback_missed_latch(feedback);
     }
 
     fn record_pending_presentation_group(&self, request_frame_options: crate::RequestFrameOptions) {
+        let last_targeted_latch_time = self.inner.borrow().last_targeted_latch_time;
         let presentation_group = presentation_group_timing_for_request(
-            request_frame_options,
-            self.last_targeted_latch_time.get(),
+            &request_frame_options,
+            last_targeted_latch_time,
             Instant::now(),
         );
-        self.last_targeted_latch_time
-            .set(presentation_group.target_latch_time);
-        self.pending_presentation_groups
-            .borrow_mut()
+        let mut state = self.inner.borrow_mut();
+        state.last_targeted_latch_time = presentation_group.target_latch_time;
+        state
+            .pending_presentation_groups
             .push_back(presentation_group);
     }
 
     fn take_pending_presentation_group(&self) -> Option<PresentationGroupTiming> {
-        self.pending_presentation_groups.borrow_mut().pop_front()
+        self.inner
+            .borrow_mut()
+            .pending_presentation_groups
+            .pop_front()
     }
 
     fn update_frame_interval_from_request(
         &self,
-        request_frame_options: crate::RequestFrameOptions,
+        request_frame_options: &crate::RequestFrameOptions,
         input_rate_tracker: &Rc<RefCell<InputRateTracker>>,
     ) {
         if let Some(frame_interval) = explicit_frame_interval_for_request(request_frame_options) {
-            self.last_frame_interval.set(Some(frame_interval));
+            self.inner.borrow_mut().last_frame_interval = Some(frame_interval);
             input_rate_tracker
                 .borrow_mut()
                 .set_frame_interval(frame_interval);
@@ -1569,65 +1605,150 @@ impl FrameSchedulerState {
 
     fn frame_interval_for_request(
         &self,
-        request_frame_options: crate::RequestFrameOptions,
+        request_frame_options: &crate::RequestFrameOptions,
     ) -> Duration {
-        frame_interval_for_request(request_frame_options, self.last_frame_interval.get())
+        frame_interval_for_request(request_frame_options, self.last_frame_interval())
     }
 
     fn deadline_was_missed(&self) -> bool {
-        self.main_thread_missed_last_deadline.get() || self.presentation_missed_last_latch.get()
+        let state = self.inner.borrow();
+        state.main_thread_missed_last_deadline || state.presentation_missed_last_latch
     }
 
-    fn update_draw_duration_estimate(&self, draw_duration: Duration) {
-        update_draw_duration_estimate(&self.draw_duration_estimate, draw_duration);
+    fn should_draw(&self, force_render: bool) -> bool {
+        let state = self.inner.borrow();
+        (state.needs_draw || force_render) && !state.output_surface_lost && state.visible
+    }
+
+    fn needs_draw_for_request(&self, force_render: bool) -> bool {
+        let state = self.inner.borrow();
+        state.needs_draw || force_render
+    }
+
+    fn set_needs_draw(&self) {
+        self.inner.borrow_mut().needs_draw = true;
+    }
+
+    fn did_draw(&self) {
+        self.inner.borrow_mut().needs_draw = false;
+    }
+
+    fn set_visible(&self, visible: bool) -> bool {
+        let mut state = self.inner.borrow_mut();
+        if state.visible == visible {
+            return false;
+        }
+
+        state.visible = visible;
+        true
+    }
+
+    fn visible(&self) -> bool {
+        self.inner.borrow().visible
     }
 
     fn output_surface_lost(&self) -> bool {
-        self.output_surface_lost.get()
+        self.inner.borrow().output_surface_lost
     }
 
-    fn mark_output_surface_lost(&self) {
-        self.output_surface_lost.set(true);
+    fn output_surface_lost_transition(&self) {
+        self.inner.borrow_mut().output_surface_lost = true;
     }
 
     fn recover_output_surface(&self) {
-        self.output_surface_lost.set(false);
+        self.inner.borrow_mut().output_surface_lost = false;
     }
 
+    #[cfg(test)]
     fn inside_begin_frame_deadline_interval(&self) -> bool {
-        self.inside_begin_frame_deadline_interval.get()
+        self.inner.borrow().inside_begin_frame_deadline_interval
     }
 
     fn needs_one_begin_frame(&self) -> bool {
-        self.needs_one_begin_frame.get()
+        self.inner.borrow().needs_one_begin_frame
+    }
+
+    fn needs_draw(&self) -> bool {
+        self.inner.borrow().needs_draw
+    }
+
+    fn pending_swaps(&self) -> u32 {
+        self.inner.borrow().pending_swaps
+    }
+
+    fn did_submit_swap(&self) {
+        let mut state = self.inner.borrow_mut();
+        state.pending_swaps = state.pending_swaps.saturating_add(1);
+    }
+
+    fn did_receive_swap_buffers_ack(&self) {
+        let mut state = self.inner.borrow_mut();
+        state.pending_swaps = state.pending_swaps.saturating_sub(1);
+    }
+
+    fn swap_submission_failed_or_skipped(&self) {
+        self.did_receive_swap_buffers_ack();
+    }
+
+    fn platform_swap_backpressured(&self, max_pending_swaps: Option<u32>) -> bool {
+        max_pending_swaps.is_some_and(|max_pending_swaps| self.pending_swaps() >= max_pending_swaps)
+    }
+
+    #[cfg(test)]
+    fn observing_begin_frame_source(&self) -> bool {
+        self.inner.borrow().observing_begin_frame_source
+    }
+
+    fn start_observing_begin_frames(&self) -> bool {
+        let mut state = self.inner.borrow_mut();
+        if state.observing_begin_frame_source {
+            return false;
+        }
+
+        state.observing_begin_frame_source = true;
+        true
+    }
+
+    fn stop_observing_begin_frames(&self) -> bool {
+        let mut state = self.inner.borrow_mut();
+        if !state.observing_begin_frame_source {
+            return false;
+        }
+
+        state.observing_begin_frame_source = false;
+        true
     }
 
     fn set_needs_one_begin_frame(&self) {
-        self.needs_one_begin_frame.set(true);
+        self.inner.borrow_mut().needs_one_begin_frame = true;
     }
 
     fn consume_one_begin_frame_request(&self) {
-        self.needs_one_begin_frame.set(false);
+        self.inner.borrow_mut().needs_one_begin_frame = false;
     }
 
     fn begin_frame_continuation(
         &self,
         begin_frame: crate::BeginFrameArgs,
     ) -> BeginFrameContinuation {
-        if begin_frame_is_older(self.current_begin_frame_args.get(), begin_frame) {
+        let state = self.inner.borrow();
+        if begin_frame_is_older(state.current_begin_frame_args.as_ref(), &begin_frame) {
             return BeginFrameContinuation::Older;
         }
 
-        if self.current_begin_frame_id.get() == Some(begin_frame.id) {
+        if state.current_begin_frame_id == Some(begin_frame.id) {
             return BeginFrameContinuation::Current;
         }
 
         BeginFrameContinuation::New {
-            pending_deadline_request: if self.inside_begin_frame_deadline_interval()
-                && !self.drew_current_begin_frame.get()
+            pending_deadline_request: if state.inside_begin_frame_deadline_interval
+                && !state.drew_current_begin_frame
             {
-                self.pending_begin_frame_deadline_request()
-                    .or(self.current_begin_frame_deadline_request.get())
+                state
+                    .pending_begin_frame_deadline
+                    .clone()
+                    .map(|pending_deadline| pending_deadline.request)
+                    .or(state.current_begin_frame_deadline_request.clone())
             } else {
                 None
             },
@@ -1649,33 +1770,35 @@ impl FrameSchedulerState {
         presentation_deadline: Option<Instant>,
     ) {
         let draw_duration = draw_finished_at.saturating_duration_since(draw_started_at);
-        self.update_draw_duration_estimate(draw_duration);
-        self.drew_current_begin_frame.set(true);
+        let mut state = self.inner.borrow_mut();
+        state.draw_duration_estimate =
+            updated_draw_duration_estimate(state.draw_duration_estimate, draw_duration);
+        state.drew_current_begin_frame = true;
         if let Some(presentation_deadline) = presentation_deadline {
-            self.main_thread_missed_last_deadline
-                .set(draw_finished_at > presentation_deadline);
+            state.main_thread_missed_last_deadline = draw_finished_at > presentation_deadline;
         }
     }
 
     fn finish_begin_frame_without_draw(&self) {
-        self.main_thread_missed_last_deadline.set(false);
+        self.inner.borrow_mut().main_thread_missed_last_deadline = false;
     }
 
-    fn begin_frame_deadline_started(&self, request_frame_options: crate::RequestFrameOptions) {
+    fn begin_frame_deadline_started(&self, request_frame_options: &crate::RequestFrameOptions) {
         if request_frame_options.begin_frame.is_some() {
-            self.inside_begin_frame_deadline_interval.set(false);
-            self.damage_reschedule_pending.set(false);
-            self.clear_pending_begin_frame_deadline();
+            let mut state = self.inner.borrow_mut();
+            state.inside_begin_frame_deadline_interval = false;
+            state.damage_reschedule_pending = false;
+            state.pending_begin_frame_deadline = None;
         }
     }
 
     fn finish_begin_frame_production(
         &self,
-        request_frame_options: crate::RequestFrameOptions,
+        request_frame_options: &crate::RequestFrameOptions,
         presentation_deadline: Option<Instant>,
         production_result: FrameProductionResult,
     ) -> Option<crate::BeginFrameAck> {
-        let Some(begin_frame) = request_frame_options.begin_frame else {
+        let Some(begin_frame) = request_frame_options.begin_frame.as_ref() else {
             return None;
         };
 
@@ -1690,7 +1813,7 @@ impl FrameSchedulerState {
                 }
             ),
         };
-        self.last_begin_frame_ack.set(Some(ack));
+        self.inner.borrow_mut().last_begin_frame_ack = Some(ack);
 
         match production_result {
             FrameProductionResult::Drawn { started_at, .. } => {
@@ -1705,8 +1828,10 @@ impl FrameSchedulerState {
     }
 
     fn pending_begin_frame_deadline_request(&self) -> Option<BeginFrameDeadlineRequest> {
-        self.pending_begin_frame_deadline
-            .get()
+        self.inner
+            .borrow()
+            .pending_begin_frame_deadline
+            .clone()
             .map(|pending_deadline| pending_deadline.request)
     }
 
@@ -1716,9 +1841,10 @@ impl FrameSchedulerState {
         deadline: Instant,
         request: BeginFrameDeadlineRequest,
     ) -> bool {
-        if self
+        let mut state = self.inner.borrow_mut();
+        if state
             .pending_begin_frame_deadline
-            .get()
+            .as_ref()
             .is_some_and(|pending_deadline| {
                 pending_deadline.id == begin_frame_id && pending_deadline.deadline == deadline
             })
@@ -1726,12 +1852,11 @@ impl FrameSchedulerState {
             return false;
         }
 
-        self.pending_begin_frame_deadline
-            .set(Some(PendingBeginFrameDeadline {
-                id: begin_frame_id,
-                deadline,
-                request,
-            }));
+        state.pending_begin_frame_deadline = Some(PendingBeginFrameDeadline {
+            id: begin_frame_id,
+            deadline,
+            request,
+        });
         true
     }
 
@@ -1740,73 +1865,131 @@ impl FrameSchedulerState {
         begin_frame_id: crate::BeginFrameId,
         deadline: Instant,
     ) -> Option<BeginFrameDeadlineRequest> {
-        let pending_deadline = self.pending_begin_frame_deadline.get()?;
+        let mut state = self.inner.borrow_mut();
+        let pending_deadline = state.pending_begin_frame_deadline.clone()?;
         if pending_deadline.id != begin_frame_id || pending_deadline.deadline != deadline {
             return None;
         }
 
-        self.pending_begin_frame_deadline.set(None);
+        state.pending_begin_frame_deadline = None;
         Some(pending_deadline.request)
     }
 
-    fn clear_pending_begin_frame_deadline(&self) {
-        self.pending_begin_frame_deadline.set(None);
-    }
-
     fn accept_begin_frame_request(&self, request_frame_options: crate::RequestFrameOptions) {
-        let Some(begin_frame) = request_frame_options.begin_frame else {
+        let Some(begin_frame) = request_frame_options.begin_frame.as_ref() else {
             return;
         };
 
-        self.damage_reschedule_pending.set(false);
-        self.current_begin_frame_id.set(Some(begin_frame.id));
-        self.current_begin_frame_args.set(Some(begin_frame));
-        self.current_begin_frame_options
-            .set(Some(request_frame_options));
-        self.current_begin_frame_deadline_request
-            .set(Some(BeginFrameDeadlineRequest {
-                options: request_frame_options,
-                needs_present: request_frame_options.require_presentation,
-            }));
-        self.drew_current_begin_frame.set(false);
-        self.inside_begin_frame_deadline_interval.set(true);
-        self.clear_pending_begin_frame_deadline();
+        let mut state = self.inner.borrow_mut();
+        state.damage_reschedule_pending = false;
+        state.current_begin_frame_id = Some(begin_frame.id);
+        state.current_begin_frame_args = Some(begin_frame.clone());
+        state.current_begin_frame_options = Some(request_frame_options.clone());
+        state.current_begin_frame_deadline_request = Some(BeginFrameDeadlineRequest {
+            options: request_frame_options.clone(),
+            needs_present: request_frame_options.require_presentation,
+        });
+        state.drew_current_begin_frame = false;
+        state.inside_begin_frame_deadline_interval = true;
+        state.pending_begin_frame_deadline = None;
     }
 
     fn set_current_begin_frame_deadline_request(&self, request: BeginFrameDeadlineRequest) {
         if request.options.begin_frame.is_some() {
-            self.damage_reschedule_pending.set(false);
-            self.current_begin_frame_deadline_request.set(Some(request));
+            let mut state = self.inner.borrow_mut();
+            state.damage_reschedule_pending = false;
+            state.current_begin_frame_deadline_request = Some(request);
         }
     }
 
     fn damage_reschedule_deadline_request(&self) -> Option<BeginFrameDeadlineRequest> {
-        if !self.inside_begin_frame_deadline_interval()
-            || self.drew_current_begin_frame.get()
-            || self.damage_reschedule_pending.get()
+        let mut state = self.inner.borrow_mut();
+        if !state.inside_begin_frame_deadline_interval
+            || state.drew_current_begin_frame
+            || state.damage_reschedule_pending
         {
             return None;
         }
 
-        let request = self
-            .pending_begin_frame_deadline_request()
-            .or(self.current_begin_frame_deadline_request.get())?;
-        self.damage_reschedule_pending.set(true);
+        let request = state
+            .pending_begin_frame_deadline
+            .clone()
+            .map(|pending_deadline| pending_deadline.request)
+            .or(state.current_begin_frame_deadline_request.clone())?;
+        state.damage_reschedule_pending = true;
         Some(request)
     }
 
     fn force_immediate_deadline_request(&self) -> Option<BeginFrameDeadlineRequest> {
-        if !self.inside_begin_frame_deadline_interval() || self.drew_current_begin_frame.get() {
+        let mut state = self.inner.borrow_mut();
+        if !state.inside_begin_frame_deadline_interval || state.drew_current_begin_frame {
             return None;
         }
 
-        let request = self
-            .pending_begin_frame_deadline_request()
-            .or(self.current_begin_frame_deadline_request.get())?;
-        self.clear_pending_begin_frame_deadline();
-        self.damage_reschedule_pending.set(false);
+        let request = state
+            .pending_begin_frame_deadline
+            .clone()
+            .map(|pending_deadline| pending_deadline.request)
+            .or(state.current_begin_frame_deadline_request.clone())?;
+        state.pending_begin_frame_deadline = None;
+        state.damage_reschedule_pending = false;
         Some(request)
     }
+
+    fn last_frame_time(&self) -> Option<Instant> {
+        self.inner.borrow().last_frame_time
+    }
+
+    fn set_last_frame_time(&self, frame_time: Instant) {
+        self.inner.borrow_mut().last_frame_time = Some(frame_time);
+    }
+
+    fn has_presentation_feedback(&self) -> bool {
+        self.inner.borrow().has_presentation_feedback
+    }
+
+    fn current_begin_frame_id(&self) -> Option<crate::BeginFrameId> {
+        self.inner.borrow().current_begin_frame_id
+    }
+
+    fn current_begin_frame_args(&self) -> Option<crate::BeginFrameArgs> {
+        self.inner.borrow().current_begin_frame_args.clone()
+    }
+
+    fn drew_current_begin_frame(&self) -> bool {
+        self.inner.borrow().drew_current_begin_frame
+    }
+
+    fn draw_duration_estimate(&self) -> Duration {
+        self.inner.borrow().draw_duration_estimate
+    }
+
+    #[cfg(test)]
+    fn last_begin_frame_ack(&self) -> Option<crate::BeginFrameAck> {
+        self.inner.borrow().last_begin_frame_ack
+    }
+
+    #[cfg(test)]
+    fn main_thread_missed_last_deadline(&self) -> bool {
+        self.inner.borrow().main_thread_missed_last_deadline
+    }
+
+    #[cfg(test)]
+    fn presentation_missed_last_latch(&self) -> bool {
+        self.inner.borrow().presentation_missed_last_latch
+    }
+
+    fn last_frame_interval(&self) -> Option<Duration> {
+        self.inner.borrow().last_frame_interval
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DesiredBeginFrameDeadlineMode {
+    None,
+    Immediate,
+    Regular,
+    Late,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1819,6 +2002,117 @@ enum BeginFrameDeadlineMode {
     WaitForScroll,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DesiredBeginFrameDeadlineModeInput {
+    has_begin_frame: bool,
+    should_draw: bool,
+    force_render: bool,
+    needs_present: bool,
+    deadline_was_missed: bool,
+    swap_backpressured: bool,
+    supports_delayed_begin_frame_scheduling: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AdjustedBeginFrameDeadlineModeInput {
+    desired_mode: DesiredBeginFrameDeadlineMode,
+    should_draw: bool,
+    active: bool,
+    should_wait_for_scroll: bool,
+    draw_already_performed: bool,
+    output_surface_lost: bool,
+}
+
+/// Mirrors Chromium's `DisplayScheduler::DesiredBeginFrameDeadlineMode`
+/// (`components/viz/service/display/display_scheduler.cc:610-661`) and
+/// `BeginFrameDeadlineMode` semantics
+/// (`components/viz/service/display/display_scheduler.h:117-137`). Zed's
+/// `has_begin_frame` and delayed-scheduling guards are local single-process
+/// additions that keep legacy non-BeginFrame request paths explicit.
+fn desired_begin_frame_deadline_mode_transition(
+    input: DesiredBeginFrameDeadlineModeInput,
+) -> DesiredBeginFrameDeadlineMode {
+    match (
+        input.has_begin_frame,
+        input.supports_delayed_begin_frame_scheduling,
+        input.swap_backpressured && (input.should_draw || input.needs_present),
+        input.should_draw,
+        input.force_render || input.deadline_was_missed,
+    ) {
+        (false, _, _, _, _) => DesiredBeginFrameDeadlineMode::None,
+        (_, false, _, _, _) => DesiredBeginFrameDeadlineMode::Immediate,
+        (_, _, true, _, _) => DesiredBeginFrameDeadlineMode::Late,
+        (_, _, _, false, _) => DesiredBeginFrameDeadlineMode::Late,
+        (_, _, _, _, true) => DesiredBeginFrameDeadlineMode::Immediate,
+        _ => DesiredBeginFrameDeadlineMode::Regular,
+    }
+}
+
+fn desired_begin_frame_deadline_mode(
+    begin_frame: Option<crate::BeginFrameArgs>,
+    should_draw: bool,
+    force_render: bool,
+    needs_present: bool,
+    deadline_was_missed: bool,
+    swap_backpressured: bool,
+    supports_delayed_begin_frame_scheduling: bool,
+) -> DesiredBeginFrameDeadlineMode {
+    desired_begin_frame_deadline_mode_transition(DesiredBeginFrameDeadlineModeInput {
+        has_begin_frame: begin_frame.is_some(),
+        should_draw,
+        force_render,
+        needs_present,
+        deadline_was_missed,
+        swap_backpressured,
+        supports_delayed_begin_frame_scheduling,
+    })
+}
+
+/// Mirrors Chromium's `DisplayScheduler::AdjustedBeginFrameDeadlineMode`
+/// (`components/viz/service/display/display_scheduler.cc:594-606`). Zed's
+/// `Blocked` mode is the local analog of GPU-busy/duplicate-draw parking, and
+/// `WaitForScroll` is the local scroll-deadline adjustment used until Phase 3
+/// ports Chromium's deadline decider.
+fn adjusted_begin_frame_deadline_mode_transition(
+    input: AdjustedBeginFrameDeadlineModeInput,
+) -> BeginFrameDeadlineMode {
+    match (
+        input.output_surface_lost,
+        input.should_draw && input.draw_already_performed,
+        input.desired_mode,
+        input.active && input.should_wait_for_scroll,
+    ) {
+        (true, _, _, _) => BeginFrameDeadlineMode::Immediate,
+        (_, true, _, _) => BeginFrameDeadlineMode::Blocked,
+        (_, _, DesiredBeginFrameDeadlineMode::None, _) => BeginFrameDeadlineMode::None,
+        (_, _, DesiredBeginFrameDeadlineMode::Immediate, _) => BeginFrameDeadlineMode::Immediate,
+        (_, _, DesiredBeginFrameDeadlineMode::Regular, true) => {
+            BeginFrameDeadlineMode::WaitForScroll
+        }
+        (_, _, DesiredBeginFrameDeadlineMode::Regular, false) => BeginFrameDeadlineMode::Regular,
+        (_, _, DesiredBeginFrameDeadlineMode::Late, _) => BeginFrameDeadlineMode::Late,
+    }
+}
+
+fn adjusted_begin_frame_deadline_mode(
+    desired_mode: DesiredBeginFrameDeadlineMode,
+    should_draw: bool,
+    active: bool,
+    should_wait_for_scroll: bool,
+    draw_already_performed: bool,
+    output_surface_lost: bool,
+) -> BeginFrameDeadlineMode {
+    adjusted_begin_frame_deadline_mode_transition(AdjustedBeginFrameDeadlineModeInput {
+        desired_mode,
+        should_draw,
+        active,
+        should_wait_for_scroll,
+        draw_already_performed,
+        output_surface_lost,
+    })
+}
+
+#[cfg(test)]
 fn begin_frame_deadline_mode(
     begin_frame: Option<crate::BeginFrameArgs>,
     should_draw: bool,
@@ -1832,44 +2126,28 @@ fn begin_frame_deadline_mode(
     output_surface_lost: bool,
     supports_delayed_begin_frame_scheduling: bool,
 ) -> BeginFrameDeadlineMode {
-    if begin_frame.is_none() {
-        return BeginFrameDeadlineMode::None;
-    }
-
-    if output_surface_lost {
-        return BeginFrameDeadlineMode::Immediate;
-    }
-
-    if should_draw && draw_already_performed {
-        return BeginFrameDeadlineMode::Blocked;
-    }
-
-    if !supports_delayed_begin_frame_scheduling {
-        return BeginFrameDeadlineMode::Immediate;
-    }
-
-    if swap_backpressured && (should_draw || needs_present) {
-        return BeginFrameDeadlineMode::Late;
-    }
-
-    if !should_draw {
-        return BeginFrameDeadlineMode::Late;
-    }
-
-    if force_render || deadline_was_missed {
-        return BeginFrameDeadlineMode::Immediate;
-    }
-
-    if active && should_wait_for_scroll {
-        return BeginFrameDeadlineMode::WaitForScroll;
-    }
-
-    BeginFrameDeadlineMode::Regular
+    let desired_mode = desired_begin_frame_deadline_mode(
+        begin_frame,
+        should_draw,
+        force_render,
+        needs_present,
+        deadline_was_missed,
+        swap_backpressured,
+        supports_delayed_begin_frame_scheduling,
+    );
+    adjusted_begin_frame_deadline_mode(
+        desired_mode,
+        should_draw,
+        active,
+        should_wait_for_scroll,
+        draw_already_performed,
+        output_surface_lost,
+    )
 }
 
 fn scheduled_begin_frame_deadline(
     deadline_mode: BeginFrameDeadlineMode,
-    begin_frame: crate::BeginFrameArgs,
+    begin_frame: &crate::BeginFrameArgs,
     draw_start_deadline: Option<Instant>,
 ) -> Option<Instant> {
     match deadline_mode {
@@ -1898,7 +2176,6 @@ fn frame_production_result_for_draw_result(
 struct BeginFrameScheduler {
     handle: AnyWindowHandle,
     cx: AsyncApp,
-    invalidator: WindowInvalidator,
     active: Rc<Cell<bool>>,
     needs_present: Rc<Cell<bool>>,
     next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
@@ -1922,8 +2199,11 @@ impl BeginFrameScheduler {
         &mut self,
         mut request_frame_options: crate::RequestFrameOptions,
     ) -> bool {
-        if let Some(begin_frame) = request_frame_options.begin_frame {
-            match self.frame_scheduler.begin_frame_continuation(begin_frame) {
+        if let Some(begin_frame) = request_frame_options.begin_frame.as_ref() {
+            match self
+                .frame_scheduler
+                .begin_frame_continuation(begin_frame.clone())
+            {
                 BeginFrameContinuation::Older => {
                     self.complete_frame(None);
                     return false;
@@ -1934,7 +2214,7 @@ impl BeginFrameScheduler {
                 } => {
                     if self.should_defer_begin_frame_for_gpu_busy() {
                         self.defer_begin_frame_until_gpu_available(
-                            self.deadline_request_for_options(request_frame_options),
+                            self.deadline_request_for_options(request_frame_options.clone()),
                         );
                         self.complete_frame(None);
                         return true;
@@ -1946,7 +2226,7 @@ impl BeginFrameScheduler {
                         );
                     }
                     self.frame_scheduler
-                        .accept_begin_frame_request(request_frame_options);
+                        .accept_begin_frame_request(request_frame_options.clone());
                 }
             }
             if request_frame_options.source_begin_frame {
@@ -1963,13 +2243,13 @@ impl BeginFrameScheduler {
             .update(&mut self.cx, |_, _, cx| cx.thermal_state())
             .log_err();
         self.frame_scheduler
-            .update_frame_interval_from_request(request_frame_options, &self.input_rate_tracker);
+            .update_frame_interval_from_request(&request_frame_options, &self.input_rate_tracker);
         let frame_interval = self
             .frame_scheduler
-            .frame_interval_for_request(request_frame_options);
+            .frame_interval_for_request(&request_frame_options);
 
-        let presentation_deadline = presentation_deadline_for_request(request_frame_options);
-        let predicted_display_time = predicted_display_time_for_request(request_frame_options);
+        let presentation_deadline = presentation_deadline_for_request(&request_frame_options);
+        let predicted_display_time = predicted_display_time_for_request(&request_frame_options);
 
         let deadline_was_missed = self.frame_scheduler.deadline_was_missed();
         let min_frame_interval = if deadline_was_missed {
@@ -1992,15 +2272,15 @@ impl BeginFrameScheduler {
             .or(predicted_display_time)
             .unwrap_or(now);
         if let Some(min_interval) = min_frame_interval {
-            if let Some(last_frame) = self.frame_scheduler.last_frame_time.get()
+            if let Some(last_frame) = self.frame_scheduler.last_frame_time()
                 && frame_time.saturating_duration_since(last_frame) < min_interval
             {
                 self.did_finish_frame(request_frame_options, FrameProductionResult::Idle);
                 return true;
             }
         }
-        if !self.frame_scheduler.has_presentation_feedback.get() {
-            self.frame_scheduler.last_frame_time.set(Some(frame_time));
+        if !self.frame_scheduler.has_presentation_feedback() {
+            self.frame_scheduler.set_last_frame_time(frame_time);
         }
 
         let next_frame_callbacks = self.next_frame_callbacks.take();
@@ -2014,7 +2294,7 @@ impl BeginFrameScheduler {
                 .log_err();
         }
 
-        let needs_present = self.needs_present_for_options(request_frame_options);
+        let needs_present = self.needs_present_for_options(&request_frame_options);
 
         self.schedule_begin_frame_deadline(request_frame_options, needs_present, now);
         true
@@ -2024,13 +2304,17 @@ impl BeginFrameScheduler {
         &self,
         request_frame_options: crate::RequestFrameOptions,
     ) -> BeginFrameDeadlineRequest {
+        let needs_present = self.needs_present_for_options(&request_frame_options);
         BeginFrameDeadlineRequest {
             options: request_frame_options,
-            needs_present: self.needs_present_for_options(request_frame_options),
+            needs_present,
         }
     }
 
-    fn needs_present_for_options(&self, request_frame_options: crate::RequestFrameOptions) -> bool {
+    fn needs_present_for_options(
+        &self,
+        request_frame_options: &crate::RequestFrameOptions,
+    ) -> bool {
         request_frame_options.require_presentation
             || self.needs_present.get()
             || (self.active.get() && self.input_rate_tracker.borrow().is_high_rate())
@@ -2042,33 +2326,41 @@ impl BeginFrameScheduler {
         needs_present: bool,
         now: Instant,
     ) {
-        let should_draw = self.invalidator.is_dirty() || request_frame_options.force_render;
+        let should_draw = self
+            .frame_scheduler
+            .should_draw(request_frame_options.force_render);
         let deadline_request = BeginFrameDeadlineRequest {
-            options: request_frame_options,
+            options: request_frame_options.clone(),
             needs_present,
         };
         self.frame_scheduler
-            .set_current_begin_frame_deadline_request(deadline_request);
+            .set_current_begin_frame_deadline_request(deadline_request.clone());
         let swap_backpressured = self.platform_swap_backpressured();
-        let should_wait_for_scroll = request_frame_options
-            .begin_frame
-            .is_some_and(|begin_frame| {
-                self.input_rate_tracker
-                    .borrow()
-                    .should_wait_for_scroll(begin_frame)
-            });
-        let deadline_mode = begin_frame_deadline_mode(
-            request_frame_options.begin_frame,
+        let should_wait_for_scroll =
+            request_frame_options
+                .begin_frame
+                .as_ref()
+                .is_some_and(|begin_frame| {
+                    self.input_rate_tracker
+                        .borrow()
+                        .should_wait_for_scroll(begin_frame.clone())
+                });
+        let desired_deadline_mode = desired_begin_frame_deadline_mode(
+            request_frame_options.begin_frame.clone(),
             should_draw,
             request_frame_options.force_render,
             needs_present,
-            self.active.get(),
             self.frame_scheduler.deadline_was_missed(),
             swap_backpressured,
-            should_wait_for_scroll,
-            self.frame_scheduler.drew_current_begin_frame.get(),
-            self.frame_scheduler.output_surface_lost(),
             self.supports_delayed_begin_frame_scheduling,
+        );
+        let deadline_mode = adjusted_begin_frame_deadline_mode(
+            desired_deadline_mode,
+            should_draw,
+            self.active.get(),
+            should_wait_for_scroll,
+            self.frame_scheduler.drew_current_begin_frame(),
+            self.frame_scheduler.output_surface_lost(),
         );
 
         if deadline_mode == BeginFrameDeadlineMode::Blocked {
@@ -2084,13 +2376,13 @@ impl BeginFrameScheduler {
                 .log_err();
         }
 
-        if let Some(begin_frame) = request_frame_options.begin_frame {
+        if let Some(begin_frame) = request_frame_options.begin_frame.as_ref() {
             let scheduled_deadline = scheduled_begin_frame_deadline(
                 deadline_mode,
                 begin_frame,
                 draw_start_deadline_for_request(
-                    request_frame_options,
-                    self.frame_scheduler.draw_duration_estimate.get(),
+                    &request_frame_options,
+                    self.frame_scheduler.draw_duration_estimate(),
                 ),
             );
 
@@ -2107,6 +2399,7 @@ impl BeginFrameScheduler {
 
                 let delay = scheduled_deadline.saturating_duration_since(now);
                 let mut scheduler = self.clone();
+                let begin_frame = begin_frame.clone();
                 self.cx
                     .spawn(async move |cx| {
                         cx.background_executor().timer(delay).await;
@@ -2134,8 +2427,8 @@ impl BeginFrameScheduler {
         else {
             return;
         };
-        if self.frame_scheduler.current_begin_frame_id.get() != Some(begin_frame.id)
-            || self.frame_scheduler.drew_current_begin_frame.get()
+        if self.frame_scheduler.current_begin_frame_id() != Some(begin_frame.id)
+            || self.frame_scheduler.drew_current_begin_frame()
         {
             return;
         }
@@ -2149,8 +2442,9 @@ impl BeginFrameScheduler {
         needs_present: bool,
     ) {
         self.frame_scheduler
-            .begin_frame_deadline_started(request_frame_options);
-        let production_result = self.attempt_draw_and_swap(request_frame_options, needs_present);
+            .begin_frame_deadline_started(&request_frame_options);
+        let production_result =
+            self.attempt_draw_and_swap(request_frame_options.clone(), needs_present);
         self.did_finish_frame(request_frame_options, production_result);
     }
 
@@ -2167,15 +2461,25 @@ impl BeginFrameScheduler {
         request_frame_options: crate::RequestFrameOptions,
         needs_present: bool,
     ) -> FrameProductionResult {
-        let should_draw = self.invalidator.is_dirty() || request_frame_options.force_render;
+        let needs_draw_for_request = self
+            .frame_scheduler
+            .needs_draw_for_request(request_frame_options.force_render);
+        let mut should_draw = self
+            .frame_scheduler
+            .should_draw(request_frame_options.force_render);
         if self.frame_scheduler.output_surface_lost() {
             if !request_frame_options.force_render {
                 return FrameProductionResult::Idle;
             }
             self.frame_scheduler.recover_output_surface();
+            should_draw = needs_draw_for_request;
         }
 
         if self.platform_swap_backpressured() && (should_draw || needs_present) {
+            return FrameProductionResult::Idle;
+        }
+
+        if !should_draw && !needs_present {
             return FrameProductionResult::Idle;
         }
 
@@ -2192,10 +2496,10 @@ impl BeginFrameScheduler {
         production_result: FrameProductionResult,
     ) {
         self.frame_scheduler
-            .begin_frame_deadline_started(request_frame_options);
+            .begin_frame_deadline_started(&request_frame_options);
         let ack = self.frame_scheduler.finish_begin_frame_production(
-            request_frame_options,
-            presentation_deadline_for_request(request_frame_options),
+            &request_frame_options,
+            presentation_deadline_for_request(&request_frame_options),
             production_result,
         );
         self.complete_frame(ack);
@@ -2203,7 +2507,7 @@ impl BeginFrameScheduler {
 
     fn complete_blocked_frame(&mut self, request_frame_options: crate::RequestFrameOptions) {
         self.frame_scheduler
-            .begin_frame_deadline_started(request_frame_options);
+            .begin_frame_deadline_started(&request_frame_options);
         self.handle
             .update(&mut self.cx, |_, window, _| {
                 window.complete_frame(None);
@@ -2288,7 +2592,7 @@ impl crate::BeginFrameObserver for BeginFrameScheduler {
     }
 
     fn last_used_begin_frame(&self) -> Option<crate::BeginFrameArgs> {
-        self.frame_scheduler.current_begin_frame_args.get()
+        self.frame_scheduler.current_begin_frame_args()
     }
 }
 
@@ -2304,12 +2608,14 @@ fn request_frame_options_for_scheduler_replay(
 fn request_frame_options_for_begin_frame(
     begin_frame: crate::BeginFrameArgs,
 ) -> crate::RequestFrameOptions {
+    let deadline = begin_frame.deadline;
+    let interval = begin_frame.interval;
     crate::RequestFrameOptions {
         begin_frame: Some(begin_frame),
         source_begin_frame: true,
-        predicted_display_time: Some(begin_frame.deadline),
-        frame_interval: Some(begin_frame.interval),
-        frame_deadline: Some(begin_frame.deadline),
+        predicted_display_time: Some(deadline),
+        frame_interval: Some(interval),
+        frame_deadline: Some(deadline),
         ..Default::default()
     }
 }
@@ -2321,20 +2627,22 @@ fn request_frame_options_for_gpu_available_replay(
 }
 
 fn presentation_deadline_for_request(
-    request_frame_options: crate::RequestFrameOptions,
+    request_frame_options: &crate::RequestFrameOptions,
 ) -> Option<Instant> {
     request_frame_options
         .begin_frame
+        .as_ref()
         .map(|begin_frame| begin_frame.deadline)
         .or(request_frame_options.frame_deadline)
 }
 
 fn draw_start_deadline_for_request(
-    request_frame_options: crate::RequestFrameOptions,
+    request_frame_options: &crate::RequestFrameOptions,
     draw_duration_estimate: Duration,
 ) -> Option<Instant> {
     request_frame_options
         .begin_frame
+        .as_ref()
         .map(|begin_frame| {
             let deadline_padding = draw_duration_estimate + Duration::from_micros(1000);
             begin_frame
@@ -2346,27 +2654,20 @@ fn draw_start_deadline_for_request(
 }
 
 fn predicted_display_time_for_request(
-    request_frame_options: crate::RequestFrameOptions,
+    request_frame_options: &crate::RequestFrameOptions,
 ) -> Option<Instant> {
     request_frame_options
         .begin_frame
+        .as_ref()
         .map(|begin_frame| begin_frame.deadline)
         .or(request_frame_options.predicted_display_time)
 }
 
 fn begin_frame_is_older(
-    current: Option<crate::BeginFrameArgs>,
-    incoming: crate::BeginFrameArgs,
+    current: Option<&crate::BeginFrameArgs>,
+    incoming: &crate::BeginFrameArgs,
 ) -> bool {
-    current.is_some_and(|current| {
-        if incoming.missed && incoming.id == current.id {
-            return false;
-        }
-
-        incoming.frame_time <= current.frame_time
-            || (incoming.id.source_id == current.id.source_id
-                && incoming.id.sequence_number <= current.id.sequence_number)
-    })
+    !crate::begin_frame_follows_last_used(incoming, current, true)
 }
 
 fn swap_completion_lost_output_surface(result: SwapCompletionResult) -> bool {
@@ -2396,6 +2697,7 @@ mod tests {
             deadline: frame_time + Duration::from_millis(16),
             interval: Duration::from_millis(16),
             missed: false,
+            possible_deadlines: None,
         }
     }
 
@@ -2413,7 +2715,7 @@ mod tests {
     fn gpu_available_replay_preserves_scheduler_presentation_intent() {
         let begin_frame = begin_frame_args(1);
         let request_frame_options = crate::RequestFrameOptions {
-            begin_frame: Some(begin_frame),
+            begin_frame: Some(begin_frame.clone()),
             source_begin_frame: true,
             require_presentation: false,
             ..Default::default()
@@ -2448,9 +2750,9 @@ mod tests {
     fn source_begin_frame_options_are_constructed_from_begin_frame_args() {
         let begin_frame = begin_frame_args(1);
 
-        let request_frame_options = request_frame_options_for_begin_frame(begin_frame);
+        let request_frame_options = request_frame_options_for_begin_frame(begin_frame.clone());
 
-        assert_eq!(request_frame_options.begin_frame, Some(begin_frame));
+        assert_eq!(request_frame_options.begin_frame, Some(begin_frame.clone()));
         assert!(request_frame_options.source_begin_frame);
         assert_eq!(
             request_frame_options.predicted_display_time,
@@ -2474,14 +2776,14 @@ mod tests {
         let pending_deadline_begin_frame = begin_frame_args(2);
         let parked_request = deadline_request(
             crate::RequestFrameOptions {
-                begin_frame: Some(parked_begin_frame),
+                begin_frame: Some(parked_begin_frame.clone()),
                 ..Default::default()
             },
             true,
         );
         let pending_deadline_request = deadline_request(
             crate::RequestFrameOptions {
-                begin_frame: Some(pending_deadline_begin_frame),
+                begin_frame: Some(pending_deadline_begin_frame.clone()),
                 ..Default::default()
             },
             false,
@@ -2489,7 +2791,7 @@ mod tests {
 
         assert_eq!(
             gpu_available_wake(
-                Some(parked_request),
+                Some(parked_request.clone()),
                 Some(pending_deadline_request),
                 true,
                 false,
@@ -2503,16 +2805,16 @@ mod tests {
         let begin_frame = begin_frame_args(1);
         let pending_deadline_request = deadline_request(
             crate::RequestFrameOptions {
-                begin_frame: Some(begin_frame),
+                begin_frame: Some(begin_frame.clone()),
                 ..Default::default()
             },
             true,
         );
 
         assert_eq!(
-            gpu_available_wake(None, Some(pending_deadline_request), true, false),
+            gpu_available_wake(None, Some(pending_deadline_request.clone()), true, false),
             Some(GpuAvailableWake::RescheduleDeadline(
-                pending_deadline_request
+                pending_deadline_request.clone()
             ))
         );
         assert_eq!(
@@ -2651,13 +2953,36 @@ mod tests {
 
         assert!(crate::BeginFrameObserver::on_begin_frame(
             &mut input_rate_tracker,
-            begin_frame,
+            begin_frame.clone(),
         ));
 
         assert_eq!(input_rate_tracker.inputs_per_second, 120);
         assert_eq!(
             crate::BeginFrameObserver::last_used_begin_frame(&input_rate_tracker),
             Some(begin_frame)
+        );
+    }
+
+    #[test]
+    fn input_rate_tracker_observer_drops_non_continuous_begin_frames() {
+        let mut input_rate_tracker = InputRateTracker::default();
+        let begin_frame = crate::BeginFrameArgs {
+            interval: Duration::from_nanos(8_333_333),
+            ..begin_frame_args_at(1, 1, Instant::now())
+        };
+
+        assert!(crate::BeginFrameObserver::on_begin_frame(
+            &mut input_rate_tracker,
+            begin_frame.clone(),
+        ));
+        assert!(!crate::BeginFrameObserver::on_begin_frame(
+            &mut input_rate_tracker,
+            begin_frame,
+        ));
+
+        assert_eq!(
+            input_rate_tracker.observer_state.dropped_begin_frame_args(),
+            1
         );
     }
 
@@ -2751,7 +3076,7 @@ mod tests {
         let frame_scheduler = FrameSchedulerState::default();
         let begin_frame = begin_frame_args(1);
         let request_frame_options = crate::RequestFrameOptions {
-            begin_frame: Some(begin_frame),
+            begin_frame: Some(begin_frame.clone()),
             ..Default::default()
         };
 
@@ -2773,11 +3098,11 @@ mod tests {
         let frame_scheduler = FrameSchedulerState::default();
         let begin_frame = begin_frame_args(1);
         let request_frame_options = crate::RequestFrameOptions {
-            begin_frame: Some(begin_frame),
+            begin_frame: Some(begin_frame.clone()),
             ..Default::default()
         };
 
-        frame_scheduler.record_pending_presentation_group(request_frame_options);
+        frame_scheduler.record_pending_presentation_group(request_frame_options.clone());
         frame_scheduler.record_pending_presentation_group(request_frame_options);
 
         let first_group = frame_scheduler.take_pending_presentation_group().unwrap();
@@ -2802,12 +3127,12 @@ mod tests {
         let frame_time = now - Duration::from_millis(100);
         let begin_frame = begin_frame_args_at(1, 1, frame_time);
         let request_frame_options = crate::RequestFrameOptions {
-            begin_frame: Some(begin_frame),
+            begin_frame: Some(begin_frame.clone()),
             ..Default::default()
         };
 
         let presentation_group =
-            presentation_group_timing_for_request(request_frame_options, None, now);
+            presentation_group_timing_for_request(&request_frame_options, None, now);
 
         assert!(
             presentation_group
@@ -2828,18 +3153,18 @@ mod tests {
         let input_rate_tracker = Rc::new(RefCell::new(InputRateTracker::default()));
         let begin_frame = begin_frame_args(1);
         let request_frame_options = crate::RequestFrameOptions {
-            begin_frame: Some(begin_frame),
+            begin_frame: Some(begin_frame.clone()),
             ..Default::default()
         };
         let target_latch_time = presentation_group_timing_for_request(
-            request_frame_options,
+            &request_frame_options,
             None,
             begin_frame.frame_time,
         )
         .target_latch_time
         .unwrap();
 
-        frame_scheduler.record_pending_presentation_group(request_frame_options);
+        frame_scheduler.record_pending_presentation_group(request_frame_options.clone());
         frame_scheduler.on_presentation_feedback(
             crate::PresentationFeedback {
                 ready_time: target_latch_time + Duration::from_micros(1),
@@ -2854,9 +3179,9 @@ mod tests {
             &input_rate_tracker,
         );
 
-        assert!(frame_scheduler.presentation_missed_last_latch.get());
+        assert!(frame_scheduler.presentation_missed_last_latch());
         assert_eq!(
-            frame_scheduler.last_frame_interval.get(),
+            frame_scheduler.last_frame_interval(),
             Some(begin_frame.interval)
         );
         assert_eq!(frame_scheduler.take_pending_presentation_group(), None);
@@ -2868,12 +3193,12 @@ mod tests {
         let input_rate_tracker = Rc::new(RefCell::new(InputRateTracker::default()));
         let begin_frame = begin_frame_args(1);
         let request_frame_options = crate::RequestFrameOptions {
-            begin_frame: Some(begin_frame),
+            begin_frame: Some(begin_frame.clone()),
             ..Default::default()
         };
         let platform_target_latch_time = begin_frame.deadline - Duration::from_micros(3000);
 
-        frame_scheduler.record_pending_presentation_group(request_frame_options);
+        frame_scheduler.record_pending_presentation_group(request_frame_options.clone());
         frame_scheduler.on_presentation_feedback(
             crate::PresentationFeedback {
                 ready_time: platform_target_latch_time + Duration::from_micros(1),
@@ -2888,9 +3213,9 @@ mod tests {
             &input_rate_tracker,
         );
 
-        assert!(frame_scheduler.presentation_missed_last_latch.get());
+        assert!(frame_scheduler.presentation_missed_last_latch());
         assert_eq!(
-            frame_scheduler.last_frame_interval.get(),
+            frame_scheduler.last_frame_interval(),
             Some(begin_frame.interval)
         );
     }
@@ -2899,7 +3224,7 @@ mod tests {
     fn frame_interval_for_request_uses_presentation_feedback_fallback() {
         assert_eq!(
             frame_interval_for_request(
-                crate::RequestFrameOptions::default(),
+                &crate::RequestFrameOptions::default(),
                 Some(Duration::from_millis(8))
             ),
             Duration::from_millis(8)
@@ -2921,10 +3246,11 @@ mod tests {
             deadline: Instant::now() + Duration::from_millis(10),
             interval: Duration::from_millis(10),
             missed: false,
+            possible_deadlines: None,
         });
 
         assert_eq!(
-            frame_interval_for_request(request_frame_options, Some(Duration::from_millis(8))),
+            frame_interval_for_request(&request_frame_options, Some(Duration::from_millis(8))),
             Duration::from_millis(10)
         );
     }
@@ -2937,7 +3263,7 @@ mod tests {
         };
 
         assert_eq!(
-            explicit_frame_interval_for_request(request_frame_options),
+            explicit_frame_interval_for_request(&request_frame_options),
             None
         );
     }
@@ -2954,12 +3280,12 @@ mod tests {
         let first_deadline = first_begin_frame.deadline;
         let second_deadline = second_begin_frame.deadline;
         let first_options = crate::RequestFrameOptions {
-            begin_frame: Some(first_begin_frame),
+            begin_frame: Some(first_begin_frame.clone()),
             force_render: true,
             ..Default::default()
         };
         let second_options = crate::RequestFrameOptions {
-            begin_frame: Some(second_begin_frame),
+            begin_frame: Some(second_begin_frame.clone()),
             require_presentation: true,
             ..Default::default()
         };
@@ -2972,7 +3298,7 @@ mod tests {
         assert!(frame_scheduler.schedule_begin_frame_deadline(
             second_begin_frame.id,
             second_deadline,
-            deadline_request(second_options, true)
+            deadline_request(second_options.clone(), true)
         ));
 
         assert_eq!(
@@ -2981,12 +3307,12 @@ mod tests {
         );
         assert_eq!(
             frame_scheduler.pending_begin_frame_deadline_request(),
-            Some(deadline_request(second_options, true))
+            Some(deadline_request(second_options.clone(), true))
         );
         assert_eq!(
             frame_scheduler
                 .take_pending_begin_frame_deadline(second_begin_frame.id, second_deadline),
-            Some(deadline_request(second_options, true))
+            Some(deadline_request(second_options.clone(), true))
         );
         assert_eq!(frame_scheduler.pending_begin_frame_deadline_request(), None);
     }
@@ -2997,7 +3323,7 @@ mod tests {
         let first_begin_frame = begin_frame_args(1);
         let second_begin_frame = begin_frame_args(2);
         let options = crate::RequestFrameOptions {
-            begin_frame: Some(first_begin_frame),
+            begin_frame: Some(first_begin_frame.clone()),
             ..Default::default()
         };
 
@@ -3008,15 +3334,15 @@ mod tests {
         ));
 
         frame_scheduler.accept_begin_frame_request(crate::RequestFrameOptions {
-            begin_frame: Some(second_begin_frame),
+            begin_frame: Some(second_begin_frame.clone()),
             ..Default::default()
         });
 
         assert_eq!(frame_scheduler.pending_begin_frame_deadline_request(), None);
         assert!(frame_scheduler.inside_begin_frame_deadline_interval());
 
-        frame_scheduler.begin_frame_deadline_started(crate::RequestFrameOptions {
-            begin_frame: Some(second_begin_frame),
+        frame_scheduler.begin_frame_deadline_started(&crate::RequestFrameOptions {
+            begin_frame: Some(second_begin_frame.clone()),
             ..Default::default()
         });
 
@@ -3028,12 +3354,12 @@ mod tests {
         let frame_scheduler = FrameSchedulerState::default();
         let begin_frame = begin_frame_args(1);
         let first_options = crate::RequestFrameOptions {
-            begin_frame: Some(begin_frame),
+            begin_frame: Some(begin_frame.clone()),
             force_render: true,
             ..Default::default()
         };
         let second_options = crate::RequestFrameOptions {
-            begin_frame: Some(begin_frame),
+            begin_frame: Some(begin_frame.clone()),
             require_presentation: true,
             ..Default::default()
         };
@@ -3046,12 +3372,12 @@ mod tests {
         assert!(!frame_scheduler.schedule_begin_frame_deadline(
             begin_frame.id,
             begin_frame.deadline,
-            deadline_request(second_options, true)
+            deadline_request(second_options.clone(), true)
         ));
         assert!(frame_scheduler.schedule_begin_frame_deadline(
             begin_frame.id,
             begin_frame.deadline + Duration::from_millis(1),
-            deadline_request(second_options, true)
+            deadline_request(second_options.clone(), true)
         ));
 
         assert_eq!(
@@ -3067,12 +3393,12 @@ mod tests {
         let first_deadline = begin_frame.deadline;
         let second_deadline = first_deadline + Duration::from_millis(1);
         let first_options = crate::RequestFrameOptions {
-            begin_frame: Some(begin_frame),
+            begin_frame: Some(begin_frame.clone()),
             force_render: true,
             ..Default::default()
         };
         let second_options = crate::RequestFrameOptions {
-            begin_frame: Some(begin_frame),
+            begin_frame: Some(begin_frame.clone()),
             require_presentation: true,
             ..Default::default()
         };
@@ -3085,7 +3411,7 @@ mod tests {
         assert!(frame_scheduler.schedule_begin_frame_deadline(
             begin_frame.id,
             second_deadline,
-            deadline_request(second_options, true)
+            deadline_request(second_options.clone(), true)
         ));
 
         assert_eq!(
@@ -3094,7 +3420,7 @@ mod tests {
         );
         assert_eq!(
             frame_scheduler.pending_begin_frame_deadline_request(),
-            Some(deadline_request(second_options, true))
+            Some(deadline_request(second_options.clone(), true))
         );
         assert_eq!(
             frame_scheduler.take_pending_begin_frame_deadline(begin_frame.id, second_deadline),
@@ -3128,7 +3454,7 @@ mod tests {
         let first_begin_frame = begin_frame_args(1);
         let missed_first_begin_frame = crate::BeginFrameArgs {
             missed: true,
-            ..first_begin_frame
+            ..first_begin_frame.clone()
         };
         let second_begin_frame = begin_frame_args_at(
             1,
@@ -3136,13 +3462,13 @@ mod tests {
             first_begin_frame.frame_time + first_begin_frame.interval,
         );
         let pending_options = crate::RequestFrameOptions {
-            begin_frame: Some(first_begin_frame),
+            begin_frame: Some(first_begin_frame.clone()),
             force_render: true,
             ..Default::default()
         };
 
         frame_scheduler.accept_begin_frame_request(crate::RequestFrameOptions {
-            begin_frame: Some(first_begin_frame),
+            begin_frame: Some(first_begin_frame.clone()),
             ..Default::default()
         });
 
@@ -3154,18 +3480,18 @@ mod tests {
         assert!(frame_scheduler.schedule_begin_frame_deadline(
             first_begin_frame.id,
             first_begin_frame.deadline,
-            deadline_request(pending_options, true),
+            deadline_request(pending_options.clone(), true),
         ));
 
         assert_eq!(
-            frame_scheduler.begin_frame_continuation(second_begin_frame),
+            frame_scheduler.begin_frame_continuation(second_begin_frame.clone()),
             BeginFrameContinuation::New {
-                pending_deadline_request: Some(deadline_request(pending_options, true))
+                pending_deadline_request: Some(deadline_request(pending_options.clone(), true))
             }
         );
 
         frame_scheduler.accept_begin_frame_request(crate::RequestFrameOptions {
-            begin_frame: Some(second_begin_frame),
+            begin_frame: Some(second_begin_frame.clone()),
             ..Default::default()
         });
 
@@ -3185,21 +3511,21 @@ mod tests {
             first_begin_frame.frame_time + first_begin_frame.interval,
         );
         let current_options = crate::RequestFrameOptions {
-            begin_frame: Some(first_begin_frame),
+            begin_frame: Some(first_begin_frame.clone()),
             require_presentation: true,
             ..Default::default()
         };
 
-        frame_scheduler.accept_begin_frame_request(current_options);
+        frame_scheduler.accept_begin_frame_request(current_options.clone());
 
         assert_eq!(
-            frame_scheduler.begin_frame_continuation(second_begin_frame),
+            frame_scheduler.begin_frame_continuation(second_begin_frame.clone()),
             BeginFrameContinuation::New {
-                pending_deadline_request: Some(deadline_request(current_options, true))
+                pending_deadline_request: Some(deadline_request(current_options.clone(), true))
             }
         );
 
-        frame_scheduler.begin_frame_deadline_started(current_options);
+        frame_scheduler.begin_frame_deadline_started(&current_options);
 
         assert_eq!(
             frame_scheduler.begin_frame_continuation(second_begin_frame),
@@ -3214,32 +3540,32 @@ mod tests {
         let frame_scheduler = FrameSchedulerState::default();
         let begin_frame = begin_frame_args(1);
         let options = crate::RequestFrameOptions {
-            begin_frame: Some(begin_frame),
+            begin_frame: Some(begin_frame.clone()),
             ..Default::default()
         };
         let pending_request = deadline_request(
             crate::RequestFrameOptions {
-                begin_frame: Some(begin_frame),
+                begin_frame: Some(begin_frame.clone()),
                 force_render: true,
                 ..Default::default()
             },
             true,
         );
 
-        frame_scheduler.accept_begin_frame_request(options);
+        frame_scheduler.accept_begin_frame_request(options.clone());
         assert!(frame_scheduler.schedule_begin_frame_deadline(
             begin_frame.id,
             begin_frame.deadline,
-            pending_request,
+            pending_request.clone(),
         ));
 
         assert_eq!(
             frame_scheduler.damage_reschedule_deadline_request(),
-            Some(pending_request)
+            Some(pending_request.clone())
         );
         assert_eq!(frame_scheduler.damage_reschedule_deadline_request(), None);
 
-        frame_scheduler.set_current_begin_frame_deadline_request(pending_request);
+        frame_scheduler.set_current_begin_frame_deadline_request(pending_request.clone());
         assert_eq!(
             frame_scheduler.damage_reschedule_deadline_request(),
             Some(pending_request)
@@ -3251,20 +3577,20 @@ mod tests {
         let frame_scheduler = FrameSchedulerState::default();
         let begin_frame = begin_frame_args(1);
         let options = crate::RequestFrameOptions {
-            begin_frame: Some(begin_frame),
+            begin_frame: Some(begin_frame.clone()),
             ..Default::default()
         };
-        let request = deadline_request(options, false);
+        let request = deadline_request(options.clone(), false);
 
-        frame_scheduler.accept_begin_frame_request(options);
-        frame_scheduler.set_current_begin_frame_deadline_request(request);
+        frame_scheduler.accept_begin_frame_request(options.clone());
+        frame_scheduler.set_current_begin_frame_deadline_request(request.clone());
         frame_scheduler.finish_begin_frame_draw_at(Instant::now(), Instant::now(), None);
 
         assert_eq!(frame_scheduler.damage_reschedule_deadline_request(), None);
 
-        frame_scheduler.accept_begin_frame_request(options);
-        frame_scheduler.set_current_begin_frame_deadline_request(request);
-        frame_scheduler.begin_frame_deadline_started(options);
+        frame_scheduler.accept_begin_frame_request(options.clone());
+        frame_scheduler.set_current_begin_frame_deadline_request(request.clone());
+        frame_scheduler.begin_frame_deadline_started(&options);
 
         assert_eq!(frame_scheduler.damage_reschedule_deadline_request(), None);
     }
@@ -3274,28 +3600,28 @@ mod tests {
         let frame_scheduler = FrameSchedulerState::default();
         let begin_frame = begin_frame_args(1);
         let current_options = crate::RequestFrameOptions {
-            begin_frame: Some(begin_frame),
+            begin_frame: Some(begin_frame.clone()),
             ..Default::default()
         };
         let pending_options = crate::RequestFrameOptions {
-            begin_frame: Some(begin_frame),
+            begin_frame: Some(begin_frame.clone()),
             force_render: true,
             ..Default::default()
         };
-        let pending_request = deadline_request(pending_options, true);
+        let pending_request = deadline_request(pending_options.clone(), true);
 
-        frame_scheduler.accept_begin_frame_request(current_options);
+        frame_scheduler.accept_begin_frame_request(current_options.clone());
         assert!(frame_scheduler.schedule_begin_frame_deadline(
             begin_frame.id,
             begin_frame.deadline,
-            pending_request,
+            pending_request.clone(),
         ));
 
         let forced_request = frame_scheduler.force_immediate_deadline_request();
-        assert_eq!(forced_request, Some(pending_request));
+        assert_eq!(forced_request, Some(pending_request.clone()));
         assert_eq!(frame_scheduler.pending_begin_frame_deadline_request(), None);
         if let Some(forced_request) = forced_request {
-            frame_scheduler.begin_frame_deadline_started(forced_request.options);
+            frame_scheduler.begin_frame_deadline_started(&forced_request.options);
         }
         assert_eq!(frame_scheduler.damage_reschedule_deadline_request(), None);
     }
@@ -3305,14 +3631,14 @@ mod tests {
         let frame_scheduler = FrameSchedulerState::default();
         let begin_frame = begin_frame_args(1);
         let options = crate::RequestFrameOptions {
-            begin_frame: Some(begin_frame),
+            begin_frame: Some(begin_frame.clone()),
             require_presentation: true,
             ..Default::default()
         };
-        let request = deadline_request(options, true);
+        let request = deadline_request(options.clone(), true);
 
-        frame_scheduler.accept_begin_frame_request(options);
-        frame_scheduler.set_current_begin_frame_deadline_request(request);
+        frame_scheduler.accept_begin_frame_request(options.clone());
+        frame_scheduler.set_current_begin_frame_deadline_request(request.clone());
 
         assert_eq!(
             frame_scheduler.force_immediate_deadline_request(),
@@ -3325,20 +3651,20 @@ mod tests {
         let frame_scheduler = FrameSchedulerState::default();
         let begin_frame = begin_frame_args(1);
         let options = crate::RequestFrameOptions {
-            begin_frame: Some(begin_frame),
+            begin_frame: Some(begin_frame.clone()),
             ..Default::default()
         };
-        let request = deadline_request(options, false);
+        let request = deadline_request(options.clone(), false);
 
-        frame_scheduler.accept_begin_frame_request(options);
-        frame_scheduler.set_current_begin_frame_deadline_request(request);
+        frame_scheduler.accept_begin_frame_request(options.clone());
+        frame_scheduler.set_current_begin_frame_deadline_request(request.clone());
         frame_scheduler.finish_begin_frame_draw_at(Instant::now(), Instant::now(), None);
 
         assert_eq!(frame_scheduler.force_immediate_deadline_request(), None);
 
-        frame_scheduler.accept_begin_frame_request(options);
-        frame_scheduler.set_current_begin_frame_deadline_request(request);
-        frame_scheduler.begin_frame_deadline_started(options);
+        frame_scheduler.accept_begin_frame_request(options.clone());
+        frame_scheduler.set_current_begin_frame_deadline_request(request.clone());
+        frame_scheduler.begin_frame_deadline_started(&options);
 
         assert_eq!(frame_scheduler.force_immediate_deadline_request(), None);
     }
@@ -3348,10 +3674,192 @@ mod tests {
         let frame_scheduler = FrameSchedulerState::default();
 
         assert!(!frame_scheduler.output_surface_lost());
-        frame_scheduler.mark_output_surface_lost();
+        frame_scheduler.output_surface_lost_transition();
         assert!(frame_scheduler.output_surface_lost());
         frame_scheduler.recover_output_surface();
         assert!(!frame_scheduler.output_surface_lost());
+    }
+
+    #[test]
+    fn scheduler_should_draw_requires_visible_damage_and_available_output_surface() {
+        let frame_scheduler = FrameSchedulerState::default();
+
+        assert!(frame_scheduler.needs_draw());
+        assert!(frame_scheduler.should_draw(false));
+        frame_scheduler.did_draw();
+        assert!(!frame_scheduler.needs_draw());
+        assert!(!frame_scheduler.should_draw(false));
+        assert!(frame_scheduler.should_draw(true));
+        frame_scheduler.set_needs_draw();
+
+        assert!(frame_scheduler.set_visible(false));
+        assert!(!frame_scheduler.should_draw(true));
+        assert!(!frame_scheduler.set_visible(false));
+        assert!(frame_scheduler.set_visible(true));
+
+        frame_scheduler.output_surface_lost_transition();
+        assert!(!frame_scheduler.should_draw(true));
+        frame_scheduler.recover_output_surface();
+        assert!(frame_scheduler.should_draw(true));
+    }
+
+    #[test]
+    fn begin_frame_observation_is_explicit_scheduler_state() {
+        let frame_scheduler = FrameSchedulerState::default();
+
+        assert!(!frame_scheduler.observing_begin_frame_source());
+        assert!(frame_scheduler.start_observing_begin_frames());
+        assert!(frame_scheduler.observing_begin_frame_source());
+        assert!(!frame_scheduler.start_observing_begin_frames());
+        assert!(frame_scheduler.stop_observing_begin_frames());
+        assert!(!frame_scheduler.observing_begin_frame_source());
+        assert!(!frame_scheduler.stop_observing_begin_frames());
+    }
+
+    #[test]
+    fn pending_swap_backpressure_is_scheduler_state() {
+        let frame_scheduler = FrameSchedulerState::default();
+
+        assert_eq!(frame_scheduler.pending_swaps(), 0);
+        assert!(!frame_scheduler.platform_swap_backpressured(Some(2)));
+
+        frame_scheduler.did_submit_swap();
+        assert_eq!(frame_scheduler.pending_swaps(), 1);
+        assert!(!frame_scheduler.platform_swap_backpressured(Some(2)));
+
+        frame_scheduler.did_submit_swap();
+        assert_eq!(frame_scheduler.pending_swaps(), 2);
+        assert!(frame_scheduler.platform_swap_backpressured(Some(2)));
+
+        frame_scheduler.did_receive_swap_buffers_ack();
+        assert_eq!(frame_scheduler.pending_swaps(), 1);
+        assert!(!frame_scheduler.platform_swap_backpressured(Some(2)));
+
+        frame_scheduler.did_receive_swap_buffers_ack();
+        frame_scheduler.did_receive_swap_buffers_ack();
+        assert_eq!(frame_scheduler.pending_swaps(), 0);
+    }
+
+    #[test]
+    fn desired_deadline_mode_transition_table_is_exhaustive_for_scheduler_inputs() {
+        let regular = DesiredBeginFrameDeadlineModeInput {
+            has_begin_frame: true,
+            should_draw: true,
+            force_render: false,
+            needs_present: false,
+            deadline_was_missed: false,
+            swap_backpressured: false,
+            supports_delayed_begin_frame_scheduling: true,
+        };
+
+        assert_eq!(
+            desired_begin_frame_deadline_mode_transition(regular),
+            DesiredBeginFrameDeadlineMode::Regular
+        );
+        assert_eq!(
+            desired_begin_frame_deadline_mode_transition(DesiredBeginFrameDeadlineModeInput {
+                has_begin_frame: false,
+                ..regular
+            }),
+            DesiredBeginFrameDeadlineMode::None
+        );
+        assert_eq!(
+            desired_begin_frame_deadline_mode_transition(DesiredBeginFrameDeadlineModeInput {
+                supports_delayed_begin_frame_scheduling: false,
+                ..regular
+            }),
+            DesiredBeginFrameDeadlineMode::Immediate
+        );
+        assert_eq!(
+            desired_begin_frame_deadline_mode_transition(DesiredBeginFrameDeadlineModeInput {
+                swap_backpressured: true,
+                ..regular
+            }),
+            DesiredBeginFrameDeadlineMode::Late
+        );
+        assert_eq!(
+            desired_begin_frame_deadline_mode_transition(DesiredBeginFrameDeadlineModeInput {
+                should_draw: false,
+                ..regular
+            }),
+            DesiredBeginFrameDeadlineMode::Late
+        );
+        assert_eq!(
+            desired_begin_frame_deadline_mode_transition(DesiredBeginFrameDeadlineModeInput {
+                force_render: true,
+                ..regular
+            }),
+            DesiredBeginFrameDeadlineMode::Immediate
+        );
+        assert_eq!(
+            desired_begin_frame_deadline_mode_transition(DesiredBeginFrameDeadlineModeInput {
+                deadline_was_missed: true,
+                ..regular
+            }),
+            DesiredBeginFrameDeadlineMode::Immediate
+        );
+    }
+
+    #[test]
+    fn adjusted_deadline_mode_transition_table_orders_local_modes() {
+        let regular = AdjustedBeginFrameDeadlineModeInput {
+            desired_mode: DesiredBeginFrameDeadlineMode::Regular,
+            should_draw: true,
+            active: true,
+            should_wait_for_scroll: false,
+            draw_already_performed: false,
+            output_surface_lost: false,
+        };
+
+        assert_eq!(
+            adjusted_begin_frame_deadline_mode_transition(regular),
+            BeginFrameDeadlineMode::Regular
+        );
+        assert_eq!(
+            adjusted_begin_frame_deadline_mode_transition(AdjustedBeginFrameDeadlineModeInput {
+                output_surface_lost: true,
+                draw_already_performed: true,
+                should_wait_for_scroll: true,
+                ..regular
+            }),
+            BeginFrameDeadlineMode::Immediate
+        );
+        assert_eq!(
+            adjusted_begin_frame_deadline_mode_transition(AdjustedBeginFrameDeadlineModeInput {
+                draw_already_performed: true,
+                should_wait_for_scroll: true,
+                ..regular
+            }),
+            BeginFrameDeadlineMode::Blocked
+        );
+        assert_eq!(
+            adjusted_begin_frame_deadline_mode_transition(AdjustedBeginFrameDeadlineModeInput {
+                should_wait_for_scroll: true,
+                ..regular
+            }),
+            BeginFrameDeadlineMode::WaitForScroll
+        );
+        assert_eq!(
+            adjusted_begin_frame_deadline_mode_transition(AdjustedBeginFrameDeadlineModeInput {
+                desired_mode: DesiredBeginFrameDeadlineMode::None,
+                ..regular
+            }),
+            BeginFrameDeadlineMode::None
+        );
+        assert_eq!(
+            adjusted_begin_frame_deadline_mode_transition(AdjustedBeginFrameDeadlineModeInput {
+                desired_mode: DesiredBeginFrameDeadlineMode::Immediate,
+                ..regular
+            }),
+            BeginFrameDeadlineMode::Immediate
+        );
+        assert_eq!(
+            adjusted_begin_frame_deadline_mode_transition(AdjustedBeginFrameDeadlineModeInput {
+                desired_mode: DesiredBeginFrameDeadlineMode::Late,
+                ..regular
+            }),
+            BeginFrameDeadlineMode::Late
+        );
     }
 
     #[test]
@@ -3377,16 +3885,16 @@ mod tests {
             Some(draw_finished_at - Duration::from_millis(1)),
         );
 
-        assert!(frame_scheduler.drew_current_begin_frame.get());
-        assert!(frame_scheduler.main_thread_missed_last_deadline.get());
+        assert!(frame_scheduler.drew_current_begin_frame());
+        assert!(frame_scheduler.main_thread_missed_last_deadline());
         assert_eq!(
-            frame_scheduler.draw_duration_estimate.get(),
+            frame_scheduler.draw_duration_estimate(),
             Duration::from_micros(2000)
         );
 
         frame_scheduler.finish_begin_frame_without_draw();
 
-        assert!(!frame_scheduler.main_thread_missed_last_deadline.get());
+        assert!(!frame_scheduler.main_thread_missed_last_deadline());
     }
 
     #[test]
@@ -3395,7 +3903,7 @@ mod tests {
         let draw_started_at = Instant::now();
 
         let ack = frame_scheduler.finish_begin_frame_production(
-            crate::RequestFrameOptions::default(),
+            &crate::RequestFrameOptions::default(),
             Some(draw_started_at - Duration::from_millis(1)),
             FrameProductionResult::Drawn {
                 started_at: draw_started_at,
@@ -3403,15 +3911,15 @@ mod tests {
             },
         );
 
-        assert!(!frame_scheduler.drew_current_begin_frame.get());
-        assert_eq!(frame_scheduler.last_begin_frame_ack.get(), None);
+        assert!(!frame_scheduler.drew_current_begin_frame());
+        assert_eq!(frame_scheduler.last_begin_frame_ack(), None);
         assert_eq!(ack, None);
 
         let begin_frame = begin_frame_args(1);
 
         let ack = frame_scheduler.finish_begin_frame_production(
-            crate::RequestFrameOptions {
-                begin_frame: Some(begin_frame),
+            &crate::RequestFrameOptions {
+                begin_frame: Some(begin_frame.clone()),
                 ..Default::default()
             },
             None,
@@ -3430,7 +3938,7 @@ mod tests {
             })
         );
         assert_eq!(
-            frame_scheduler.last_begin_frame_ack.get(),
+            frame_scheduler.last_begin_frame_ack(),
             Some(crate::BeginFrameAck {
                 frame_id: begin_frame.id,
                 frame_time: begin_frame.frame_time,
@@ -3439,8 +3947,8 @@ mod tests {
         );
 
         let ack = frame_scheduler.finish_begin_frame_production(
-            crate::RequestFrameOptions {
-                begin_frame: Some(begin_frame),
+            &crate::RequestFrameOptions {
+                begin_frame: Some(begin_frame.clone()),
                 ..Default::default()
             },
             None,
@@ -3460,17 +3968,17 @@ mod tests {
         );
 
         frame_scheduler.finish_begin_frame_production(
-            crate::RequestFrameOptions {
-                begin_frame: Some(begin_frame),
+            &crate::RequestFrameOptions {
+                begin_frame: Some(begin_frame.clone()),
                 ..Default::default()
             },
             None,
             FrameProductionResult::PresentedWithoutDraw,
         );
 
-        assert!(!frame_scheduler.main_thread_missed_last_deadline.get());
+        assert!(!frame_scheduler.main_thread_missed_last_deadline());
         assert_eq!(
-            frame_scheduler.last_begin_frame_ack.get(),
+            frame_scheduler.last_begin_frame_ack(),
             Some(crate::BeginFrameAck {
                 frame_id: begin_frame.id,
                 frame_time: begin_frame.frame_time,
@@ -3487,7 +3995,7 @@ mod tests {
         assert_eq!(
             scheduled_begin_frame_deadline(
                 BeginFrameDeadlineMode::Regular,
-                begin_frame,
+                &begin_frame,
                 Some(draw_start_deadline),
             ),
             Some(draw_start_deadline)
@@ -3495,7 +4003,7 @@ mod tests {
         assert_eq!(
             scheduled_begin_frame_deadline(
                 BeginFrameDeadlineMode::WaitForScroll,
-                begin_frame,
+                &begin_frame,
                 None
             ),
             Some(begin_frame.frame_time + duration_div(begin_frame.interval, 3))
@@ -3503,7 +4011,7 @@ mod tests {
         assert_eq!(
             scheduled_begin_frame_deadline(
                 BeginFrameDeadlineMode::Late,
-                begin_frame,
+                &begin_frame,
                 Some(draw_start_deadline),
             ),
             Some(begin_frame.frame_time + begin_frame.interval)
@@ -3511,7 +4019,7 @@ mod tests {
         assert_eq!(
             scheduled_begin_frame_deadline(
                 BeginFrameDeadlineMode::Immediate,
-                begin_frame,
+                &begin_frame,
                 Some(draw_start_deadline),
             ),
             None
@@ -3583,6 +4091,33 @@ mod tests {
                 false,
                 false,
             ),
+            BeginFrameDeadlineMode::Immediate
+        );
+    }
+
+    #[test]
+    fn begin_frame_deadline_mode_splits_desired_and_adjusted_modes() {
+        let desired_mode = desired_begin_frame_deadline_mode(
+            Some(begin_frame_args(1)),
+            true,
+            false,
+            true,
+            false,
+            false,
+            true,
+        );
+
+        assert_eq!(desired_mode, DesiredBeginFrameDeadlineMode::Regular);
+        assert_eq!(
+            adjusted_begin_frame_deadline_mode(desired_mode, true, true, true, false, false),
+            BeginFrameDeadlineMode::WaitForScroll
+        );
+        assert_eq!(
+            adjusted_begin_frame_deadline_mode(desired_mode, true, true, false, true, false),
+            BeginFrameDeadlineMode::Blocked
+        );
+        assert_eq!(
+            adjusted_begin_frame_deadline_mode(desired_mode, true, true, false, false, true),
             BeginFrameDeadlineMode::Immediate
         );
     }
@@ -3715,10 +4250,10 @@ mod tests {
         let new_source = begin_frame_args_at(2, 1, frame_time);
 
         assert!(begin_frame_is_older(
-            Some(current),
-            same_source_next_sequence
+            Some(&current),
+            &same_source_next_sequence
         ));
-        assert!(begin_frame_is_older(Some(current), new_source));
+        assert!(begin_frame_is_older(Some(&current), &new_source));
     }
 
     #[test]
@@ -3728,7 +4263,10 @@ mod tests {
         let newer_from_new_source =
             begin_frame_args_at(2, 1, frame_time + Duration::from_millis(16));
 
-        assert!(!begin_frame_is_older(Some(current), newer_from_new_source));
+        assert!(!begin_frame_is_older(
+            Some(&current),
+            &newer_from_new_source
+        ));
     }
 
     #[test]
@@ -3739,8 +4277,8 @@ mod tests {
             begin_frame_args_at(1, 10, frame_time + Duration::from_millis(16));
 
         assert!(begin_frame_is_older(
-            Some(current),
-            newer_time_same_sequence
+            Some(&current),
+            &newer_time_same_sequence
         ));
     }
 
@@ -3748,10 +4286,10 @@ mod tests {
     fn begin_frame_continuity_allows_missed_retry_for_current_frame() {
         let frame_time = Instant::now();
         let current = begin_frame_args_at(1, 10, frame_time);
-        let mut missed_retry = current;
+        let mut missed_retry = current.clone();
         missed_retry.missed = true;
 
-        assert!(!begin_frame_is_older(Some(current), missed_retry));
+        assert!(!begin_frame_is_older(Some(&current), &missed_retry));
     }
 
     #[test]
@@ -4009,6 +4547,7 @@ impl Window {
         let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
         let input_rate_tracker = Rc::new(RefCell::new(InputRateTracker::default()));
         let frame_scheduler = FrameSchedulerState::default();
+        frame_scheduler.set_visible(visible.get());
 
         platform_window
             .request_decorations(window_decorations.unwrap_or(WindowDecorations::Server));
@@ -4023,7 +4562,6 @@ impl Window {
                 let mut scheduler = BeginFrameScheduler {
                     handle,
                     cx: cx.clone(),
-                    invalidator: invalidator.clone(),
                     active: active.clone(),
                     needs_present: needs_present.clone(),
                     next_frame_callbacks: next_frame_callbacks.clone(),
@@ -4039,14 +4577,13 @@ impl Window {
                     let swap_ack_observed = handle
                         .update(&mut cx, |_, window, _| {
                             let was_backpressured = window.platform_swap_backpressured();
-                            window.pending_platform_swaps =
-                                window.pending_platform_swaps.saturating_sub(1);
+                            window.frame_scheduler.did_receive_swap_buffers_ack();
                             let is_backpressured = window.platform_swap_backpressured();
                             window
                                 .gpu_busy_response_state
                                 .on_swap_completion(was_backpressured, is_backpressured);
                             if output_surface_lost {
-                                window.frame_scheduler.mark_output_surface_lost();
+                                window.frame_scheduler.output_surface_lost_transition();
                                 window.refresh();
                             }
                             can_schedule_begin_frame_deadline =
@@ -4193,7 +4730,6 @@ impl Window {
                 let mut scheduler = BeginFrameScheduler {
                     handle,
                     cx: cx.to_async(),
-                    invalidator: invalidator.clone(),
                     active: active.clone(),
                     needs_present: needs_present.clone(),
                     next_frame_callbacks: next_frame_callbacks.clone(),
@@ -4265,7 +4801,9 @@ impl Window {
                 handle
                     .update(&mut cx, |_, window, _| {
                         window.visible.set(visible);
-                        window.update_begin_frame_subscription();
+                        if window.frame_scheduler.set_visible(visible) {
+                            window.update_begin_frame_subscription();
+                        }
                     })
                     .log_err();
             }
@@ -4363,7 +4901,9 @@ impl Window {
         }
 
         platform_window.map_window().unwrap();
-        platform_window.add_begin_frame_observer(crate::BeginFrameObserverKind::Scheduler);
+        if frame_scheduler.start_observing_begin_frames() {
+            platform_window.add_begin_frame_observer(crate::BeginFrameObserverKind::Scheduler);
+        }
 
         Ok(Window {
             handle,
@@ -4413,7 +4953,6 @@ impl Window {
             needs_present,
             uses_platform_swap_completion,
             max_pending_platform_swaps,
-            pending_platform_swaps: 0,
             gpu_busy_response_state: GpuBusyResponseState::Idle,
             pending_gpu_available_frame: None,
             input_rate_tracker,
@@ -5323,8 +5862,8 @@ impl Window {
     }
 
     pub(crate) fn schedule_frame_after_work(&self) {
-        self.platform_window
-            .add_begin_frame_observer(crate::BeginFrameObserverKind::Scheduler);
+        self.frame_scheduler.set_needs_draw();
+        self.update_begin_frame_subscription();
         if let Some(request) = self.frame_scheduler.damage_reschedule_deadline_request() {
             self.platform_window
                 .request_frame(request_frame_options_for_scheduler_replay(request));
@@ -5342,25 +5881,34 @@ impl Window {
         };
 
         self.frame_scheduler
-            .begin_frame_deadline_started(request.options);
-        let should_draw = self.invalidator.is_dirty() || request.options.force_render;
-        let production_result =
-            if self.frame_scheduler.output_surface_lost() && !request.options.force_render {
+            .begin_frame_deadline_started(&request.options);
+        let needs_draw_for_request = self
+            .frame_scheduler
+            .needs_draw_for_request(request.options.force_render);
+        let mut should_draw = self
+            .frame_scheduler
+            .should_draw(request.options.force_render);
+        let production_result = if self.frame_scheduler.output_surface_lost()
+            && !request.options.force_render
+        {
+            FrameProductionResult::Idle
+        } else {
+            if self.frame_scheduler.output_surface_lost() {
+                self.frame_scheduler.recover_output_surface();
+                should_draw = needs_draw_for_request;
+            }
+
+            if self.platform_swap_backpressured() && (should_draw || request.needs_present) {
+                FrameProductionResult::Idle
+            } else if !should_draw && !request.needs_present {
                 FrameProductionResult::Idle
             } else {
-                if self.frame_scheduler.output_surface_lost() {
-                    self.frame_scheduler.recover_output_surface();
-                }
-
-                if self.platform_swap_backpressured() && (should_draw || request.needs_present) {
-                    FrameProductionResult::Idle
-                } else {
-                    self.attempt_frame_production(request.options, request.needs_present, cx)
-                }
-            };
+                self.attempt_frame_production(request.options.clone(), request.needs_present, cx)
+            }
+        };
         let ack = self.frame_scheduler.finish_begin_frame_production(
-            request.options,
-            presentation_deadline_for_request(request.options),
+            &request.options,
+            presentation_deadline_for_request(&request.options),
             production_result,
         );
         self.complete_frame(ack);
@@ -5389,7 +5937,10 @@ impl Window {
         needs_present: bool,
         cx: &mut App,
     ) -> FrameProductionResult {
-        if self.invalidator.is_dirty() || request_frame_options.force_render {
+        if self
+            .frame_scheduler
+            .needs_draw_for_request(request_frame_options.force_render)
+        {
             let started_at = Instant::now();
             let draw_result = measure("frame duration", || {
                 self.draw_and_present(request_frame_options, cx)
@@ -5405,9 +5956,11 @@ impl Window {
 
     fn update_begin_frame_subscription(&self) {
         if self.has_frame_work() {
-            self.platform_window
-                .add_begin_frame_observer(crate::BeginFrameObserverKind::Scheduler);
-        } else {
+            if self.frame_scheduler.start_observing_begin_frames() {
+                self.platform_window
+                    .add_begin_frame_observer(crate::BeginFrameObserverKind::Scheduler);
+            }
+        } else if self.frame_scheduler.stop_observing_begin_frames() {
             self.platform_window
                 .remove_begin_frame_observer(crate::BeginFrameObserverKind::Scheduler);
         }
@@ -5422,17 +5975,17 @@ impl Window {
     }
 
     fn can_schedule_deadline_after_swap_completion(&self) -> bool {
-        self.visible.get()
+        self.frame_scheduler.visible()
     }
 
     fn begin_frame_subscription_state(&self) -> BeginFrameSubscriptionState {
         let input_rate_tracker = self.input_rate_tracker.borrow();
         BeginFrameSubscriptionState {
-            visible: self.visible.get(),
-            dirty: self.invalidator.is_dirty(),
+            visible: self.frame_scheduler.visible(),
+            dirty: self.frame_scheduler.needs_draw(),
             needs_present: self.needs_present.get(),
             has_pending_platform_swaps: self.uses_platform_swap_completion
-                && self.pending_platform_swaps > 0,
+                && self.frame_scheduler.pending_swaps() > 0,
             has_pending_gpu_available_frame: self.pending_gpu_available_frame.is_some(),
             needs_one_begin_frame: self.frame_scheduler.needs_one_begin_frame(),
             has_next_frame_callbacks: !self.next_frame_callbacks.borrow().is_empty(),
@@ -5443,8 +5996,8 @@ impl Window {
     }
 
     fn platform_swap_backpressured(&self) -> bool {
-        self.max_pending_platform_swaps
-            .is_some_and(|max_pending_swaps| self.pending_platform_swaps >= max_pending_swaps)
+        self.frame_scheduler
+            .platform_swap_backpressured(self.max_pending_platform_swaps)
     }
 
     fn should_defer_begin_frame_for_gpu_busy(&mut self) -> bool {
@@ -5470,6 +6023,7 @@ impl Window {
         debug_assert!(self.rendered_entity_stack.is_empty());
         let full_damage = self.refreshing;
         self.invalidator.set_dirty(false);
+        self.frame_scheduler.did_draw();
         self.requested_autoscroll = None;
 
         // Restore the previously-used input handler.
@@ -5606,13 +6160,13 @@ impl Window {
         request_frame_options: crate::RequestFrameOptions,
     ) -> crate::PlatformDrawResult {
         if self.uses_platform_swap_completion {
-            self.pending_platform_swaps = self.pending_platform_swaps.saturating_add(1);
+            self.frame_scheduler.did_submit_swap();
         }
         let draw_result = self.platform_window.draw(&self.rendered_frame.scene);
         if self.uses_platform_swap_completion
             && !matches!(draw_result, crate::PlatformDrawResult::Submitted)
         {
-            self.pending_platform_swaps = self.pending_platform_swaps.saturating_sub(1);
+            self.frame_scheduler.swap_submission_failed_or_skipped();
         }
         if self.uses_platform_swap_completion
             && matches!(draw_result, crate::PlatformDrawResult::Submitted)

@@ -607,7 +607,7 @@ pub struct A11yCallbacks {
     pub deactivation: Box<dyn Fn() + Send + 'static>,
 }
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
+#[derive(Debug, Clone, Eq, PartialEq, Default)]
 #[expect(missing_docs)]
 pub struct RequestFrameOptions {
     /// Platform BeginFrame metadata for this frame, when the platform frame source provides it.
@@ -633,7 +633,29 @@ pub struct BeginFrameId {
     pub sequence_number: u64,
 }
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
+#[expect(missing_docs)]
+pub struct PossibleDeadline {
+    pub vsync_id: i64,
+    pub latch_delta: Duration,
+    pub present_delta: Duration,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+#[expect(missing_docs)]
+pub struct PossibleDeadlines {
+    pub os_preferred_index: usize,
+    pub deadlines: Vec<PossibleDeadline>,
+}
+
+impl PossibleDeadlines {
+    /// Returns the platform-preferred deadline candidate.
+    pub fn os_preferred_deadline(&self) -> Option<&PossibleDeadline> {
+        self.deadlines.get(self.os_preferred_index)
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 #[expect(missing_docs)]
 pub struct BeginFrameArgs {
     pub id: BeginFrameId,
@@ -641,6 +663,7 @@ pub struct BeginFrameArgs {
     pub deadline: Instant,
     pub interval: Duration,
     pub missed: bool,
+    pub possible_deadlines: Option<PossibleDeadlines>,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -670,13 +693,99 @@ pub trait BeginFrameSource {
     fn did_finish_frame(&mut self, observer_id: Self::ObserverId, ack: Option<BeginFrameAck>);
 }
 
+/// Tracks per-observer BeginFrame continuity.
+///
+/// This is the GPUI equivalent of Chromium's `BeginFrameObserverBase` state:
+/// observers record the last BeginFrame they actually used, and the source or
+/// observer can reject duplicated or non-forward BeginFrames before they reach
+/// scheduler/input logic.
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct BeginFrameObserverState {
+    last_used_begin_frame: Option<BeginFrameArgs>,
+    dropped_begin_frame_args: u64,
+}
+
+impl BeginFrameObserverState {
+    /// Returns whether `begin_frame` is forward-continuous with the observer's
+    /// last used BeginFrame. This mirrors Chromium's
+    /// `CheckBeginFrameContinuity`.
+    pub fn should_issue_begin_frame(
+        &self,
+        begin_frame: &BeginFrameArgs,
+        allow_missed_retry_for_current_frame: bool,
+    ) -> bool {
+        begin_frame_follows_last_used(
+            begin_frame,
+            self.last_used_begin_frame.as_ref(),
+            allow_missed_retry_for_current_frame,
+        )
+    }
+
+    /// Records whether an observer used or dropped a delivered BeginFrame.
+    pub fn record_begin_frame_result(&mut self, begin_frame: BeginFrameArgs, used: bool) {
+        if used {
+            self.last_used_begin_frame = Some(begin_frame);
+        } else {
+            self.dropped_begin_frame_args = self.dropped_begin_frame_args.saturating_add(1);
+        }
+    }
+
+    /// Returns the last BeginFrame used by the observer.
+    pub fn last_used_begin_frame(&self) -> Option<BeginFrameArgs> {
+        self.last_used_begin_frame.clone()
+    }
+
+    /// Returns the count of delivered BeginFrames the observer dropped.
+    pub fn dropped_begin_frame_args(&self) -> u64 {
+        self.dropped_begin_frame_args
+    }
+}
+
+/// Returns whether `begin_frame` is newer than an observer's last used
+/// BeginFrame.
+pub fn begin_frame_follows_last_used(
+    begin_frame: &BeginFrameArgs,
+    last_used_begin_frame: Option<&BeginFrameArgs>,
+    allow_missed_retry_for_current_frame: bool,
+) -> bool {
+    let Some(last_used_begin_frame) = last_used_begin_frame else {
+        return true;
+    };
+
+    if allow_missed_retry_for_current_frame
+        && begin_frame.missed
+        && begin_frame.id == last_used_begin_frame.id
+    {
+        return true;
+    }
+
+    begin_frame.frame_time > last_used_begin_frame.frame_time
+        && (begin_frame.id.source_id != last_used_begin_frame.id.source_id
+            || begin_frame.id.sequence_number > last_used_begin_frame.id.sequence_number)
+}
+
+/// Returns whether `begin_frame` is newer than an observer's last completed
+/// BeginFrame ack.
+pub fn begin_frame_follows_ack(
+    begin_frame: &BeginFrameArgs,
+    last_ack: Option<BeginFrameAck>,
+) -> bool {
+    let Some(last_ack) = last_ack else {
+        return true;
+    };
+
+    begin_frame.frame_time > last_ack.frame_time
+        && (begin_frame.id.source_id != last_ack.frame_id.source_id
+            || begin_frame.id.sequence_number > last_ack.frame_id.sequence_number)
+}
+
 /// Identifies a subscriber to a platform window's [`BeginFrameSource`].
 ///
 /// Mirrors the observer list on a `viz::BeginFrameSource`
 /// (`components/viz/common/frame_sinks/begin_frame_source.h`): the source issues
-/// [`BeginFrameArgs`] to the scheduler observer before the input observer. The
-/// two delivery paths are `IssueBeginFrameToSchedulerClient` /
-/// `IssueBeginFrameToInputClient` (`begin_frame_source.cc:238-245`).
+/// [`BeginFrameArgs`] to the input observer before the scheduler observer. The
+/// two delivery paths are `IssueBeginFrameToInputClient` /
+/// `IssueBeginFrameToSchedulerClient` (`begin_frame_source.cc:238-245`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BeginFrameObserverKind {
     /// The scheduler client. Consumes full frame requests — source begin frames,
@@ -780,8 +889,8 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     ///
     /// Mirrors wiring a `BeginFrameObserver` onto a `viz::BeginFrameSource`
     /// (`components/viz/common/frame_sinks/begin_frame_source.h`): the source
-    /// issues [`BeginFrameArgs`] to the scheduler client before the input client
-    /// (`IssueBeginFrameToSchedulerClient` / `IssueBeginFrameToInputClient`,
+    /// issues [`BeginFrameArgs`] to the input client before the scheduler client
+    /// (`IssueBeginFrameToInputClient` / `IssueBeginFrameToSchedulerClient`,
     /// `begin_frame_source.cc:238-245`). On platforms without a structured
     /// begin-frame source the scheduler variant is the window's frame callback
     /// and the input variant is ignored.
@@ -2495,6 +2604,53 @@ mod image_tests {
         for pixel in bytes.chunks_exact(4) {
             assert_eq!(pixel, &[0xF8, 0xBD, 0x38, 0xFF]);
         }
+    }
+}
+
+#[cfg(test)]
+mod begin_frame_tests {
+    use super::*;
+
+    #[test]
+    fn possible_deadlines_returns_os_preferred_candidate() {
+        let possible_deadlines = PossibleDeadlines {
+            os_preferred_index: 1,
+            deadlines: vec![
+                PossibleDeadline {
+                    vsync_id: 10,
+                    latch_delta: Duration::from_millis(8),
+                    present_delta: Duration::from_millis(16),
+                },
+                PossibleDeadline {
+                    vsync_id: 11,
+                    latch_delta: Duration::from_millis(24),
+                    present_delta: Duration::from_millis(32),
+                },
+            ],
+        };
+
+        assert_eq!(
+            possible_deadlines.os_preferred_deadline(),
+            Some(&PossibleDeadline {
+                vsync_id: 11,
+                latch_delta: Duration::from_millis(24),
+                present_delta: Duration::from_millis(32),
+            })
+        );
+    }
+
+    #[test]
+    fn possible_deadlines_returns_none_for_invalid_os_preferred_index() {
+        let possible_deadlines = PossibleDeadlines {
+            os_preferred_index: 1,
+            deadlines: vec![PossibleDeadline {
+                vsync_id: 10,
+                latch_delta: Duration::from_millis(8),
+                present_delta: Duration::from_millis(16),
+            }],
+        };
+
+        assert_eq!(possible_deadlines.os_preferred_deadline(), None);
     }
 }
 

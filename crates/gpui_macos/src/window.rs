@@ -553,6 +553,7 @@ impl MacBeginFrameSource {
         self.last_begin_frame_ack = Some(ack);
         if self
             .last_display_link_timing
+            .as_ref()
             .is_some_and(|timing| timing.begin_frame.id == ack.frame_id)
         {
             self.last_display_link_timing = None;
@@ -570,11 +571,12 @@ impl MacBeginFrameSource {
     }
 
     fn last_display_link_timing(&self) -> Option<DisplayLinkTiming> {
-        self.last_display_link_timing
+        self.last_display_link_timing.clone()
     }
 
     fn last_sequence_number(&self) -> u64 {
         self.last_display_link_timing
+            .as_ref()
             .map(|timing| timing.begin_frame.id.sequence_number)
             .unwrap_or_default()
     }
@@ -583,7 +585,7 @@ impl MacBeginFrameSource {
         missed_display_link_timing_if_observing(
             self.scheduler_observer_registered,
             timing,
-            self.last_used_begin_frame,
+            self.last_used_begin_frame.clone(),
             self.last_begin_frame_ack,
         )
     }
@@ -596,7 +598,7 @@ impl MacBeginFrameSource {
         should_deliver_frame_request(
             kind,
             options,
-            self.last_used_begin_frame,
+            self.last_used_begin_frame.clone(),
             self.last_begin_frame_ack,
         )
     }
@@ -3155,9 +3157,9 @@ extern "C" fn step(view: *mut c_void) {
         .as_ref()
         .and_then(DisplayLink::latest_timing);
     let mut committed_ready_iosurface_frame = false;
-    if let Some(display_link_timing) = display_link_timing {
+    if let Some(display_link_timing) = display_link_timing.as_ref() {
         lock.begin_frame_source
-            .record_display_link_timing(display_link_timing);
+            .record_display_link_timing(display_link_timing.clone());
         committed_ready_iosurface_frame = lock.renderer.set_display_timing(
             display_link_timing.predicted_display_time,
             display_link_timing.frame_interval,
@@ -3248,25 +3250,11 @@ fn begin_frame_is_newer_than_source_records(
     last_used_begin_frame: Option<BeginFrameArgs>,
     last_ack: Option<BeginFrameAck>,
 ) -> bool {
-    if last_used_begin_frame.is_some_and(|last_used_begin_frame| {
-        begin_frame.id == last_used_begin_frame.id
-            || begin_frame.frame_time <= last_used_begin_frame.frame_time
-            || (begin_frame.id.source_id == last_used_begin_frame.id.source_id
-                && begin_frame.id.sequence_number <= last_used_begin_frame.id.sequence_number)
-    }) {
+    if !gpui::begin_frame_follows_last_used(&begin_frame, last_used_begin_frame.as_ref(), false) {
         return false;
     }
 
-    if last_ack.is_some_and(|ack| {
-        ack.frame_id == begin_frame.id
-            || begin_frame.frame_time <= ack.frame_time
-            || (begin_frame.id.source_id == ack.frame_id.source_id
-                && begin_frame.id.sequence_number <= ack.frame_id.sequence_number)
-    }) {
-        return false;
-    }
-
-    true
+    gpui::begin_frame_follows_ack(&begin_frame, last_ack)
 }
 
 fn missed_display_link_timing_if_observing(
@@ -3279,7 +3267,7 @@ fn missed_display_link_timing_if_observing(
         return None;
     }
     if !begin_frame_is_newer_than_source_records(
-        last_timing.begin_frame,
+        last_timing.begin_frame.clone(),
         last_used_begin_frame,
         last_ack,
     ) {
@@ -3318,7 +3306,10 @@ fn record_completed_begin_frame_ack(
     };
 
     *last_ack = Some(ack);
-    if last_timing.is_some_and(|timing| timing.begin_frame.id == ack.frame_id) {
+    if last_timing
+        .as_ref()
+        .is_some_and(|timing| timing.begin_frame.id == ack.frame_id)
+    {
         *last_timing = None;
     }
 }
@@ -3359,14 +3350,14 @@ fn request_frame(
     );
     if !lock
         .begin_frame_source
-        .should_issue_to_scheduler_observer(kind, options)
+        .should_issue_to_scheduler_observer(kind, options.clone())
     {
         return;
     }
 
     if let Some((mut input_callback, begin_frame)) = lock
         .begin_frame_source
-        .take_input_client_for_begin_frame(kind, options)
+        .take_input_client_for_begin_frame(kind, options.clone())
     {
         drop(lock);
         input_callback(begin_frame);
@@ -3393,7 +3384,7 @@ fn request_frame(
     let Some(mut callback) = lock.begin_frame_source.take_scheduler_observer_callback() else {
         return;
     };
-    lock.record_used_begin_frame(options.begin_frame);
+    lock.record_used_begin_frame(options.begin_frame.clone());
     drop(lock);
 
     callback(options);
@@ -3418,7 +3409,7 @@ fn request_begin_frame(window_state: Weak<Mutex<MacWindowState>>) {
         return;
     };
     lock.begin_frame_source
-        .record_display_link_timing(display_link_timing);
+        .record_display_link_timing(display_link_timing.clone());
     drop(lock);
 
     let request_frame_options =
@@ -3447,7 +3438,7 @@ fn request_missed_frame(window_state: Weak<Mutex<MacWindowState>>) {
         return;
     };
     lock.begin_frame_source
-        .record_display_link_timing(display_link_timing);
+        .record_display_link_timing(display_link_timing.clone());
     let request_frame_options =
         request_frame_options_for_display_link_timing(Some(display_link_timing));
     drop(lock);
@@ -3999,6 +3990,7 @@ extern "C" fn toggle_tab_bar(this: &Object, _sel: Sel, _id: id) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
 
     #[test]
     fn missed_display_link_timing_reissues_last_timing_as_missed() {
@@ -4015,13 +4007,14 @@ mod tests {
                 deadline: predicted_display_time,
                 interval: frame_interval,
                 missed: false,
+                possible_deadlines: None,
             },
             predicted_display_time,
             frame_interval: Some(frame_interval),
             frame_deadline: predicted_display_time,
         };
 
-        let missed_timing = missed_display_link_timing(last_timing).unwrap();
+        let missed_timing = missed_display_link_timing(last_timing.clone()).unwrap();
 
         assert_eq!(missed_timing.begin_frame.id, last_timing.begin_frame.id);
         assert_eq!(
@@ -4049,6 +4042,7 @@ mod tests {
                 deadline: frame_time,
                 interval: Duration::ZERO,
                 missed: false,
+                possible_deadlines: None,
             },
             predicted_display_time: frame_time,
             frame_interval: Some(Duration::ZERO),
@@ -4072,13 +4066,17 @@ mod tests {
                 deadline: predicted_display_time,
                 interval: Duration::from_millis(16),
                 missed: false,
+                possible_deadlines: None,
             },
             predicted_display_time,
             frame_interval: Some(Duration::from_millis(16)),
             frame_deadline: predicted_display_time,
         };
 
-        assert!(missed_display_link_timing_if_observing(false, last_timing, None, None).is_none());
+        assert!(
+            missed_display_link_timing_if_observing(false, last_timing.clone(), None, None)
+                .is_none()
+        );
         assert!(missed_display_link_timing_if_observing(true, last_timing, None, None).is_some());
     }
 
@@ -4096,6 +4094,7 @@ mod tests {
                 deadline: predicted_display_time,
                 interval: Duration::from_millis(16),
                 missed: false,
+                possible_deadlines: None,
             },
             predicted_display_time,
             frame_interval: Some(Duration::from_millis(16)),
@@ -4103,11 +4102,11 @@ mod tests {
         };
         let mut source = MacBeginFrameSource::default();
 
-        source.record_display_link_timing(timing);
-        assert!(source.missed_timing(timing).is_none());
+        source.record_display_link_timing(timing.clone());
+        assert!(source.missed_timing(timing.clone()).is_none());
 
         gpui::BeginFrameSource::add_observer(&mut source, MacBeginFrameObserverId::Scheduler);
-        let missed_timing = source.missed_timing(timing).unwrap();
+        let missed_timing = source.missed_timing(timing.clone()).unwrap();
         assert!(missed_timing.begin_frame.missed);
         assert_eq!(missed_timing.begin_frame.id, timing.begin_frame.id);
 
@@ -4129,6 +4128,7 @@ mod tests {
                 deadline: predicted_display_time,
                 interval: Duration::from_millis(16),
                 missed: false,
+                possible_deadlines: None,
             },
             predicted_display_time,
             frame_interval: Some(Duration::from_millis(16)),
@@ -4136,7 +4136,7 @@ mod tests {
         };
         let mut source = MacBeginFrameSource::default();
         gpui::BeginFrameSource::add_observer(&mut source, MacBeginFrameObserverId::Scheduler);
-        source.record_display_link_timing(timing);
+        source.record_display_link_timing(timing.clone());
 
         gpui::BeginFrameSource::did_finish_frame(
             &mut source,
@@ -4165,35 +4165,37 @@ mod tests {
             deadline: predicted_display_time,
             interval: Duration::from_millis(16),
             missed: false,
+            possible_deadlines: None,
         };
         let options = RequestFrameOptions {
-            begin_frame: Some(begin_frame),
+            begin_frame: Some(begin_frame.clone()),
             predicted_display_time: Some(predicted_display_time),
             frame_interval: Some(Duration::from_millis(16)),
             frame_deadline: Some(predicted_display_time),
             ..Default::default()
         };
-        let observed_begin_frame = Rc::new(Cell::new(None));
+        let observed_begin_frame = Rc::new(RefCell::new(None));
         let mut source = MacBeginFrameSource::default();
         source.set_input_client(Box::new({
             let observed_begin_frame = observed_begin_frame.clone();
-            move |begin_frame| observed_begin_frame.set(Some(begin_frame))
+            move |begin_frame| *observed_begin_frame.borrow_mut() = Some(begin_frame)
         }));
 
-        let Some((mut input_client, input_begin_frame)) = source
-            .take_input_client_for_begin_frame(FrameRequestDeliveryKind::SourceBeginFrame, options)
-        else {
+        let Some((mut input_client, input_begin_frame)) = source.take_input_client_for_begin_frame(
+            FrameRequestDeliveryKind::SourceBeginFrame,
+            options.clone(),
+        ) else {
             panic!("source BeginFrame should issue to input client");
         };
         input_client(input_begin_frame);
         source.restore_input_client(input_client);
-        assert_eq!(observed_begin_frame.get(), Some(begin_frame));
+        assert_eq!(*observed_begin_frame.borrow(), Some(begin_frame.clone()));
 
         assert!(source.should_issue_to_scheduler_observer(
             FrameRequestDeliveryKind::SourceBeginFrame,
-            options,
+            options.clone(),
         ));
-        source.record_used_begin_frame(options.begin_frame);
+        source.record_used_begin_frame(options.begin_frame.clone());
         assert!(!source.should_issue_to_scheduler_observer(
             FrameRequestDeliveryKind::SourceBeginFrameAfterInput,
             options,
@@ -4213,9 +4215,10 @@ mod tests {
             deadline: predicted_display_time,
             interval: Duration::from_millis(16),
             missed: false,
+            possible_deadlines: None,
         };
         let options = RequestFrameOptions {
-            begin_frame: Some(begin_frame),
+            begin_frame: Some(begin_frame.clone()),
             predicted_display_time: Some(predicted_display_time),
             frame_interval: Some(Duration::from_millis(16)),
             frame_deadline: Some(predicted_display_time),
@@ -4229,9 +4232,10 @@ mod tests {
         }));
 
         // Installing the input client auto-registers the observer — delivery works.
-        let Some((mut input_client, input_begin_frame)) = source
-            .take_input_client_for_begin_frame(FrameRequestDeliveryKind::SourceBeginFrame, options)
-        else {
+        let Some((mut input_client, input_begin_frame)) = source.take_input_client_for_begin_frame(
+            FrameRequestDeliveryKind::SourceBeginFrame,
+            options.clone(),
+        ) else {
             panic!("source BeginFrame should issue to input client when registered");
         };
         input_client(input_begin_frame);
@@ -4244,7 +4248,7 @@ mod tests {
             source
                 .take_input_client_for_begin_frame(
                     FrameRequestDeliveryKind::SourceBeginFrame,
-                    options
+                    options.clone()
                 )
                 .is_none()
         );
@@ -4275,6 +4279,7 @@ mod tests {
                 deadline: predicted_display_time,
                 interval: Duration::from_millis(16),
                 missed: false,
+                possible_deadlines: None,
             },
             predicted_display_time,
             frame_interval: Some(Duration::from_millis(16)),
@@ -4284,7 +4289,7 @@ mod tests {
         assert!(
             missed_display_link_timing_if_observing(
                 true,
-                last_timing,
+                last_timing.clone(),
                 None,
                 Some(gpui::BeginFrameAck {
                     frame_id: last_timing.begin_frame.id,
@@ -4297,7 +4302,7 @@ mod tests {
         assert!(
             missed_display_link_timing_if_observing(
                 true,
-                last_timing,
+                last_timing.clone(),
                 None,
                 Some(gpui::BeginFrameAck {
                     frame_id: gpui::BeginFrameId {
@@ -4330,6 +4335,7 @@ mod tests {
                 deadline: predicted_display_time,
                 interval: Duration::from_millis(16),
                 missed: false,
+                possible_deadlines: None,
             },
             predicted_display_time,
             frame_interval: Some(Duration::from_millis(16)),
@@ -4339,8 +4345,8 @@ mod tests {
         assert!(
             missed_display_link_timing_if_observing(
                 true,
-                last_timing,
-                Some(last_timing.begin_frame),
+                last_timing.clone(),
+                Some(last_timing.begin_frame.clone()),
                 None,
             )
             .is_none()
@@ -4362,6 +4368,7 @@ mod tests {
                         .unwrap_or(predicted_display_time),
                     interval: Duration::from_millis(16),
                     missed: false,
+                    possible_deadlines: None,
                 }),
                 None,
             )
@@ -4382,9 +4389,10 @@ mod tests {
             deadline: predicted_display_time,
             interval: Duration::from_millis(16),
             missed: false,
+            possible_deadlines: None,
         };
         let request_frame_options = RequestFrameOptions {
-            begin_frame: Some(begin_frame),
+            begin_frame: Some(begin_frame.clone()),
             predicted_display_time: Some(predicted_display_time),
             frame_interval: Some(Duration::from_millis(16)),
             frame_deadline: Some(predicted_display_time),
@@ -4393,26 +4401,26 @@ mod tests {
 
         assert!(!should_deliver_frame_request(
             FrameRequestDeliveryKind::SourceBeginFrame,
-            request_frame_options,
-            Some(begin_frame),
+            request_frame_options.clone(),
+            Some(begin_frame.clone()),
             None,
         ));
         assert!(!should_deliver_frame_request(
             FrameRequestDeliveryKind::SourceBeginFrameAfterInput,
-            request_frame_options,
-            Some(begin_frame),
+            request_frame_options.clone(),
+            Some(begin_frame.clone()),
             None,
         ));
         assert!(should_deliver_frame_request(
             FrameRequestDeliveryKind::SchedulerReplay,
-            request_frame_options,
-            Some(begin_frame),
+            request_frame_options.clone(),
+            Some(begin_frame.clone()),
             None,
         ));
         assert!(should_deliver_frame_request(
             FrameRequestDeliveryKind::Native,
             RequestFrameOptions::default(),
-            Some(begin_frame),
+            Some(begin_frame.clone()),
             None,
         ));
         assert!(!should_deliver_frame_request(
@@ -4437,6 +4445,7 @@ mod tests {
                 deadline: predicted_display_time,
                 interval: Duration::from_millis(16),
                 missed: false,
+                possible_deadlines: None,
             },
             predicted_display_time,
             frame_interval: Some(Duration::from_millis(16)),
@@ -4446,7 +4455,7 @@ mod tests {
         assert!(
             missed_display_link_timing_if_observing(
                 true,
-                last_timing,
+                last_timing.clone(),
                 None,
                 Some(gpui::BeginFrameAck {
                     frame_id: gpui::BeginFrameId {
@@ -4496,6 +4505,7 @@ mod tests {
                 deadline: predicted_display_time,
                 interval: Duration::from_millis(16),
                 missed: false,
+                possible_deadlines: None,
             },
             predicted_display_time,
             frame_interval: Some(Duration::from_millis(16)),
@@ -4541,6 +4551,7 @@ mod tests {
                 deadline: predicted_display_time,
                 interval: Duration::from_millis(16),
                 missed: false,
+                possible_deadlines: None,
             },
             predicted_display_time,
             frame_interval: Some(Duration::from_millis(16)),

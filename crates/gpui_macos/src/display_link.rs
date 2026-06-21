@@ -3,7 +3,7 @@ use core_graphics::display::CGDirectDisplayID;
 use dispatch2::{
     _dispatch_source_type_data_add, DispatchObject, DispatchQueue, DispatchRetained, DispatchSource,
 };
-use gpui::{BeginFrameArgs, BeginFrameId};
+use gpui::{BeginFrameArgs, BeginFrameId, PossibleDeadline, PossibleDeadlines};
 use gpui_util::ResultExt;
 use mach2::mach_time::{mach_absolute_time, mach_timebase_info, mach_timebase_info_data_t};
 use scheduler::Instant;
@@ -33,7 +33,7 @@ struct DisplayLinkCallbackContext {
     latest_frame_interval_ns: Arc<AtomicU64>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct DisplayLinkTiming {
     pub begin_frame: BeginFrameArgs,
     pub predicted_display_time: Instant,
@@ -142,17 +142,24 @@ impl DisplayLink {
         };
         let interval = frame_interval.unwrap_or(Duration::from_micros(16667));
         let sequence_number = self.latest_sequence_number.load(Ordering::Acquire);
+        let frame_time = predicted_display_time
+            .checked_sub(interval)
+            .unwrap_or(predicted_display_time);
+        let first_present_delta = predicted_display_time.saturating_duration_since(frame_time);
         let begin_frame = BeginFrameArgs {
             id: BeginFrameId {
                 source_id: self.source_id,
                 sequence_number,
             },
-            frame_time: predicted_display_time
-                .checked_sub(interval)
-                .unwrap_or(predicted_display_time),
+            frame_time,
             deadline: predicted_display_time,
             interval,
             missed: false,
+            possible_deadlines: Some(possible_deadlines_for_frame(
+                sequence_number,
+                interval,
+                first_present_delta,
+            )),
         };
         Some(DisplayLinkTiming {
             begin_frame,
@@ -174,6 +181,84 @@ impl DisplayLink {
             self.display_link.as_mut().unwrap().stop()?;
         }
         Ok(())
+    }
+}
+
+fn possible_deadlines_for_frame(
+    sequence_number: u64,
+    interval: Duration,
+    first_present_delta: Duration,
+) -> PossibleDeadlines {
+    const FORWARD_VSYNC_CANDIDATES: u32 = 3;
+
+    let deadlines = (0..FORWARD_VSYNC_CANDIDATES)
+        .map(|candidate| {
+            let present_delta = first_present_delta + interval.saturating_mul(candidate);
+            PossibleDeadline {
+                vsync_id: i64::try_from(sequence_number.saturating_add(u64::from(candidate)))
+                    .unwrap_or(i64::MAX),
+                latch_delta: present_delta,
+                present_delta,
+            }
+        })
+        .collect();
+
+    PossibleDeadlines {
+        os_preferred_index: 0,
+        deadlines,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn possible_deadlines_include_os_preferred_and_forward_vsync_candidates() {
+        let interval = Duration::from_millis(8);
+        let deadlines = possible_deadlines_for_frame(42, interval, Duration::from_millis(10));
+
+        assert_eq!(deadlines.os_preferred_index, 0);
+        assert_eq!(
+            deadlines.deadlines,
+            vec![
+                PossibleDeadline {
+                    vsync_id: 42,
+                    latch_delta: Duration::from_millis(10),
+                    present_delta: Duration::from_millis(10),
+                },
+                PossibleDeadline {
+                    vsync_id: 43,
+                    latch_delta: Duration::from_millis(18),
+                    present_delta: Duration::from_millis(18),
+                },
+                PossibleDeadline {
+                    vsync_id: 44,
+                    latch_delta: Duration::from_millis(26),
+                    present_delta: Duration::from_millis(26),
+                },
+            ]
+        );
+        assert_eq!(
+            deadlines.os_preferred_deadline(),
+            Some(&PossibleDeadline {
+                vsync_id: 42,
+                latch_delta: Duration::from_millis(10),
+                present_delta: Duration::from_millis(10),
+            })
+        );
+    }
+
+    #[test]
+    fn possible_deadlines_clamp_vsync_id_on_overflow() {
+        let deadlines = possible_deadlines_for_frame(
+            u64::MAX,
+            Duration::from_millis(8),
+            Duration::from_millis(8),
+        );
+
+        assert_eq!(deadlines.deadlines[0].vsync_id, i64::MAX);
+        assert_eq!(deadlines.deadlines[1].vsync_id, i64::MAX);
     }
 }
 
