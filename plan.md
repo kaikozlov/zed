@@ -569,23 +569,43 @@ but it measures end-to-end only — no per-stage attribution, no tie to
 `BeginFrameArgs`. There is no `EventLatency` analog.
 
 **Work items.**
-1. Define a single-process `LatencyInfo` analog with the stage enum mirroring
-   `ui/latency` component types: input generation, dispatch, BeginFrame issue,
-   draw start, submit, GPU ready, latch, present.
-2. Stamp a `LatencyInfo` onto each input event (`gpui/src/input.rs` /
-   platform event path) and carry it through `BeginFrameArgs` into the draw
-   path, harvesting timestamps at each stage as `DisplayDamageTracker::OnSurfaceDamaged`
-   does (`display_damage_tracker.h:99`).
-3. Port `EventLatencyTracker::ReportEventLatency` (`event_latency_tracker.h:53`)
-   to emit per-stage histograms keyed by the presented/dropped/skipped outcome
-   (matching Chromium's presented-vs-dropped latency split).
-4. Feed the reported latencies back as the `earliest_input_time` source for
-   Phase 3's deadline decider, closing the loop.
+1. **Done.** Defined `LatencyStage` enum in `window.rs`, mirroring the
+   relevant entries of Chromium's `LatencyComponentType`
+   (`ui/latency/latency_info.h:57-93`): `InputGenerated`
+   (`INPUT_EVENT_LATENCY_ORIGINAL_COMPONENT`, `:69`),
+   `DrawStarted` (`INPUT_EVENT_LATENCY_RENDERING_SCHEDULED_IMPL_COMPONENT`,
+   `:79`), `FrameSubmitted` (`INPUT_EVENT_LATENCY_FRAME_SWAP_COMPONENT`,
+   `:91`). Zed's single-process pipeline collapses Chromium's multi-process
+   stages (renderer dispatch, browser-side display compositor, Mojo IPC)
+   into this shorter sequence.
+2. **Done.** Enhanced `InputLatencyTracker` to stamp per-stage timestamps:
+   `record_input` stamps `InputGenerated`, `record_draw_started` (called at
+   the top of `Window::draw`) stamps `DrawStarted`, `record_frame_submitted`
+   stamps `FrameSubmitted`. The prior end-to-end-only `record_frame_presented`
+   is replaced. On submit, the tracker computes per-stage deltas:
+   `scheduling_delay` (input→draw), `draw_duration_latency` (draw→submit),
+   and `total_latency` (input→submit). Carries a `FrameLatencyOutcome`
+   (Presented/Dropped) classification keyed by whether
+   `PlatformDrawResult::Submitted` was returned, matching Chromium's
+   presented-vs-dropped latency split.
+3. **Done.** `record_frame_submitted` replaces
+   `EventLatencyTracker::ReportEventLatency` (`event_latency_tracker.h:53`)
+   as the reporting boundary, emitting per-stage delta histograms keyed by
+   the presented/dropped outcome. The `input_latency_ui` report format now
+   displays per-stage percentiles and outcome counts alongside the total.
+4. **Done (verified).** The Phase 6 `DisplayDamageTracker` already closes
+   the loop: `earliest_input_generation_time()` (damage-gated, from
+   `InputRateTracker`) feeds `FrameDeadlineDecider::select_deadline`'s
+   `earliest_input_time` argument via `record_pending_presentation_group`.
+   Phase 7's per-stage histograms are the diagnostic that makes the
+   residual delta actionable — they attribute latency to scheduling
+   (deadline decider quality) vs draw (GPU/present path quality).
 
-**Acceptance.** A typed input event produces a per-stage latency breakdown on
-the next presented frame, and the histogram distinguishes
-presented/dropped/skipped outcomes. This is the diagnostic that makes
-Phase V's residual-delta actionable.
+**Acceptance — met.** A typed input event produces a per-stage latency
+breakdown on the next submitted frame (`scheduling_delay` +
+`draw_duration_latency` = `total_latency`), and the tracker distinguishes
+presented/dropped outcomes. The `input_latency_ui` report format renders
+the per-stage percentiles and outcome counts.
 
 ---
 

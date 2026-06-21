@@ -74,10 +74,8 @@ pub fn report_input_latency_telemetry(window: &Window, cx: &mut App) {
 
     let (delta_latency, delta_coalesce, report_window_seconds) =
         if let Some((prev_instant, prev_snapshot)) = state.previous.get(&window_id) {
-            let mut delta_latency = current.latency_histogram.clone();
-            delta_latency
-                .subtract(&prev_snapshot.latency_histogram)
-                .ok();
+            let mut delta_latency = current.total_latency.clone();
+            delta_latency.subtract(&prev_snapshot.total_latency).ok();
             let mut delta_coalesce = current.events_per_frame_histogram.clone();
             delta_coalesce
                 .subtract(&prev_snapshot.events_per_frame_histogram)
@@ -90,7 +88,7 @@ pub fn report_input_latency_telemetry(window: &Window, cx: &mut App) {
             // window has been open, so record 0 to signal that this is the
             // initial accumulation period rather than a fixed-width window.
             (
-                current.latency_histogram.clone(),
+                current.total_latency.clone(),
                 current.events_per_frame_histogram.clone(),
                 0u64,
             )
@@ -139,7 +137,7 @@ fn count_frames_in_range(histogram: &Histogram<u64>, low_ns: u64, high_ns: u64) 
 }
 
 fn format_report(snapshot: &InputLatencySnapshot, previous: &ReporterState) -> String {
-    let histogram = &snapshot.latency_histogram;
+    let histogram = &snapshot.total_latency;
     let total = histogram.len();
 
     if total == 0 {
@@ -175,6 +173,40 @@ fn format_report(snapshot: &InputLatencySnapshot, previous: &ReporterState) -> S
 
     write_latency_percentiles(&mut report, "Percentiles", histogram, percentiles);
     write_latency_distribution(&mut report, "Distribution", histogram);
+
+    let total_outcomes = snapshot.presented_count + snapshot.dropped_count;
+    if total_outcomes > 0 {
+        report.push('\n');
+        report.push_str("Frame Outcomes\n");
+        report.push_str("--------------\n");
+        report.push_str(&format!(
+            "  Presented: {:>6} ({:>5.1}%)\n",
+            snapshot.presented_count,
+            snapshot.presented_count as f64 / total_outcomes as f64 * 100.0
+        ));
+        report.push_str(&format!(
+            "  Dropped:   {:>6} ({:>5.1}%)\n",
+            snapshot.dropped_count,
+            snapshot.dropped_count as f64 / total_outcomes as f64 * 100.0
+        ));
+    }
+
+    if snapshot.scheduling_delay.len() > 0 {
+        write_latency_percentiles(
+            &mut report,
+            "Scheduling Delay (input → draw start)",
+            &snapshot.scheduling_delay,
+            percentiles,
+        );
+    }
+    if snapshot.draw_duration_latency.len() > 0 {
+        write_latency_percentiles(
+            &mut report,
+            "Draw Duration (draw start → submit)",
+            &snapshot.draw_duration_latency,
+            percentiles,
+        );
+    }
 
     let coalesce = &snapshot.events_per_frame_histogram;
     let coalesce_total = coalesce.len();
@@ -219,7 +251,7 @@ fn format_report(snapshot: &InputLatencySnapshot, previous: &ReporterState) -> S
     if let (Some(prev_snapshot), Some(prev_timestamp)) =
         (&previous.previous_snapshot, &previous.previous_timestamp)
     {
-        let prev_latency = &prev_snapshot.latency_histogram;
+        let prev_latency = &prev_snapshot.total_latency;
         let prev_total = prev_latency.len();
         let delta_total = total - prev_total;
 

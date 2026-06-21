@@ -3367,6 +3367,95 @@ mod tests {
         drop(data);
     }
 
+    #[cfg(feature = "input-latency-histogram")]
+    #[test]
+    fn input_latency_tracker_records_total_latency_on_submit() {
+        let mut tracker = InputLatencyTracker::new().unwrap();
+        let input_time = Instant::now();
+        tracker.record_input(input_time);
+        tracker.record_draw_started();
+        tracker.record_frame_submitted(FrameLatencyOutcome::Presented);
+
+        let snapshot = tracker.snapshot();
+        assert_eq!(snapshot.total_latency.len(), 1);
+        assert!(snapshot.total_latency.min() > 0);
+        assert_eq!(snapshot.presented_count, 1);
+        assert_eq!(snapshot.dropped_count, 0);
+    }
+
+    #[cfg(feature = "input-latency-histogram")]
+    #[test]
+    fn input_latency_tracker_records_per_stage_deltas() {
+        let mut tracker = InputLatencyTracker::new().unwrap();
+        tracker.record_input(Instant::now());
+        tracker.record_draw_started();
+        tracker.record_frame_submitted(FrameLatencyOutcome::Presented);
+
+        let snapshot = tracker.snapshot();
+        assert_eq!(snapshot.scheduling_delay.len(), 1);
+        assert_eq!(snapshot.draw_duration_latency.len(), 1);
+        assert!(snapshot.scheduling_delay.min() > 0);
+        assert!(snapshot.draw_duration_latency.min() > 0);
+    }
+
+    #[cfg(feature = "input-latency-histogram")]
+    #[test]
+    fn input_latency_tracker_distinguishes_presented_and_dropped() {
+        let mut tracker = InputLatencyTracker::new().unwrap();
+
+        tracker.record_input(Instant::now());
+        tracker.record_draw_started();
+        tracker.record_frame_submitted(FrameLatencyOutcome::Presented);
+
+        tracker.record_input(Instant::now());
+        tracker.record_draw_started();
+        tracker.record_frame_submitted(FrameLatencyOutcome::Dropped);
+
+        let snapshot = tracker.snapshot();
+        assert_eq!(snapshot.presented_count, 1);
+        assert_eq!(snapshot.dropped_count, 1);
+        assert_eq!(snapshot.total_latency.len(), 2);
+    }
+
+    #[cfg(feature = "input-latency-histogram")]
+    #[test]
+    fn input_latency_tracker_coalesces_multiple_inputs_per_frame() {
+        let mut tracker = InputLatencyTracker::new().unwrap();
+        tracker.record_input(Instant::now());
+        tracker.record_input(Instant::now());
+        tracker.record_input(Instant::now());
+        tracker.record_draw_started();
+        tracker.record_frame_submitted(FrameLatencyOutcome::Presented);
+
+        let snapshot = tracker.snapshot();
+        assert_eq!(snapshot.total_latency.len(), 1, "one sample per frame");
+        assert_eq!(snapshot.events_per_frame_histogram.len(), 1);
+    }
+
+    #[cfg(feature = "input-latency-histogram")]
+    #[test]
+    fn input_latency_tracker_records_mid_draw_exclusions() {
+        let mut tracker = InputLatencyTracker::new().unwrap();
+        tracker.record_mid_draw_input();
+        tracker.record_mid_draw_input();
+
+        let snapshot = tracker.snapshot();
+        assert_eq!(snapshot.mid_draw_events_dropped, 2);
+    }
+
+    #[cfg(feature = "input-latency-histogram")]
+    #[test]
+    fn input_latency_tracker_no_input_produces_no_latency_sample() {
+        let mut tracker = InputLatencyTracker::new().unwrap();
+        tracker.record_draw_started();
+        tracker.record_frame_submitted(FrameLatencyOutcome::Presented);
+
+        let snapshot = tracker.snapshot();
+        assert_eq!(snapshot.total_latency.len(), 0);
+        assert_eq!(snapshot.scheduling_delay.len(), 0);
+        assert_eq!(snapshot.draw_duration_latency.len(), 0);
+    }
+
     #[test]
     fn bounded_dirty_view_damage_unions_until_unbounded() {
         let view_id = EntityId::from(1);
@@ -4844,57 +4933,141 @@ mod tests {
     }
 }
 
-/// A point-in-time snapshot of the input-latency histograms for a window,
-/// suitable for external formatting.
+/// Per-stage latency pipeline stages mirroring the relevant entries of
+/// Chromium's `LatencyComponentType`
+/// (`ui/latency/latency_info.h:57-93`). In Zed's single-process pipeline,
+/// the multi-process stages (renderer dispatch, browser-side display
+/// compositor, Mojo IPC) collapse into a shorter sequence.
+#[cfg(feature = "input-latency-histogram")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum LatencyStage {
+    /// Mirrors `INPUT_EVENT_LATENCY_ORIGINAL_COMPONENT`
+    /// (`latency_info.h:69`). Input event dispatched to the window.
+    InputGenerated,
+    /// Mirrors `INPUT_EVENT_LATENCY_RENDERING_SCHEDULED_IMPL_COMPONENT`
+    /// (`latency_info.h:79`). BeginFrame deadline fired and the frame's
+    /// draw is starting.
+    DrawStarted,
+    /// Mirrors `INPUT_EVENT_LATENCY_FRAME_SWAP_COMPONENT`
+    /// (`latency_info.h:91`). Frame submitted to the platform presenter.
+    FrameSubmitted,
+}
+
+/// Frame production outcome, mirroring Chromium's presented/dropped/skipped
+/// classification from `event_latency_tracker.h` + `CompositorFrameReporter`.
+#[cfg(feature = "input-latency-histogram")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FrameLatencyOutcome {
+    /// Frame was drawn and submitted successfully.
+    Presented,
+    /// Frame production resulted in no draw or a deferred/failed swap.
+    Dropped,
+}
+
+/// A point-in-time snapshot of the per-stage input-latency histograms for a
+/// window, suitable for external formatting.
+///
+/// Each histogram records the delta between consecutive pipeline stages in
+/// nanoseconds, making it possible to attribute residual latency to a
+/// specific stage — the diagnostic the Phase V typometer gate needs to make
+/// its residual-delta actionable (per `plan.md` Phase 7 acceptance).
 #[cfg(feature = "input-latency-histogram")]
 pub struct InputLatencySnapshot {
-    /// Histogram of input-to-frame latency samples, in nanoseconds.
-    pub latency_histogram: Histogram<u64>,
+    /// Total input-to-submit latency (InputGenerated → FrameSubmitted).
+    pub total_latency: Histogram<u64>,
+    /// Scheduling delay: InputGenerated → DrawStarted. Captures the
+    /// time from input dispatch to the frame's draw beginning, including
+    /// BeginFrame deadline scheduling and wait.
+    pub scheduling_delay: Histogram<u64>,
+    /// Draw duration: DrawStarted → FrameSubmitted. Captures the
+    /// time spent painting and submitting the frame.
+    pub draw_duration_latency: Histogram<u64>,
     /// Histogram of input events coalesced per rendered frame.
     pub events_per_frame_histogram: Histogram<u64>,
     /// Count of input events that arrived mid-draw and were excluded from
     /// latency recording.
     pub mid_draw_events_dropped: u64,
+    /// Count of frames that were drawn and submitted successfully.
+    pub presented_count: u64,
+    /// Count of frames where production resulted in no draw or a
+    /// deferred/failed swap.
+    pub dropped_count: u64,
 }
 
-/// Records the time between when the first input event in a frame is dispatched
-/// and when the resulting frame is presented, capturing worst-case latency when
-/// multiple events are coalesced into a single frame.
+/// Per-stage input latency tracker, mirroring Chromium's
+/// `LatencyInfo` + `EventLatencyTracker` in a single-process form.
+///
+/// Stamps timestamps at each pipeline stage for the earliest pending input
+/// (worst-case latency attribution when multiple inputs coalesce into one
+/// frame). On frame submit, computes per-stage deltas and records them into
+/// histograms, then classifies the frame outcome as presented or dropped.
+///
+/// The per-stage breakdown replaces the prior end-to-end-only measurement.
+/// It is the diagnostic that makes the Phase V residual-delta actionable:
+/// scheduling delay tells you whether the deadline decider (Phase 3) is
+/// choosing the right latch; draw duration tells you whether the
+/// GPU/present path (Phases 8-9) is the bottleneck.
 #[cfg(feature = "input-latency-histogram")]
 struct InputLatencyTracker {
-    /// Timestamp of the first unrendered input event in the current frame;
-    /// cleared when a frame is presented.
-    first_input_at: Option<Instant>,
-    /// Count of input events received since the last frame was presented.
+    /// Timestamp of the first unrendered input event in the current frame,
+    /// mirroring the earliest `LatencyInfo` trace in the pending set.
+    /// Cleared when a frame is submitted.
+    input_generated_at: Option<Instant>,
+    /// Timestamp when the current frame's draw began. Set idempotently at
+    /// the top of `Window::draw`.
+    draw_started_at: Option<Instant>,
+    /// Count of input events received since the last frame was submitted.
     pending_input_count: u64,
-    /// Histogram of input-to-frame latency samples, in nanoseconds.
-    latency_histogram: Histogram<u64>,
-    /// Histogram of input events coalesced per rendered frame.
+    /// Total input-to-submit latency, in nanoseconds.
+    total_latency: Histogram<u64>,
+    /// Input dispatch to draw-start delay, in nanoseconds.
+    scheduling_delay: Histogram<u64>,
+    /// Draw-start to submit duration, in nanoseconds.
+    draw_duration_latency: Histogram<u64>,
+    /// Input events coalesced per rendered frame.
     events_per_frame_histogram: Histogram<u64>,
-    /// Count of input events that arrived mid-draw and were excluded from
-    /// latency recording because their effects won't appear until the next frame.
+    /// Input events that arrived mid-draw and were excluded from latency
+    /// recording because their effects won't appear until the next frame.
     mid_draw_events_dropped: u64,
+    /// Outcome counters.
+    presented_count: u64,
+    dropped_count: u64,
 }
 
 #[cfg(feature = "input-latency-histogram")]
 impl InputLatencyTracker {
     fn new() -> Result<Self> {
         Ok(Self {
-            first_input_at: None,
+            input_generated_at: None,
+            draw_started_at: None,
             pending_input_count: 0,
-            latency_histogram: Histogram::new(3)
-                .map_err(|e| anyhow!("Failed to create input latency histogram: {e}"))?,
+            total_latency: Histogram::new(3)
+                .map_err(|e| anyhow!("Failed to create total latency histogram: {e}"))?,
+            scheduling_delay: Histogram::new(3)
+                .map_err(|e| anyhow!("Failed to create scheduling delay histogram: {e}"))?,
+            draw_duration_latency: Histogram::new(3)
+                .map_err(|e| anyhow!("Failed to create draw duration histogram: {e}"))?,
             events_per_frame_histogram: Histogram::new(3)
                 .map_err(|e| anyhow!("Failed to create events per frame histogram: {e}"))?,
             mid_draw_events_dropped: 0,
+            presented_count: 0,
+            dropped_count: 0,
         })
     }
 
-    /// Record that an input event was dispatched at the given time.
-    /// Only the first event's timestamp per frame is retained (worst-case latency).
+    /// Stamp the `InputGenerated` stage. Only the first event's timestamp
+    /// per frame is retained (worst-case latency), mirroring how Chromium's
+    /// `DisplayDamageTracker` harvests the earliest `INPUT_EVENT_LATENCY_ORIGINAL_COMPONENT`
+    /// from the `LatencyInfo` vector (`display_damage_tracker.cc:103-112`).
     fn record_input(&mut self, dispatch_time: Instant) {
-        self.first_input_at.get_or_insert(dispatch_time);
+        self.input_generated_at.get_or_insert(dispatch_time);
         self.pending_input_count += 1;
+    }
+
+    /// Stamp the `DrawStarted` stage. Idempotent per frame — only the first
+    /// call sets the timestamp.
+    fn record_draw_started(&mut self) {
+        self.draw_started_at.get_or_insert(Instant::now());
     }
 
     /// Record that an input event arrived during a draw phase and was excluded
@@ -4903,25 +5076,57 @@ impl InputLatencyTracker {
         self.mid_draw_events_dropped += 1;
     }
 
-    /// Record that a frame was presented, flushing pending latency and coalescing samples.
-    fn record_frame_presented(&mut self) {
-        if let Some(first_input_at) = self.first_input_at.take() {
-            let latency_nanos = first_input_at.elapsed().as_nanos() as u64;
-            self.latency_histogram.record(latency_nanos).ok();
+    /// Stamp the `FrameSubmitted` stage, compute per-stage deltas, record
+    /// histograms, and classify the frame outcome. Mirrors
+    /// `EventLatencyTracker::ReportEventLatency`
+    /// (`event_latency_tracker.h:53`) by emitting per-stage latency data
+    /// keyed by the presented/dropped outcome.
+    fn record_frame_submitted(&mut self, outcome: FrameLatencyOutcome) {
+        let submit_time = Instant::now();
+
+        if let Some(input_generated) = self.input_generated_at.take() {
+            let total_nanos = submit_time
+                .saturating_duration_since(input_generated)
+                .as_nanos() as u64;
+            self.total_latency.record(total_nanos).ok();
+
+            if let Some(draw_started) = self.draw_started_at.take() {
+                let scheduling_nanos = draw_started
+                    .saturating_duration_since(input_generated)
+                    .as_nanos() as u64;
+                self.scheduling_delay.record(scheduling_nanos).ok();
+
+                let draw_nanos = submit_time
+                    .saturating_duration_since(draw_started)
+                    .as_nanos() as u64;
+                self.draw_duration_latency.record(draw_nanos).ok();
+            }
+        } else {
+            self.draw_started_at = None;
         }
+
         if self.pending_input_count > 0 {
             self.events_per_frame_histogram
                 .record(self.pending_input_count)
                 .ok();
             self.pending_input_count = 0;
         }
+
+        match outcome {
+            FrameLatencyOutcome::Presented => self.presented_count += 1,
+            FrameLatencyOutcome::Dropped => self.dropped_count += 1,
+        }
     }
 
     fn snapshot(&self) -> InputLatencySnapshot {
         InputLatencySnapshot {
-            latency_histogram: self.latency_histogram.clone(),
+            total_latency: self.total_latency.clone(),
+            scheduling_delay: self.scheduling_delay.clone(),
+            draw_duration_latency: self.draw_duration_latency.clone(),
             events_per_frame_histogram: self.events_per_frame_histogram.clone(),
             mid_draw_events_dropped: self.mid_draw_events_dropped,
+            presented_count: self.presented_count,
+            dropped_count: self.dropped_count,
         }
     }
 }
@@ -6576,6 +6781,8 @@ impl Window {
         let earliest_input = self.input_rate_tracker.borrow().earliest_input_time();
         self.damage_tracker
             .on_display_damaged(handling_interaction, earliest_input);
+        #[cfg(feature = "input-latency-histogram")]
+        self.input_latency_tracker.record_draw_started();
         self.invalidator.set_dirty(false);
         self.frame_scheduler.did_draw();
         self.requested_autoscroll = None;
@@ -6733,7 +6940,14 @@ impl Window {
             );
         }
         #[cfg(feature = "input-latency-histogram")]
-        self.input_latency_tracker.record_frame_presented();
+        {
+            let outcome = if matches!(draw_result, crate::PlatformDrawResult::Submitted(_)) {
+                FrameLatencyOutcome::Presented
+            } else {
+                FrameLatencyOutcome::Dropped
+            };
+            self.input_latency_tracker.record_frame_submitted(outcome);
+        }
         self.needs_present
             .set(matches!(draw_result, crate::PlatformDrawResult::Deferred));
         profiling::finish_frame!();
