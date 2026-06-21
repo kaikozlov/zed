@@ -710,6 +710,9 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     ) -> Option<oneshot::Receiver<usize>>;
     fn activate(&self);
     fn is_active(&self) -> bool;
+    fn is_visible(&self) -> bool {
+        true
+    }
     fn is_hovered(&self) -> bool;
     fn background_appearance(&self) -> WindowBackgroundAppearance;
     fn set_title(&mut self, title: &str);
@@ -719,6 +722,7 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn toggle_fullscreen(&self);
     fn is_fullscreen(&self) -> bool;
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>);
+    fn on_begin_frame_for_input(&self, _callback: Box<dyn FnMut(BeginFrameArgs)>) {}
     fn set_needs_begin_frame(&self, _needs_begin_frame: bool) {}
     fn request_frame(&self, _options: RequestFrameOptions) {}
     fn request_begin_frame(&self) {}
@@ -735,6 +739,7 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_presentation_feedback(&self, _callback: Box<dyn FnMut(PresentationFeedback)>) {}
     fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> DispatchEventResult>);
     fn on_active_status_change(&self, callback: Box<dyn FnMut(bool)>);
+    fn on_visibility_change(&self, _callback: Box<dyn FnMut(bool)>) {}
     fn on_hover_status_change(&self, callback: Box<dyn FnMut(bool)>);
     fn on_resize(&self, callback: Box<dyn FnMut(Size<Pixels>, f32)>);
     fn on_moved(&self, callback: Box<dyn FnMut()>);

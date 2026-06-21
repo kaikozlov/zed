@@ -277,13 +277,37 @@ ZED_MACOS_LEGACY_METAL_LAYER=1 cargo run -p zed
 - Swap ack now re-enters the GPUI `BeginFrameScheduler` instead of directly
   asking the platform for a new BeginFrame. If a frame was parked behind GPU
   busy, GPUI replays that frame first. Otherwise, if the current BeginFrame has
-  a delayed deadline pending, GPUI reschedules that deadline immediately after
-  the pending swap count drops. Only when there is no parked frame and no
-  current delayed deadline does GPUI request a fresh BeginFrame. This matches
-  Chromium's `DidReceiveSwapBuffersAck()` ordering: update `pending_swaps_`,
-  clear GPU busy, then call `ScheduleBeginFrameDeadline()` so the current
-  BeginFrame can move off a late backpressure deadline as soon as the swap queue
-  opens.
+  a delayed deadline pending and the window is visible, GPUI reschedules that
+  deadline after any observed swap ack, not only after an ack that crosses the
+  backpressured threshold. Only when there is no parked frame, no current
+  delayed deadline, and real scheduler work remains does GPUI request a fresh
+  BeginFrame. Pending platform swaps by themselves keep the source subscribed
+  but do not trigger speculative scheduler wakeups. This matches Chromium's
+  `DidReceiveSwapBuffersAck()` ordering: update `pending_swaps_`, clear GPU
+  busy, then call
+  `ScheduleBeginFrameDeadline()` so the current BeginFrame can move off a late
+  backpressure deadline as soon as the swap queue opens.
+- Resize now has a local equivalent of Chromium's
+  `DisplayScheduler::ForceImmediateSwapIfPossible()`. GPUI's bounds-change path
+  marks the window dirty, lets resize observers update layout, and then forces
+  any open BeginFrame deadline through `AttemptDrawAndSwap()` /
+  `DidFinishFrame()` immediately. A pending rescheduled deadline for the current
+  BeginFrame is consumed before the fallback current request, matching
+  Chromium's "force the current scheduler interval" behavior before resize
+  suppression. The macOS `displayLayer:` fallback render remains only for cases
+  where there is no active BeginFrame interval to flush or the early resize
+  render loses the race.
+- GPUI now carries an explicit local equivalent of Chromium's
+  `output_surface_lost_` scheduler bit. A failed IOSurface swap completion marks
+  the output surface lost, requests refresh work, and immediately flushes any
+  open BeginFrame interval as a no-draw finish. While lost, deadline selection is
+  immediate and normal draw/present production is blocked; the next recovery
+  frame is forced through `force_render`, which refreshes GPU-facing state and
+  clears the lost bit before drawing. This keeps the local single-process
+  recovery path aligned with Chromium's `OutputSurfaceLost()` /
+  `DesiredBeginFrameDeadlineMode(kImmediate)` / `ShouldDraw() == false`
+  sequence without permanently blocking recovery on an external GPU-process
+  output-surface recreation.
 - Important runtime finding: do **not** use `IOSurfaceIsInUse` as the hot-path
   reuse gate in this local process. Without Chromium's full CA/viz presentation
   feedback, that check can report surfaces unavailable long after the local
@@ -584,6 +608,26 @@ ZED_MACOS_LEGACY_METAL_LAYER=1 cargo run -p zed
   delivered last-used BeginFrame or the finished ack. This closes the
   delivery-to-finish race where a BeginFrame accepted by GPUI but not yet
   finished could be reissued as a duplicate missed frame.
+- macOS frame delivery now distinguishes Chromium-style source BeginFrames from
+  scheduler replays and native resize renders. Source deliveries from
+  `CVDisplayLink`, `request_begin_frame()`, and missed-frame retry are filtered
+  against the source's last-used/acked records before invoking GPUI's callback.
+  Scheduler replays, such as damage-deadline reschedules and GPU-available
+  re-entry, intentionally bypass that source filter so the scheduler can
+  reconsider the current BeginFrame. Native resize render requests remain
+  non-BeginFrame fallback work, but active resize-time BeginFrames are now
+  flushed through GPUI's scheduler before that fallback is dispatched. This
+  moves the local platform boundary closer to Chromium's split between
+  `ExternalBeginFrameSource::OnBeginFrame()`, `DisplayScheduler` re-entry, and
+  resize-time forced swaps.
+- GPUI now has a platform `on_begin_frame_for_input` observer, matching
+  Chromium's `BeginFrameSource::IssueBeginFrameToInputClient()` before
+  `IssueBeginFrameToSchedulerClient()`. macOS source BeginFrames deliver to
+  this input observer before invoking the scheduler request-frame callback;
+  scheduler replays and native resize renders do not. The GPUI input tracker
+  consumes those source BeginFrames to update its display-cadence threshold, so
+  input pacing state is tied to the same source tick stream as frame scheduling
+  instead of only being updated from scheduler continuation.
 - macOS now drops queued missed-BeginFrame callbacks after
   `set_needs_begin_frame(false)`. This mirrors Chromium's
   `StopObservingBeginFrames()` cancellation of queued missed tasks: the dispatch
@@ -697,6 +741,17 @@ ZED_MACOS_LEGACY_METAL_LAYER=1 cargo run -p zed
   This closes the choppy-path gap where a clean BeginFrame had already scheduled
   a `LATE` deadline and later damage could otherwise wait until the end of the
   interval instead of moving to Chromium's regular/immediate draw deadline.
+- GPUI now also mirrors Chromium's `ForceImmediateSwapIfPossible()` for resize
+  pressure. When bounds change during an open BeginFrame interval, GPUI consumes
+  the pending/current `BeginFrameDeadlineRequest`, runs production immediately,
+  forwards the resulting `BeginFrameAck`, and clears the delayed deadline so a
+  stale timer cannot later finish the same BeginFrame again.
+- GPUI now mirrors Chromium's `OutputSurfaceLost()` scheduler behavior in the
+  local Metal failure path. Failed IOSurface submissions enter an
+  output-surface-lost state, force any active interval to finish immediately
+  without drawing, and keep subsequent deadlines immediate until a forced
+  recovery render clears the state. Non-recovery draws are suppressed while the
+  bit is set, matching Chromium's `ShouldDraw()` guard.
 - `LATE` deadline mode now follows Chromium's
   `DesiredBeginFrameDeadlineTime(kLate)` behavior. Instead of completing
   clean BeginFrames immediately, GPUI waits until the end of the BeginFrame
@@ -725,10 +780,12 @@ ZED_MACOS_LEGACY_METAL_LAYER=1 cargo run -p zed
   GPU-busy state and re-enters the scheduler even if the source had only reached
   Chromium's "one BeginFrame after busy sent" state. Parked GPU-available
   frames are replayed first; otherwise a pending current BeginFrame deadline is
-  rescheduled before GPUI asks the platform for a fresh BeginFrame. This matches
-  Chromium's
-  `DidReceiveSwapBuffersAck()` rule: after `pending_swaps_` is decremented, the
-  scheduler observes the updated backpressure state and calls
+  rescheduled on every visible-window swap ack before GPUI asks the platform for
+  a fresh BeginFrame. Pending platform swaps are deliberately excluded from that
+  fresh BeginFrame wake test, so retained swap completions keep the source alive
+  without spinning production when no draw/present work exists. This matches
+  Chromium's `DidReceiveSwapBuffersAck()` rule: after `pending_swaps_` is
+  decremented, the scheduler observes the updated backpressure state and calls
   `ScheduleBeginFrameDeadline()`/wakes pending BeginFrame work.
 - GPUI uses the BeginFrame deadline/frame time as its fallback frame time until
   real presentation feedback arrives. This moves frame pacing closer to
@@ -741,7 +798,12 @@ ZED_MACOS_LEGACY_METAL_LAYER=1 cargo run -p zed
   `CVDisplayLink` instead of running it continuously just because the window is
   visible. Visibility changes, display changes, activation, and AppKit
   `displayLayer:` callbacks now reapply that subscription state rather than
-  forcing the display link on unconditionally.
+  forcing the display link on unconditionally. GPUI now also carries platform
+  visibility as scheduler state: hidden/occluded windows retain their dirty or
+  pending-present work, but `has_frame_work()` returns false until visibility
+  returns. This mirrors Chromium's `DisplayScheduler::visible_` gate in
+  `ShouldDraw()` instead of leaving occlusion as only a macOS display-link
+  start/stop side effect.
 - Runtime finding from the first built app: dropping the BeginFrame source
   immediately after each input-driven frame made editing feel low-FPS/choppy,
   because bursty invalidations had to restart `CVDisplayLink` one tick at a
