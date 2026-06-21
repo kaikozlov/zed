@@ -1611,7 +1611,15 @@ impl FrameSchedulerState {
             .and_then(|bf| bf.possible_deadlines.as_ref())
         {
             let begin_frame = request_frame_options.begin_frame.as_ref().unwrap();
-            let max_buffers = self.max_pending_swaps_for_current_frame().unwrap_or(2);
+            // Compute max_buffers from the same begin_frame we use for
+            // possible_deadlines, so both come from one source rather than
+            // mixing request_frame_options with state.current_begin_frame_args.
+            let max_buffers = possible_deadlines
+                .os_preferred_deadline()
+                .map(|d| {
+                    crate::max_pending_swaps_for_deadline(d.present_delta, begin_frame.interval)
+                })
+                .unwrap_or(2);
 
             let selected_index = {
                 let mut state = self.inner.borrow_mut();
@@ -1624,7 +1632,14 @@ impl FrameSchedulerState {
                 )
             };
 
-            let selected = &possible_deadlines.deadlines[selected_index];
+            // Use .get() instead of direct indexing to avoid a panic if
+            // os_preferred_index is out of bounds and the decider's
+            // OS-preferred fallback returns it unchecked.
+            let selected = possible_deadlines
+                .deadlines
+                .get(selected_index)
+                .or_else(|| possible_deadlines.os_preferred_deadline())
+                .unwrap_or(&possible_deadlines.deadlines[0]);
             let expected_display_time = begin_frame.frame_time.checked_add(selected.present_delta);
             let target_latch_time = begin_frame
                 .frame_time
@@ -1669,6 +1684,11 @@ impl FrameSchedulerState {
     /// Removes the presentation group whose `swap_id` matches, preserving the
     /// FIFO order of remaining groups. Mirrors `display.h` swap_n matching
     /// (`display.cc:802-812`).
+    ///
+    /// When `swap_id` is `None` (platform doesn't stamp), falls back to FIFO
+    /// pop. When `swap_id` is provided but not found (e.g. duplicate feedback
+    /// for an already-consumed swap), returns `None` rather than mis-attributing
+    /// a different group from the FIFO front.
     fn take_pending_presentation_group_by_swap_id(
         &self,
         swap_id: Option<u64>,
@@ -1684,8 +1704,9 @@ impl FrameSchedulerState {
         {
             return state.pending_presentation_groups.remove(pos);
         }
-        // No match by id — fall back to FIFO to preserve the drain proof.
-        state.pending_presentation_groups.pop_front()
+        // Stamped swap_id not found — return None instead of mis-attributing
+        // the FIFO front. The group for this swap_id was already consumed.
+        None
     }
 
     fn update_frame_interval_from_request(
@@ -3225,6 +3246,14 @@ mod tests {
         // loop. This is the Phase 3 acceptance criterion: "A frame's selected
         // deadline is an index into a PossibleDeadlines vector chosen by the
         // ported decider, not a single computed timestamp."
+        //
+        // Setup: OS-preferred is index 2 (48ms present_delta), giving
+        // max_pending_swaps_for_deadline(48ms, 16ms) = 3 buffers.
+        // target_present_delta = 3 * 16ms = 48ms. The decider selects the
+        // last candidate with present_delta <= 48ms → index 2 (48ms).
+        // expected_display_time = frame_time + 48ms.
+        // The fallback loop would produce frame_time + 16ms (the begin_frame
+        // deadline), proving the decider ran.
         let frame_scheduler = FrameSchedulerState::default();
         let now = Instant::now();
         let interval = Duration::from_millis(16);
@@ -3238,7 +3267,7 @@ mod tests {
             interval,
             missed: false,
             possible_deadlines: Some(crate::PossibleDeadlines {
-                os_preferred_index: 0,
+                os_preferred_index: 2,
                 deadlines: vec![
                     crate::PossibleDeadline {
                         vsync_id: 1,
@@ -3265,16 +3294,12 @@ mod tests {
 
         frame_scheduler.record_pending_presentation_group(request_frame_options, None, None);
 
-        // With max_buffers=2 (default fallback), target_present_delta = 2*16ms = 32ms.
-        // The decider selects the last candidate with present_delta <= 32ms,
-        // which is index 1 (32ms). So expected_display_time should be
-        // frame_time + 32ms, NOT frame_time + 16ms (which the hand-rolled
-        // loop would produce).
         let group = frame_scheduler.take_pending_presentation_group().unwrap();
         assert_eq!(
             group.expected_display_time,
-            Some(begin_frame.frame_time + interval * 2),
-            "decider should select index 1 (32ms present_delta), not index 0 (16ms)"
+            Some(begin_frame.frame_time + interval * 3),
+            "decider should select index 2 (48ms present_delta from 3-buffer budget), \
+             not the fallback deadline (16ms)"
         );
     }
 
