@@ -1402,10 +1402,22 @@ impl MetalRenderer {
         self.core_animation_presenter.is_some()
     }
 
-    pub fn max_pending_swaps(&self) -> Option<u32> {
-        self.core_animation_presenter
-            .as_ref()
-            .map(|_| IOSURFACE_MAX_PENDING_SWAPS as u32)
+    pub fn max_pending_swaps(&self, interval: Option<Duration>) -> Option<u32> {
+        self.core_animation_presenter.as_ref().map(|_| {
+            let caps = gpui::RefreshRateSwapCaps {
+                max_pending_swaps: IOSURFACE_MAX_PENDING_SWAPS as u32,
+                // At 120Hz, IOSurface's 3-buffer pipeline still needs at most 2
+                // pending swaps; the lower tier is a no-op until the presenter
+                // supports a 4th buffer.
+                max_pending_swaps_120hz: Some(IOSURFACE_MAX_PENDING_SWAPS as u32),
+                max_pending_swaps_90hz: None,
+                max_pending_swaps_72hz: None,
+            };
+            match interval {
+                Some(interval) => gpui::max_pending_swaps_for_refresh_rate(interval, &caps),
+                None => caps.max_pending_swaps,
+            }
+        })
     }
 
     pub fn supports_delayed_begin_frame_scheduling(&self) -> bool {

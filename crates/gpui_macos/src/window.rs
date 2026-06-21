@@ -2019,8 +2019,8 @@ impl PlatformWindow for MacWindow {
             .supports_swap_completion_feedback()
     }
 
-    fn max_pending_swaps(&self) -> Option<u32> {
-        self.0.as_ref().lock().renderer.max_pending_swaps()
+    fn max_pending_swaps(&self, interval: Option<Duration>) -> Option<u32> {
+        self.0.as_ref().lock().renderer.max_pending_swaps(interval)
     }
 
     fn on_swap_completion(&self, callback: Box<dyn FnMut(SwapCompletionFeedback)>) {

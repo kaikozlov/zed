@@ -1077,7 +1077,6 @@ pub struct Window {
     hovered: Rc<Cell<bool>>,
     pub(crate) needs_present: Rc<Cell<bool>>,
     uses_platform_swap_completion: bool,
-    max_pending_platform_swaps: Option<u32>,
     gpu_busy_response_state: GpuBusyResponseState,
     pending_gpu_available_frame: Option<BeginFrameDeadlineRequest>,
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
@@ -4860,7 +4859,6 @@ impl Window {
             .request_decorations(window_decorations.unwrap_or(WindowDecorations::Server));
         platform_window.set_background_appearance(window_background);
         let uses_platform_swap_completion = platform_window.supports_swap_completion_feedback();
-        let max_pending_platform_swaps = platform_window.max_pending_swaps();
         let supports_delayed_begin_frame_scheduling =
             platform_window.supports_delayed_begin_frame_scheduling();
         if uses_platform_swap_completion {
@@ -5259,7 +5257,6 @@ impl Window {
             hovered,
             needs_present,
             uses_platform_swap_completion,
-            max_pending_platform_swaps,
             gpu_busy_response_state: GpuBusyResponseState::Idle,
             pending_gpu_available_frame: None,
             input_rate_tracker,
@@ -6304,9 +6301,13 @@ impl Window {
 
     fn platform_swap_backpressured(&self) -> bool {
         // Prefer the per-deadline cap (Phase 3) when the current frame carries
-        // PossibleDeadlines; fall back to the static platform cap otherwise.
+        // PossibleDeadlines; fall back to the refresh-rate-dependent platform
+        // cap (Phase 5) keyed off the current frame interval.
         let deadline_cap = self.frame_scheduler.max_pending_swaps_for_current_frame();
-        let effective_cap = deadline_cap.or(self.max_pending_platform_swaps);
+        let effective_cap = deadline_cap.or_else(|| {
+            let interval = self.frame_scheduler.last_frame_interval();
+            self.platform_window.max_pending_swaps(interval)
+        });
         self.frame_scheduler
             .platform_swap_backpressured(effective_cap)
     }

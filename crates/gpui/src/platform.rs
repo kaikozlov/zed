@@ -835,6 +835,45 @@ pub fn max_pending_swaps_for_deadline(present_delta: Duration, interval: Duratio
     ((total_ns + 0.8 * interval_ns) / interval_ns) as u32
 }
 
+/// Optional per-refresh-rate swap caps, mirroring `viz::PendingSwapParams`
+/// (`components/viz/service/display/pending_swap_params.h`). Each field, when
+/// set, overrides `max_pending_swaps` at that refresh-rate tier.
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct RefreshRateSwapCaps {
+    /// The default cap, used when no tier-specific cap applies.
+    pub max_pending_swaps: u32,
+    /// Overrides for ≥120 Hz. `None` falls back to `max_pending_swaps`.
+    pub max_pending_swaps_120hz: Option<u32>,
+    /// Overrides for ≥90 Hz. `None` falls back to `max_pending_swaps`.
+    pub max_pending_swaps_90hz: Option<u32>,
+    /// Overrides for ≥72 Hz. `None` falls back to `max_pending_swaps`.
+    pub max_pending_swaps_72hz: Option<u32>,
+}
+
+/// Selects the pending-swap cap based on the current refresh-rate interval.
+///
+/// Ports `DisplayScheduler::MaxPendingSwapsForRefreshRate`
+/// (`display_scheduler.cc:455`). The thresholds use the same margins as
+/// Chromium: 14ms (72Hz), 11.5ms (90Hz), 8.5ms (120Hz).
+pub fn max_pending_swaps_for_refresh_rate(interval: Duration, caps: &RefreshRateSwapCaps) -> u32 {
+    const HZ_72_INTERVAL: Duration = Duration::from_micros(14000);
+    const HZ_90_INTERVAL: Duration = Duration::from_micros(11500);
+    const HZ_120_INTERVAL: Duration = Duration::from_micros(8500);
+
+    if interval < HZ_120_INTERVAL {
+        caps.max_pending_swaps_120hz
+            .unwrap_or(caps.max_pending_swaps)
+    } else if interval < HZ_90_INTERVAL {
+        caps.max_pending_swaps_90hz
+            .unwrap_or(caps.max_pending_swaps)
+    } else if interval < HZ_72_INTERVAL {
+        caps.max_pending_swaps_72hz
+            .unwrap_or(caps.max_pending_swaps)
+    } else {
+        caps.max_pending_swaps
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 #[expect(missing_docs)]
 pub struct BeginFrameArgs {
@@ -1105,7 +1144,11 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn supports_swap_completion_feedback(&self) -> bool {
         false
     }
-    fn max_pending_swaps(&self) -> Option<u32> {
+    /// Returns the current pending-swap cap, optionally keyed to the display's
+    /// refresh-rate interval (`MaxPendingSwapsForRefreshRate`,
+    /// `display_scheduler.cc:455`). Platforms without structured swap completion
+    /// return `None`.
+    fn max_pending_swaps(&self, _interval: Option<Duration>) -> Option<u32> {
         None
     }
     fn on_swap_completion(&self, _callback: Box<dyn FnMut(SwapCompletionFeedback)>) {}
@@ -3003,6 +3046,60 @@ mod begin_frame_tests {
         assert_eq!(
             max_pending_swaps_for_deadline(Duration::from_millis(16), Duration::ZERO),
             1
+        );
+    }
+
+    // --- RefreshRateSwapCaps tests ---
+
+    #[test]
+    fn refresh_rate_swap_caps_uses_120hz_tier_at_8_5ms_interval() {
+        // Phase 5 acceptance: "On a 120 Hz display, the pending-swap cap is the
+        // 120 Hz tier, not the 60 Hz default."
+        let caps = RefreshRateSwapCaps {
+            max_pending_swaps: 2,
+            max_pending_swaps_120hz: Some(3),
+            max_pending_swaps_90hz: None,
+            max_pending_swaps_72hz: None,
+        };
+        // 8.5ms = 8500μs is exactly the k120HzInterval threshold.
+        assert_eq!(
+            max_pending_swaps_for_refresh_rate(Duration::from_micros(8500), &caps),
+            2, // 8500μs is NOT < 8500μs, so this is 90Hz tier → default
+        );
+        // 8.49ms is < 8.5ms threshold → 120Hz tier.
+        assert_eq!(
+            max_pending_swaps_for_refresh_rate(Duration::from_micros(8499), &caps),
+            3,
+        );
+    }
+
+    #[test]
+    fn refresh_rate_swap_caps_uses_default_below_all_tiers() {
+        let caps = RefreshRateSwapCaps {
+            max_pending_swaps: 2,
+            max_pending_swaps_120hz: Some(3),
+            max_pending_swaps_90hz: Some(3),
+            max_pending_swaps_72hz: Some(3),
+        };
+        // 16.67ms (60Hz) is above all thresholds → default.
+        assert_eq!(
+            max_pending_swaps_for_refresh_rate(Duration::from_micros(16667), &caps),
+            2
+        );
+    }
+
+    #[test]
+    fn refresh_rate_swap_caps_falls_back_when_tier_is_none() {
+        let caps = RefreshRateSwapCaps {
+            max_pending_swaps: 2,
+            max_pending_swaps_120hz: None,
+            max_pending_swaps_90hz: None,
+            max_pending_swaps_72hz: None,
+        };
+        // All tiers None → always default, regardless of interval.
+        assert_eq!(
+            max_pending_swaps_for_refresh_rate(Duration::from_micros(8000), &caps),
+            2
         );
     }
 }

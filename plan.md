@@ -424,15 +424,19 @@ static `IOSURFACE_MAX_PENDING_SWAPS`. The scheduler reads it once into
 `max_pending_platform_swaps` (`window.rs:1080`). No refresh-rate dependence.
 
 **Work items.**
-1. Add `max_pending_swaps_120hz`/`90hz`/`72hz` optional params to the macOS
-   presenter config, mirroring `PendingSwapParams` (`display_scheduler.h:38-52`).
-2. Port `MaxPendingSwapsForRefreshRate` (`display_scheduler.cc:455`) keyed off
-   `current_begin_frame_args_.interval`. Expose it through
-   `max_pending_swaps` (`platform.rs:895`) returning the current value rather
-   than a static constant.
-3. The scheduler re-reads the cap when the BeginFrame interval changes (new
-   display, ProMotion throttle), not just at window creation
-   (`window.rs:4527`).
+1. [x] Add `RefreshRateSwapCaps` to `platform.rs` mirroring `PendingSwapParams`
+   (`pending_swap_params.h`), with `max_pending_swaps`/`120hz`/`90hz`/`72hz`
+   fields. The macOS presenter constructs caps from `IOSURFACE_MAX_PENDING_SWAPS`.
+2. [x] Port `MaxPendingSwapsForRefreshRate` (`display_scheduler.cc:455`) as
+   `max_pending_swaps_for_refresh_rate(interval, &caps)` (`platform.rs`), keyed
+   off the BeginFrame interval with the same 8.5/11.5/14ms thresholds. Exposed
+   through `PlatformWindow::max_pending_swaps(Option<Duration>)` which the macOS
+   impl forwards to `MetalRenderer::max_pending_swaps`.
+3. [x] The scheduler re-reads the cap on every backpressure check via
+   `platform_swap_backpressured`, which passes `frame_scheduler.last_frame_interval()`
+   to `platform_window.max_pending_swaps(interval)`. The stored
+   `max_pending_platform_swaps` field was removed — the cap is now always
+   dynamic.
 
 **Acceptance.** On a 120 Hz display, the pending-swap cap is the 120 Hz tier,
 not the 60 Hz default. Verified with a unit test feeding a 8.5 ms interval.
