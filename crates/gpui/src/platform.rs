@@ -655,6 +655,186 @@ impl PossibleDeadlines {
     }
 }
 
+/// The latency threshold above which input-to-pixel delay becomes perceptible.
+///
+/// Mirrors `FrameDeadlineDecider::kPerceptibleLatencyThreshold`
+/// (`frame_deadline_decider.h:18`).
+const PERCEPTIBLE_LATENCY_THRESHOLD: Duration = Duration::from_millis(100);
+
+/// Selects the best deadline from a [`PossibleDeadlines`] set.
+///
+/// Ported from `viz::FrameDeadlineDecider`
+/// (`components/viz/service/display/frame_deadline_decider.h/.cc`).
+///
+/// The decider implements three behaviors in `select_deadline`:
+/// 1. **Platform-preferred short-circuit** — when `use_platform_preferred_deadlines`
+///    is true, always return the OS-preferred index (`frame_deadline_decider.cc:58`).
+/// 2. **In-sequence stickiness** (`find_closest_deadline_by_presentation`) — once a
+///    sequence starts with a target present delta, subsequent frames lock to the
+///    closest matching deadline until `on_go_idle` resets the sequence
+///    (`frame_deadline_decider.cc:63`).
+/// 3. **Input-aware perceptible-latency cap** — when `earliest_input_time` is known,
+///    clamp the target present delta so total input-to-pixel latency stays below
+///    [`PERCEPTIBLE_LATENCY_THRESHOLD`] (`frame_deadline_decider.cc:84-100`).
+#[derive(Debug, Clone)]
+pub struct FrameDeadlineDecider {
+    in_frame_sequence: bool,
+    curr_sequence_present_delta: Duration,
+    curr_sequence_deadline_index: usize,
+    use_platform_preferred_deadlines: bool,
+}
+
+impl FrameDeadlineDecider {
+    /// Creates a decider. When `use_platform_preferred_deadlines` is true,
+    /// `select_deadline` always returns the OS-preferred index.
+    pub fn new(use_platform_preferred_deadlines: bool) -> Self {
+        Self {
+            in_frame_sequence: false,
+            curr_sequence_present_delta: Duration::ZERO,
+            curr_sequence_deadline_index: 0,
+            use_platform_preferred_deadlines,
+        }
+    }
+
+    /// Selects the deadline index. Mirrors `SelectDeadline`
+    /// (`frame_deadline_decider.cc:24`).
+    pub fn select_deadline(
+        &mut self,
+        possible_deadlines: &PossibleDeadlines,
+        vsync_interval: Duration,
+        max_allowed_buffers: u32,
+        frame_time: Instant,
+        earliest_input_time: Option<Instant>,
+    ) -> usize {
+        let deadlines = &possible_deadlines.deadlines;
+        assert!(!deadlines.is_empty());
+
+        if self.use_platform_preferred_deadlines {
+            self.record_sequence_state(possible_deadlines, possible_deadlines.os_preferred_index);
+            return possible_deadlines.os_preferred_index;
+        }
+
+        if self.in_frame_sequence {
+            let index = self.find_closest_deadline_by_presentation(possible_deadlines);
+            self.record_sequence_state(possible_deadlines, index);
+            return index;
+        }
+
+        self.in_frame_sequence = true;
+
+        // target_present_delta = max_allowed_buffers * vsync_interval
+        // (no presentation_offset on non-Android; `frame_deadline_decider.cc:79`).
+        let mut target_present_delta = vsync_interval.saturating_mul(max_allowed_buffers);
+
+        // Input-aware perceptible-latency cap (`frame_deadline_decider.cc:84-100`).
+        if let Some(earliest_input) = earliest_input_time {
+            let input_delta = frame_time.saturating_duration_since(earliest_input);
+            let latency_cap = PERCEPTIBLE_LATENCY_THRESHOLD
+                .saturating_sub(vsync_interval)
+                .saturating_sub(vsync_interval / 4);
+            let max_present_delta = latency_cap.saturating_sub(input_delta);
+            if max_present_delta < target_present_delta {
+                target_present_delta = max_present_delta;
+            }
+        }
+
+        // Binary search for the last deadline with present_delta <= target
+        // (C++ `std::upper_bound` then decrement; `frame_deadline_decider.cc:102-114`).
+        let upper_bound = deadlines.partition_point(|d| d.present_delta <= target_present_delta);
+        let chrome_preferred_index = upper_bound.saturating_sub(1).min(deadlines.len() - 1);
+        let chrome_preferred_deadline = &deadlines[chrome_preferred_index];
+
+        // Fallback: Chrome preferred exceeds target → use OS preferred
+        // (`frame_deadline_decider.cc:117-119`).
+        if chrome_preferred_deadline.present_delta > target_present_delta {
+            let result = possible_deadlines.os_preferred_index;
+            self.record_sequence_state(possible_deadlines, result);
+            return result;
+        }
+
+        // Fallback: Chrome preferred is below OS preferred → don't reduce below OS
+        // (`frame_deadline_decider.cc:122-127`).
+        if let Some(os_preferred) = possible_deadlines.os_preferred_deadline()
+            && chrome_preferred_deadline.present_delta < os_preferred.present_delta
+        {
+            let result = possible_deadlines.os_preferred_index;
+            self.record_sequence_state(possible_deadlines, result);
+            return result;
+        }
+
+        self.record_sequence_state(possible_deadlines, chrome_preferred_index);
+        chrome_preferred_index
+    }
+
+    /// Records the selected deadline's present delta and index for in-sequence
+    /// stickiness. Mirrors the `absl::Cleanup` in `SelectDeadline`
+    /// (`frame_deadline_decider.cc:40-56`).
+    fn record_sequence_state(&mut self, possible_deadlines: &PossibleDeadlines, index: usize) {
+        self.curr_sequence_deadline_index = index;
+        if let Some(deadline) = possible_deadlines.deadlines.get(index) {
+            self.curr_sequence_present_delta = deadline.present_delta;
+        }
+    }
+
+    /// Resets sequence state. Mirrors `OnGoIdle`
+    /// (`frame_deadline_decider.cc:134`).
+    pub fn on_go_idle(&mut self) {
+        self.in_frame_sequence = false;
+        self.curr_sequence_present_delta = Duration::ZERO;
+        self.curr_sequence_deadline_index = 0;
+    }
+
+    /// Finds the deadline closest to the sequence's current present delta.
+    /// Mirrors `FindClosestDeadlineByPresentation`
+    /// (`frame_deadline_decider.cc:142`).
+    fn find_closest_deadline_by_presentation(
+        &self,
+        possible_deadlines: &PossibleDeadlines,
+    ) -> usize {
+        let deadlines = &possible_deadlines.deadlines;
+
+        if self.curr_sequence_deadline_index < deadlines.len() {
+            let cached = &deadlines[self.curr_sequence_deadline_index];
+            let diff = cached
+                .present_delta
+                .abs_diff(self.curr_sequence_present_delta);
+            if diff <= Duration::from_millis(1) {
+                return self.curr_sequence_deadline_index;
+            }
+        }
+
+        let mut best_index = 0;
+        let mut min_diff = deadlines[0]
+            .present_delta
+            .abs_diff(self.curr_sequence_present_delta);
+        for (i, deadline) in deadlines.iter().enumerate().skip(1) {
+            let diff = deadline
+                .present_delta
+                .abs_diff(self.curr_sequence_present_delta);
+            if diff < min_diff {
+                min_diff = diff;
+                best_index = i;
+            }
+        }
+        best_index
+    }
+}
+
+/// Derives the per-deadline buffer cap from the selected `present_delta`.
+///
+/// Mirrors `DisplayScheduler::MaxPendingSwapsForDeadline`
+/// (`display_scheduler.cc:479`). The `0.8` constant biases rounding up so the
+/// buffer count covers frames whose present time is not an exact multiple of the
+/// interval.
+pub fn max_pending_swaps_for_deadline(present_delta: Duration, interval: Duration) -> u32 {
+    if interval.is_zero() {
+        return 1;
+    }
+    let total_ns = present_delta.as_nanos() as f64;
+    let interval_ns = interval.as_nanos() as f64;
+    ((total_ns + 0.8 * interval_ns) / interval_ns) as u32
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 #[expect(missing_docs)]
 pub struct BeginFrameArgs {
@@ -2651,6 +2831,169 @@ mod begin_frame_tests {
         };
 
         assert_eq!(possible_deadlines.os_preferred_deadline(), None);
+    }
+
+    // --- FrameDeadlineDecider tests ---
+
+    fn deadline(vsync_id: i64, delta_ms: u64) -> PossibleDeadline {
+        PossibleDeadline {
+            vsync_id,
+            latch_delta: Duration::from_millis(delta_ms),
+            present_delta: Duration::from_millis(delta_ms),
+        }
+    }
+
+    fn deadlines(os_pref: usize, deltas_ms: &[u64]) -> PossibleDeadlines {
+        PossibleDeadlines {
+            os_preferred_index: os_pref,
+            deadlines: deltas_ms
+                .iter()
+                .enumerate()
+                .map(|(i, &ms)| deadline(i as i64, ms))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn decider_platform_preferred_short_circuits() {
+        let mut decider = FrameDeadlineDecider::new(true);
+        let pd = deadlines(2, &[16, 32, 48]);
+        let index =
+            decider.select_deadline(&pd, Duration::from_millis(16), 3, Instant::now(), None);
+        assert_eq!(index, 2);
+    }
+
+    #[test]
+    fn decider_new_sequence_selects_within_buffer_budget() {
+        // 3 buffers * 16ms = 48ms target. Candidates: [16, 32, 48, 64].
+        // Upper bound of <=48 is index 3 (48). Chrome preferred = index 2 (48ms).
+        // 48 <= 48, so not > target. 48 >= OS preferred (16). Result = 2.
+        let mut decider = FrameDeadlineDecider::new(false);
+        let pd = deadlines(0, &[16, 32, 48, 64]);
+        let now = Instant::now();
+        let index = decider.select_deadline(&pd, Duration::from_millis(16), 3, now, None);
+        assert_eq!(index, 2);
+    }
+
+    #[test]
+    fn decider_in_sequence_sticks_to_closest_present_delta() {
+        let mut decider = FrameDeadlineDecider::new(false);
+        let pd = deadlines(0, &[16, 32, 48, 64]);
+        let now = Instant::now();
+
+        // First frame: max_allowed_buffers=3 → target 48ms → index 2 (48ms).
+        let first = decider.select_deadline(&pd, Duration::from_millis(16), 3, now, None);
+        assert_eq!(first, 2);
+
+        // Second frame in sequence: sticks to 48ms (index 2, within 1ms of 48ms).
+        let second = decider.select_deadline(&pd, Duration::from_millis(16), 1, now, None);
+        assert_eq!(second, 2);
+    }
+
+    #[test]
+    fn decider_on_go_idle_resets_sequence() {
+        let mut decider = FrameDeadlineDecider::new(false);
+        let pd = deadlines(0, &[16, 32, 48, 64]);
+        let now = Instant::now();
+
+        decider.select_deadline(&pd, Duration::from_millis(16), 3, now, None);
+        decider.on_go_idle();
+
+        // After idle, new sequence with 1 buffer → target 16ms → index 0.
+        let index = decider.select_deadline(&pd, Duration::from_millis(16), 1, now, None);
+        assert_eq!(index, 0);
+    }
+
+    #[test]
+    fn decider_input_aware_cap_clamps_target_down() {
+        // Without input: 3 buffers * 16ms = 48ms → index 2.
+        // With input 80ms before frame_time:
+        //   input_delta = 80ms
+        //   latency_cap = 100 - 16 - 4 = 80ms
+        //   max_present_delta = 80 - 80 = 0ms
+        //   target clamped to 0ms → all candidates exceed → OS preferred fallback.
+        let mut decider = FrameDeadlineDecider::new(false);
+        let pd = deadlines(0, &[16, 32, 48]);
+        let frame_time = Instant::now();
+        let earliest_input = frame_time - Duration::from_millis(80);
+
+        let index = decider.select_deadline(
+            &pd,
+            Duration::from_millis(16),
+            3,
+            frame_time,
+            Some(earliest_input),
+        );
+        assert_eq!(index, 0);
+    }
+
+    #[test]
+    fn decider_input_aware_cap_partial_clamp() {
+        // input_delta = 50ms
+        // latency_cap = 100 - 16 - 4 = 80ms
+        // max_present_delta = 80 - 50 = 30ms
+        // target clamped from 48ms to 30ms → upper_bound of <=30 in [16,32,48] = index 1 (32ms)
+        // Wait: 32 > 30, so upper_bound = 1, decrement to 0 (16ms). 16 < 16 (OS pref) → fallback to OS pref.
+        // Hmm, that's not a great test. Let me pick different values.
+        // Let me use candidates [10, 25, 40, 55] with 16ms interval:
+        // input_delta = 50ms, latency_cap = 80ms, max_present = 30ms
+        // upper_bound of <=30 in [10,25,40,55] = index 2, decrement to 1 (25ms).
+        // 25 <= 30 ✓, 25 >= OS pref (10) ✓ → result = 1.
+        let mut decider = FrameDeadlineDecider::new(false);
+        let pd = deadlines(0, &[10, 25, 40, 55]);
+        let frame_time = Instant::now();
+        let earliest_input = frame_time - Duration::from_millis(50);
+
+        let index = decider.select_deadline(
+            &pd,
+            Duration::from_millis(16),
+            3,
+            frame_time,
+            Some(earliest_input),
+        );
+        assert_eq!(index, 1);
+    }
+
+    #[test]
+    fn decider_falls_back_to_os_preferred_when_chrome_exceeds_target() {
+        // 1 buffer * 16ms = 16ms target. Candidates: [32, 48, 64] (all > 16).
+        // upper_bound = 0, decrement saturates to 0 (32ms). 32 > 16 → OS pref.
+        let mut decider = FrameDeadlineDecider::new(false);
+        let pd = deadlines(1, &[32, 48, 64]);
+        let now = Instant::now();
+
+        let index = decider.select_deadline(&pd, Duration::from_millis(16), 1, now, None);
+        assert_eq!(index, 1);
+    }
+
+    #[test]
+    fn max_pending_swaps_for_deadline_matches_chromium_formula() {
+        // present_delta=48ms, interval=16ms:
+        // (48_000_000 + 0.8 * 16_000_000) / 16_000_000 = (48_000_000 + 12_800_000) / 16_000_000 = 3.8 → 3
+        assert_eq!(
+            max_pending_swaps_for_deadline(Duration::from_millis(48), Duration::from_millis(16)),
+            3
+        );
+        // present_delta=32ms, interval=16ms:
+        // (32_000_000 + 12_800_000) / 16_000_000 = 2.8 → 2
+        assert_eq!(
+            max_pending_swaps_for_deadline(Duration::from_millis(32), Duration::from_millis(16)),
+            2
+        );
+        // present_delta=16ms, interval=16ms:
+        // (16_000_000 + 12_800_000) / 16_000_000 = 1.8 → 1
+        assert_eq!(
+            max_pending_swaps_for_deadline(Duration::from_millis(16), Duration::from_millis(16)),
+            1
+        );
+    }
+
+    #[test]
+    fn max_pending_swaps_for_deadline_returns_one_for_zero_interval() {
+        assert_eq!(
+            max_pending_swaps_for_deadline(Duration::from_millis(16), Duration::ZERO),
+            1
+        );
     }
 }
 

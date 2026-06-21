@@ -334,19 +334,23 @@ hand-rolled approximation of `SelectDeadline`.
    timing: generate the OS-preferred deadline plus forward-vsync candidates,
    each carrying its `vsync_id` (the display's vsync counter) and deltas from
    `frame_time`.
-3. [ ] Port `FrameDeadlineDecider` (`frame_deadline_decider.h/.cc`) as a Rust
-   struct. `SelectDeadline` (`:25`) becomes the method that replaces today's
-   `presentation_group_timing_for_request` future-latch advancement
-   (`window.rs:1272`). Keep the in-sequence stickiness
-   (`FindClosestDeadlineByPresentation:143`) and the `OnGoIdle` reset
-   (`:115`).
-4. [ ] Port the **input-aware perceptible-latency cap**
-   (`frame_deadline_decider.cc:90-100`): when `earliest_input_time` is known,
-   clamp `target_present_delta` to `100 ms − vsync_interval − 0.25·vsync_interval − input_delta`.
-   This is the single most latency-relevant algorithm in the whole pipeline.
-5. [ ] Port `MaxPendingSwapsForDeadline` (`display_scheduler.cc:474`) so the
-   per-deadline buffer cap is derived from the selected `present_delta`, not
-   the static `IOSURFACE_MAX_PENDING_SWAPS` constant.
+3. [x] Port `FrameDeadlineDecider` (`frame_deadline_decider.h/.cc`) as a Rust
+   struct (`platform.rs` `FrameDeadlineDecider`). `select_deadline` mirrors
+   `SelectDeadline` (`:24`) including the in-sequence stickiness
+   (`find_closest_deadline_by_presentation`, `:142`) and the `on_go_idle` reset
+   (`:134`). The decider is not yet wired into the scheduler's
+   `presentation_group_timing_for_request` future-latch advancement — that
+   integration replaces the hand-rolled approximation once the scheduler calls
+   `select_deadline` instead of computing a single timestamp.
+4. [x] Port the **input-aware perceptible-latency cap**
+   (`frame_deadline_decider.cc:84-100`): when `earliest_input_time` is known,
+   `select_deadline` clamps `target_present_delta` to
+   `100 ms − vsync_interval − 0.25·vsync_interval − input_delta`.
+5. [x] Port `MaxPendingSwapsForDeadline` (`display_scheduler.cc:479`) as
+   `max_pending_swaps_for_deadline(present_delta, interval)` (`platform.rs`).
+   The function is not yet wired into the scheduler's swap cap — that
+   integration replaces the static `IOSURFACE_MAX_PENDING_SWAPS` read once the
+   scheduler consumes the decider's selected deadline.
 
 **Acceptance.** A frame's selected deadline is an index into a
 `PossibleDeadlines` vector chosen by the ported decider, not a single computed
