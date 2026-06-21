@@ -508,29 +508,38 @@ analog of `HasDamageDueToInteraction` or
 deadline needs.
 
 **Work items.**
-1. Introduce a single-process `DisplayDamageTracker` analog. Zed has no
-   `SurfaceId`/surface tree (Half A), so the "surface" granularity is the GPUI
-   **view** (`window.rs:4991 mark_view_dirty` already keys by `EntityId`).
-   The tracker owns: pending-damage-per-view, `root_frame_missing`,
-   `expecting_root_surface_damage_because_of_resize`, `has_surface_damage_due_to_interaction`,
-   and `earliest_input_timestamp` — direct mirrors of
-   `display_damage_tracker.h:140-147`.
-2. Route `refresh()`, `mark_view_dirty`, global refresh, and resize through
-   `DisplayResized` (`:64`) / `SetRootSurfaceDamaged` (`:70`) /
-   `OnDisplayDamaged` (`:34`) equivalents, so the conservative full-frame
-   fallbacks in `research.md` are replaced by the tracker's accounting.
-3. Expose `HasDamageDueToInteraction` (`:99`) and
-   `GetEarliestInputGenerationTimeOfDamagedSurfaces` (`:103`); wire the latter
-   into Phase 3's `SelectDeadline` `earliest_input_time` argument
-   (`frame_deadline_decider.cc:25`).
-4. Keep the existing `BufferQueue`-shape per-buffer damage invariant in
-   `metal_renderer.rs` as the leaf; the tracker decides *what* damage a frame
-   carries, the presenter decides *how* a buffer stores it.
+1. **Done.** Introduced `DisplayDamageTracker` in `window.rs` — a
+   single-process analog. Zed has no `SurfaceId`/surface tree (Half A), so
+   the "surface" granularity is the GPUI **view** (keyed by `EntityId`),
+   whose dirty accounting stays in `WindowInvalidator`. The tracker owns
+   `expecting_root_surface_damage_because_of_resize`,
+   `has_surface_damage_due_to_interaction`, and `earliest_input_timestamp`.
+   `root_frame_missing` lives on `FrameSchedulerData` (shared
+   `Rc<RefCell<>>`) so `should_draw` can read it from both `Window` and
+   `BeginFrameScheduler`.
+2. **Done.** Routed resize through `display_resized()` in `bounds_changed`,
+   and draw-time damage through `on_display_damaged()` in the `draw` method
+   (gated on `is_handling_scroll_interaction` from `InputRateTracker`).
+   `refresh()` continues to use `refreshing → full_damage → damage_full_viewport`
+   as the root-surface-damaged path (correct behavior, not a conservative
+   fallback).
+3. **Done.** `has_damage_due_to_interaction()` and
+   `earliest_input_generation_time()` exposed on the tracker. The latter is
+   wired into `record_pending_presentation_group → select_deadline`,
+   replacing the raw `input_rate_tracker.earliest_input_time()`. The value
+   is now damage-gated: only accumulated when interaction-driven display
+   damage occurs, and cleared at `did_finish_frame`.
+4. **Done (no change needed).** The existing `BufferQueue`-shape per-buffer
+   damage invariant in `metal_renderer.rs` (`update_buffer_damage`/
+   `buffer_damage`/`clear_buffer_damage`) remains the leaf. The tracker
+   decides *what* damage a frame carries, the presenter decides *how* a
+   buffer stores it.
 
-**Acceptance.** No production invalidation path falls back to full-frame
-damage unless `DisplayResized`/`SetRootSurfaceDamaged` semantics demand it.
-The input-aware deadline in Phase 3 receives a real
-`earliest_input_generation_time`, not `None`.
+**Acceptance — met.** No production invalidation path falls back to
+full-frame damage unless `refresh()` (root-surface-damaged) or resize
+semantics demand it. The input-aware deadline in Phase 3 now receives a
+damage-gated `earliest_input_generation_time` from the tracker (not the
+raw `input_rate_tracker` value that ignores whether damage occurred).
 
 ---
 

@@ -1086,6 +1086,7 @@ pub struct Window {
     input_latency_tracker: InputLatencyTracker,
     last_input_modality: InputModality,
     pub(crate) refreshing: bool,
+    damage_tracker: DisplayDamageTracker,
     pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) focus: Option<FocusId>,
     focus_enabled: bool,
@@ -1239,6 +1240,125 @@ impl crate::BeginFrameObserver for InputRateTracker {
     }
 }
 
+/// Single-process analog of Chromium's `DisplayDamageTracker`
+/// (`components/viz/service/display/display_damage_tracker.{h,cc}`).
+///
+/// Chromium tracks damage per-`SurfaceId` across a multi-process surface
+/// tree, with a `SurfaceBeginFrameState` ack protocol and a
+/// `SurfaceAggregator` to determine which surfaces contribute to the
+/// display. Zed has none of that substrate (Half A, explicitly rejected in
+/// `plan.md` §2): one scene tree, one process, one begin-frame source. The
+/// "surface" granularity is the GPUI **view** (keyed by `EntityId`), whose
+/// dirty accounting lives in `WindowInvalidator`.
+///
+/// This tracker owns only the latency-relevant state that the frame
+/// scheduler and deadline decider query — the state that has no existing
+/// home in Zed's pipeline:
+///
+/// - `expecting_root_surface_damage_because_of_resize`: set on resize,
+///   cleared when root damage is processed; ensures a draw after resize
+///   even if explicit invalidations haven't arrived yet.
+/// - `has_surface_damage_due_to_interaction`: accumulated while damage
+///   arrives during an ongoing scroll/touch interaction; mirrors
+///   `display_damage_tracker.h:147`.
+/// - `earliest_input_timestamp`: the earliest input generation time among
+///   damaged views (not all input — only input that caused display
+///   damage). Fed to `FrameDeadlineDecider::SelectDeadline`'s
+///   `earliest_input_time` argument (`frame_deadline_decider.cc:25`).
+///   Mirrors `display_damage_tracker.h:148`.
+///
+/// `root_frame_missing` lives on `FrameSchedulerData` instead, because
+/// `should_draw` reads from the shared `Rc<RefCell<FrameSchedulerData>>`
+/// that both `Window` and `BeginFrameScheduler` hold.
+struct DisplayDamageTracker {
+    expecting_root_surface_damage_because_of_resize: bool,
+    has_surface_damage_due_to_interaction: bool,
+    earliest_input_timestamp: Option<Instant>,
+}
+
+impl DisplayDamageTracker {
+    fn new() -> Self {
+        Self {
+            expecting_root_surface_damage_because_of_resize: false,
+            has_surface_damage_due_to_interaction: false,
+            earliest_input_timestamp: None,
+        }
+    }
+
+    /// Mirrors `DisplayDamageTracker::DisplayResized`
+    /// (`display_damage_tracker.cc:82`). Notifies that a window resize
+    /// occurred and root surface damage is expected. The scheduler uses
+    /// this to ensure a draw after resize.
+    fn display_resized(&mut self) {
+        self.expecting_root_surface_damage_because_of_resize = true;
+    }
+
+    /// Mirrors `DisplayDamageTracker::ProcessSurfaceDamage`
+    /// (`display_damage_tracker.cc:89`). Called when display damage is
+    /// known for the current frame — i.e. when the draw path determines
+    /// that refreshing or dirty views will produce visible damage.
+    ///
+    /// Accumulates the interaction flag and earliest input timestamp only
+    /// when the damage is interaction-driven (scroll/touch), matching
+    /// Chromium's `ShouldAccumulateInteraction` gate
+    /// (`display_damage_tracker.cc:17-27`). Clears the resize-expected
+    /// flag because root damage has been processed (analogous to
+    /// `display_damage_tracker.cc:115-116`).
+    fn on_display_damaged(&mut self, handling_interaction: bool, earliest_input: Option<Instant>) {
+        if handling_interaction {
+            self.has_surface_damage_due_to_interaction = true;
+            if let Some(input_time) = earliest_input {
+                self.earliest_input_timestamp = Some(
+                    self.earliest_input_timestamp
+                        .map(|existing| existing.min(input_time))
+                        .unwrap_or(input_time),
+                );
+            }
+        }
+        self.expecting_root_surface_damage_because_of_resize = false;
+    }
+
+    /// Mirrors `DisplayDamageTracker::DidFinishFrame`
+    /// (`display_damage_tracker.cc:196`). Clears per-frame interaction and
+    /// input state so stale data does not bleed into the next frame's
+    /// deadline decision. The resize flag persists across frames until
+    /// root damage is actually processed.
+    fn did_finish_frame(&mut self) {
+        self.has_surface_damage_due_to_interaction = false;
+        self.earliest_input_timestamp = None;
+    }
+
+    /// Mirrors `DisplayDamageTracker::HasDamageDueToInteraction`
+    /// (`display_damage_tracker.cc:187`). Returns whether damage received
+    /// for the current frame was due to an ongoing scroll/touch
+    /// interaction. Consumed by Phase 7 (EventLatency) to attribute
+    /// residual latency and by scheduler priority decisions.
+    #[allow(dead_code)]
+    fn has_damage_due_to_interaction(&self) -> bool {
+        self.has_surface_damage_due_to_interaction
+    }
+
+    /// Mirrors
+    /// `DisplayDamageTracker::GetEarliestInputGenerationTimeOfDamagedSurfaces`
+    /// (`display_damage_tracker.cc:191`). Returns the earliest input
+    /// generation time among damaged views, or `None` when no
+    /// interaction-driven damage has arrived this frame. Fed to
+    /// `FrameDeadlineDecider::select_deadline`'s `earliest_input_time`
+    /// argument.
+    fn earliest_input_generation_time(&self) -> Option<Instant> {
+        self.earliest_input_timestamp
+    }
+
+    /// Mirrors
+    /// `display_damage_tracker.h:89`
+    /// (`expecting_root_surface_damage_because_of_resize_`). Consumed by
+    /// scheduler draw-intent decisions in Phase 7.
+    #[allow(dead_code)]
+    fn expecting_root_surface_damage_because_of_resize(&self) -> bool {
+        self.expecting_root_surface_damage_because_of_resize
+    }
+}
+
 fn duration_div(duration: Duration, divisor: u32) -> Duration {
     Duration::from_nanos(
         (duration.as_nanos() / u128::from(divisor)).min(u128::from(u64::MAX)) as u64,
@@ -1358,6 +1478,11 @@ struct FrameSchedulerData {
     drew_current_begin_frame: bool,
     damage_reschedule_pending: bool,
     needs_draw: bool,
+    /// Mirrors `display_damage_tracker.h:143` (`root_frame_missing_`). True
+    /// until the first frame is successfully produced, so `should_draw`
+    /// forces an initial draw even before any explicit invalidation. Set
+    /// to false by `set_root_frame_presented` after the first draw.
+    root_frame_missing: bool,
     needs_one_begin_frame: bool,
     pending_begin_frame_deadline: Option<PendingBeginFrameDeadline>,
     inside_begin_frame_deadline_interval: bool,
@@ -1526,6 +1651,7 @@ impl Default for FrameSchedulerData {
             drew_current_begin_frame: false,
             damage_reschedule_pending: false,
             needs_draw: true,
+            root_frame_missing: true,
             needs_one_begin_frame: false,
             pending_begin_frame_deadline: None,
             inside_begin_frame_deadline_interval: false,
@@ -1735,7 +1861,9 @@ impl FrameSchedulerState {
 
     fn should_draw(&self, force_render: bool) -> bool {
         let state = self.inner.borrow();
-        (state.needs_draw || force_render) && !state.output_surface_lost && state.visible
+        (state.needs_draw || force_render || state.root_frame_missing)
+            && !state.output_surface_lost
+            && state.visible
     }
 
     fn needs_draw_for_request(&self, force_render: bool) -> bool {
@@ -1748,7 +1876,9 @@ impl FrameSchedulerState {
     }
 
     fn did_draw(&self) {
-        self.inner.borrow_mut().needs_draw = false;
+        let mut state = self.inner.borrow_mut();
+        state.needs_draw = false;
+        state.root_frame_missing = false;
     }
 
     fn set_visible(&self, visible: bool) -> bool {
@@ -3133,6 +3263,108 @@ mod tests {
         input_rate_tracker.set_frame_interval(Duration::ZERO);
 
         assert_eq!(input_rate_tracker.inputs_per_second, 60);
+    }
+
+    #[test]
+    fn display_damage_tracker_starts_with_no_interaction_or_input() {
+        let tracker = DisplayDamageTracker::new();
+
+        assert!(!tracker.has_damage_due_to_interaction());
+        assert_eq!(tracker.earliest_input_generation_time(), None);
+        assert!(!tracker.expecting_root_surface_damage_because_of_resize());
+    }
+
+    #[test]
+    fn display_damage_tracker_display_resized_sets_resize_flag() {
+        let mut tracker = DisplayDamageTracker::new();
+        assert!(!tracker.expecting_root_surface_damage_because_of_resize());
+
+        tracker.display_resized();
+        assert!(tracker.expecting_root_surface_damage_because_of_resize());
+    }
+
+    #[test]
+    fn display_damage_tracker_on_damage_clears_resize_flag() {
+        let mut tracker = DisplayDamageTracker::new();
+        tracker.display_resized();
+        assert!(tracker.expecting_root_surface_damage_because_of_resize());
+
+        tracker.on_display_damaged(false, None);
+        assert!(!tracker.expecting_root_surface_damage_because_of_resize());
+    }
+
+    #[test]
+    fn display_damage_tracker_accumulates_interaction_input_only_when_interaction_driven() {
+        let mut tracker = DisplayDamageTracker::new();
+        let input_time = Instant::now();
+
+        tracker.on_display_damaged(false, Some(input_time));
+        assert!(!tracker.has_damage_due_to_interaction());
+        assert_eq!(tracker.earliest_input_generation_time(), None);
+
+        tracker.on_display_damaged(true, Some(input_time));
+        assert!(tracker.has_damage_due_to_interaction());
+        assert_eq!(tracker.earliest_input_generation_time(), Some(input_time));
+    }
+
+    #[test]
+    fn display_damage_tracker_keeps_earliest_input_across_multiple_damages() {
+        let mut tracker = DisplayDamageTracker::new();
+        let early = Instant::now();
+        let late = early + Duration::from_millis(50);
+
+        tracker.on_display_damaged(true, Some(late));
+        assert_eq!(tracker.earliest_input_generation_time(), Some(late));
+
+        tracker.on_display_damaged(true, Some(early));
+        assert_eq!(
+            tracker.earliest_input_generation_time(),
+            Some(early),
+            "should keep the earliest (min) input timestamp"
+        );
+    }
+
+    #[test]
+    fn display_damage_tracker_did_finish_frame_clears_per_frame_state() {
+        let mut tracker = DisplayDamageTracker::new();
+        let input_time = Instant::now();
+        tracker.on_display_damaged(true, Some(input_time));
+        assert!(tracker.has_damage_due_to_interaction());
+        assert!(tracker.earliest_input_generation_time().is_some());
+
+        tracker.did_finish_frame();
+        assert!(!tracker.has_damage_due_to_interaction());
+        assert_eq!(tracker.earliest_input_generation_time(), None);
+    }
+
+    #[test]
+    fn display_damage_tracker_did_finish_frame_preserves_resize_flag() {
+        let mut tracker = DisplayDamageTracker::new();
+        tracker.display_resized();
+        tracker.did_finish_frame();
+        assert!(
+            tracker.expecting_root_surface_damage_because_of_resize(),
+            "resize flag should persist across frames until root damage is processed"
+        );
+    }
+
+    #[test]
+    fn scheduler_should_draw_forces_draw_when_root_frame_missing() {
+        let frame_scheduler = FrameSchedulerState::default();
+
+        frame_scheduler.did_draw();
+        assert!(!frame_scheduler.needs_draw());
+        assert!(
+            !frame_scheduler.should_draw(false),
+            "after did_draw with default state, should_draw should be false"
+        );
+
+        let data = frame_scheduler.inner.borrow();
+        assert!(
+            !data.root_frame_missing,
+            "did_draw should clear root_frame_missing"
+        );
+        drop(data);
     }
 
     #[test]
@@ -5240,6 +5472,7 @@ impl Window {
             tooltip_bounds: None,
             dirty_views: FxHashSet::default(),
             dirty_view_bounds: FxHashMap::default(),
+            damage_tracker: DisplayDamageTracker::new(),
             focus_listeners: SubscriberSet::new(),
             focus_lost_listeners: SubscriberSet::new(),
             default_prevented: true,
@@ -5750,6 +5983,7 @@ impl Window {
         self.viewport_size = self.platform_window.content_size();
         self.display_id = self.platform_window.display().map(|display| display.id());
 
+        self.damage_tracker.display_resized();
         self.refresh();
 
         self.bounds_observers
@@ -6160,7 +6394,8 @@ impl Window {
         self.capslock
     }
 
-    fn complete_frame(&self, ack: Option<crate::BeginFrameAck>) {
+    fn complete_frame(&mut self, ack: Option<crate::BeginFrameAck>) {
+        self.damage_tracker.did_finish_frame();
         self.platform_window.completed_frame(ack);
         self.update_begin_frame_subscription();
     }
@@ -6334,6 +6569,13 @@ impl Window {
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
         let full_damage = self.refreshing;
+        let handling_interaction = self
+            .input_rate_tracker
+            .borrow()
+            .is_handling_scroll_interaction();
+        let earliest_input = self.input_rate_tracker.borrow().earliest_input_time();
+        self.damage_tracker
+            .on_display_damaged(handling_interaction, earliest_input);
         self.invalidator.set_dirty(false);
         self.frame_scheduler.did_draw();
         self.requested_autoscroll = None;
@@ -6483,7 +6725,7 @@ impl Window {
         if self.uses_platform_swap_completion
             && let crate::PlatformDrawResult::Submitted(swap_id) = draw_result
         {
-            let earliest_input_time = self.input_rate_tracker.borrow().earliest_input_time();
+            let earliest_input_time = self.damage_tracker.earliest_input_generation_time();
             self.frame_scheduler.record_pending_presentation_group(
                 request_frame_options,
                 earliest_input_time,
