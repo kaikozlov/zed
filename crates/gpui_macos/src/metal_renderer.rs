@@ -89,7 +89,7 @@ enum CATransactionPhase {
 /// API, gated by a runtime `respondsToSelector:` probe.
 ///
 /// This module isolates the private-API surface so the commit path in
-/// `commit_iosurface_frame` can use a clean abstraction without inlining
+/// `commit_presented_frame_to_ca` can use a clean abstraction without inlining
 /// `msg_send!` calls.
 mod ca_transaction {
     use std::sync::OnceLock;
@@ -313,6 +313,18 @@ struct PresentedIosurfaceFrame {
     /// Monotonically increasing swap id (analog of `display.h` `swap_n`).
     /// Stamped onto all feedback emitted for this frame.
     swap_id: u64,
+    /// Mirrors `PresentedFrame::has_committed`
+    /// (`ca_layer_tree_coordinator.h:56`). Set to `true` when this frame
+    /// has been committed to CoreAnimation inside
+    /// `commit_presented_frame_to_ca`. Before this is set, the frame's
+    /// GPU work is complete (Metal command buffer finished) but the
+    /// layer content swap has not yet been submitted to the CA render
+    /// server. Used by `apply_backpressure` to determine whether the
+    /// committed front frame's fences should be waited on before buffer
+    /// reuse — matching `CALayerTreeCoordinator::ApplyBackpressure`'s
+    /// `presented_frames_.front().has_committed` gate
+    /// (`ca_layer_tree_coordinator.mm:83`).
+    has_committed: bool,
 }
 
 #[derive(Clone)]
@@ -667,6 +679,16 @@ impl CoreAnimationPresenter {
         self.next_submission_order.fetch_add(1, Ordering::AcqRel) + 1
     }
 
+    /// Creates the next `MTLSharedEvent` fence for the current
+    /// unpresented frame. The fence is encoded into the Metal command
+    /// buffer (`encode_signal_event`) and later stored on the
+    /// `PresentedIosurfaceFrame` when it enters the presentation queue.
+    /// Mirrors `CALayerTreeCoordinator::EnqueueBackpressureFences`
+    /// (`ca_layer_tree_coordinator.mm:73`), which accumulates metal fences
+    /// for the current unpresented frame before `Present()` moves it into
+    /// `presented_frames_`. In Zed's single-buffer-per-frame model, one
+    /// fence per frame suffices (Chromium accumulates a vector because
+    /// its CARendererLayerTree can span multiple IOSurface planes).
     fn next_backpressure_fence(&self) -> IosurfaceBackpressureFence {
         IosurfaceBackpressureFence {
             event: self.backpressure_event.clone(),
@@ -674,7 +696,19 @@ impl CoreAnimationPresenter {
         }
     }
 
-    fn apply_committed_backpressure(&self) {
+    /// Applies backpressure by waiting on the committed front frame's
+    /// `MTLSharedEvent` fence before allowing buffer reuse. Mirrors
+    /// `CALayerTreeCoordinator::ApplyBackpressure`
+    /// (`ca_layer_tree_coordinator.mm:81`), which waits on the metal/GL
+    /// fences of the committed front frame in `presented_frames_` before
+    /// reusing its buffers.
+    ///
+    /// This is the single call site for `MTLSharedEvent` fence
+    /// application in the IOSurface present path. Called from
+    /// `draw_chromium_pipeline` at the top of each draw, before acquiring
+    /// a buffer, ensuring that the GPU work from the previous committed
+    /// frame has been observed before its IOSurface is reused.
+    fn apply_backpressure(&self) {
         if let Some(fence) = self.committed_backpressure_fence.lock().take() {
             apply_iosurface_backpressure_fence(&fence);
         }
@@ -909,6 +943,16 @@ fn apply_iosurface_backpressure_fence(fence: &IosurfaceBackpressureFence) {
     }
 }
 
+/// Fires the swap-completion and presentation-feedback callbacks for a
+/// committed (or dropped) frame. Mirrors the callback-firing tail of
+/// `CALayerTreeCoordinator::CommitPresentedFrameToCA`
+/// (`ca_layer_tree_coordinator.mm:241-302`), which runs
+/// `frame.completion_callback` and `frame.presentation_callback` after
+/// the CA commit lands.
+///
+/// When `presented` is true and the frame committed successfully, also
+/// installs the frame's backpressure fence as the new committed fence —
+/// the next `apply_backpressure` call will wait on it before buffer reuse.
 fn complete_iosurface_frame(frame: Box<PresentedIosurfaceFrame>, presented: bool) {
     let latch_time = scheduler::Instant::now();
     let swap_id = Some(frame.swap_id);
@@ -958,6 +1002,12 @@ fn complete_iosurface_frame(frame: Box<PresentedIosurfaceFrame>, presented: bool
     }
 }
 
+/// Fires failed swap-completion and presentation-feedback callbacks for a
+/// frame whose Metal command buffer did not complete successfully. This
+/// is the error path analog of `complete_iosurface_frame` — Chromium has
+/// no direct equivalent because its GPU process isolates rendering failures,
+/// but the callback structure mirrors the same swap-completion +
+/// presentation-feedback pair.
 fn fail_iosurface_frame(frame: Box<PresentedIosurfaceFrame>) {
     let latch_time = scheduler::Instant::now();
     let swap_id = Some(frame.swap_id);
@@ -994,7 +1044,27 @@ fn fail_iosurface_frame(frame: Box<PresentedIosurfaceFrame>) {
     }
 }
 
-fn commit_iosurface_frame(frame: Box<PresentedIosurfaceFrame>) -> bool {
+/// Commits a ready IOSurface frame to CoreAnimation. This is the single
+/// CA-commit boundary in the IOSurface present path, mirroring
+/// `CALayerTreeCoordinator::CommitPresentedFrameToCA`
+/// (`ca_layer_tree_coordinator.mm:188`).
+///
+/// Call sequence mirrors Chromium:
+/// 1. **Generation guard** — stale-generation frames (from before a resize)
+///    self-skip, exactly like Chromium's blank-frame path.
+/// 2. **CA transaction** — `begin()` + `set_disable_actions()` +
+///    optional `add_commit_handler(PostCommit)` for async completion.
+/// 3. **Content swap** — optionally recreates the CAContext (fence-port
+///    lifecycle on resize, matching `ca_layer_tree_coordinator.mm:211-224`),
+///    then swaps the layer contents.
+/// 4. **Commit** — `ca_transaction::commit()` submits to the CA render
+///    server. Sets `has_committed = true` on the frame, matching
+///    `PresentedFrame::has_committed` (`ca_layer_tree_coordinator.h:56`).
+/// 5. **Callbacks** — `complete_iosurface_frame` fires the swap-completion
+///    and presentation-feedback callbacks, either via the post-commit
+///    handler (if phase handlers are supported) or synchronously after
+///    commit.
+fn commit_presented_frame_to_ca(frame: Box<PresentedIosurfaceFrame>) -> bool {
     if frame.generation != frame.current_generation.load(Ordering::Acquire) {
         complete_iosurface_frame(frame, false);
         return false;
@@ -1008,15 +1078,15 @@ fn commit_iosurface_frame(frame: Box<PresentedIosurfaceFrame>) -> bool {
         ca_transaction::set_disable_actions();
         let frame_for_handler = frame.clone();
         ca_transaction::add_commit_handler(CATransactionPhase::PostCommit, move || {
-            if let Some(frame) = frame_for_handler.take() {
+            if let Some(mut frame) = frame_for_handler.take() {
+                frame.has_committed = true;
                 complete_iosurface_frame(frame, true);
             }
         })
     };
 
     unsafe {
-        if let Some(frame_for_contents) = frame.take() {
-            let mut frame_for_contents = frame_for_contents;
+        if let Some(mut frame_for_contents) = frame.take() {
             frame_for_contents.committed_display_timing = display_timing;
             if frame_for_contents.recreate_ca_context_on_commit {
                 let drawable_size = frame_for_contents.drawable_size;
@@ -1039,12 +1109,14 @@ fn commit_iosurface_frame(frame: Box<PresentedIosurfaceFrame>) -> bool {
             } else {
                 let _: () = msg_send![frame_for_contents.layer, setContents: contents];
             }
+            frame_for_contents.has_committed = true;
             frame.set(Some(frame_for_contents));
         }
         ca_transaction::commit();
     }
 
-    if !registered_post_commit && let Some(frame) = frame.take() {
+    if !registered_post_commit && let Some(mut frame) = frame.take() {
+        frame.has_committed = true;
         complete_iosurface_frame(frame, true);
     }
 
@@ -1065,7 +1137,7 @@ fn commit_ready_iosurface_frame(
     let Some(frame) = frame else {
         return false;
     };
-    commit_iosurface_frame(frame);
+    commit_presented_frame_to_ca(frame);
     true
 }
 
@@ -1096,7 +1168,7 @@ fn commit_ready_iosurface_frame_after_completion(
 
 /// Commit ready frames from the front of the queue until a current-generation
 /// frame is presented. Stale-generation frames (produced before the most recent
-/// resize) self-skip inside `commit_iosurface_frame`, which is exactly the
+/// resize) self-skip inside `commit_presented_frame_to_ca`, which is exactly the
 /// "wrong size during resize" filter: generation is bumped on every resize, so
 /// only same-size frames carry the current generation. Returns true once a
 /// current-generation frame was committed.
@@ -1108,7 +1180,7 @@ fn drain_ready_frames_to_current_generation(
         let Some(frame) = frame else {
             return false;
         };
-        if commit_iosurface_frame(frame) {
+        if commit_presented_frame_to_ca(frame) {
             return true;
         }
     }
@@ -1749,7 +1821,7 @@ impl MetalRenderer {
                 return PlatformDrawResult::Skipped;
             }
 
-            presenter.apply_committed_backpressure();
+            presenter.apply_backpressure();
 
             if presenter.pending_swap_count.load(Ordering::Acquire) >= IOSURFACE_MAX_PENDING_SWAPS {
                 commit_ready_iosurface_frame(presenter.presented_frames.clone());
@@ -1846,6 +1918,7 @@ impl MetalRenderer {
                         layer_tree: presenter.layer_tree.clone(),
                         drawable_size: presenter.drawable_size,
                         swap_id: submission_order as u64,
+                        has_committed: false,
                     };
                     let resize_frame_wait = presenter.resize_frame_wait.clone();
                     presented_frames

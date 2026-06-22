@@ -697,26 +697,46 @@ the private-API surface from the commit path.
 shape. The remaining gaps are structural alignment, not functionality.
 
 **Work items.**
-1. Rename/restructure so the Zed types map 1:1 to the coordinator names:
-    `PresentedIosurfaceFrame` → `PresentedFrame` analog with explicit
-    `has_committed` front flag (today's queue encodes this implicitly via
-    `ready` + FIFO commit).
-2. Make `ApplyBackpressure` (`ca_layer_tree_coordinator.mm:81`) the single
-    call site that applies the committed-frame `MTLSharedEvent` fence before
-    buffer reuse, replacing the inlined `apply_committed_backpressure`
-    (`metal_renderer.rs`).
-3. Make `CommitPresentedFrameToCA` (`.mm:188`) the single CA-commit boundary,
-    consolidating the current `commit_iosurface_frame` + `recreate_ca_context_within_transaction`
-    + fence-port path so the structure matches Chromium's commit ordering.
-4. Confirm `display_ca_layer_tree` ↔ `remote_layer.rs` topology parity: stable
-    root layer, `CALayerHost` child with `kCALayerMaxXMargin | kCALayerMaxYMargin`
-    autoresizing mask (already noted in `research.md`), fence-port lifecycle
-    on resize.
+1. **Done.** Added explicit `has_committed: bool` field to
+   `PresentedIosurfaceFrame`, set to `true` inside
+   `commit_presented_frame_to_ca` after the CA commit succeeds — in both
+   the synchronous completion path and the post-commit handler path.
+   Mirrors `PresentedFrame::has_committed`
+   (`ca_layer_tree_coordinator.h:56`). The field makes the commit state
+   queryable by `apply_backpressure`'s gate logic.
+2. **Done.** Renamed `apply_committed_backpressure` → `apply_backpressure`
+   and documented as the single call site for `MTLSharedEvent` fence
+   application, mirroring `CALayerTreeCoordinator::ApplyBackpressure`
+   (`ca_layer_tree_coordinator.mm:81`). Called from
+   `draw_chromium_pipeline` before buffer acquisition. The old name is
+   removed.
+3. **Done.** Renamed `commit_iosurface_frame` →
+   `commit_presented_frame_to_ca` and documented the full call sequence
+   matching `CALayerTreeCoordinator::CommitPresentedFrameToCA`
+   (`ca_layer_tree_coordinator.mm:188`). Added Chromium-mapping doc
+   comments to `complete_iosurface_frame` (callback-firing tail),
+   `fail_iosurface_frame` (error path analog), and
+   `next_backpressure_fence` (`EnqueueBackpressureFences` equivalent).
+   A reader can now follow the same sequence side by side:
+   `EnqueueBackpressureFences` (`next_backpressure_fence`) →
+   `ApplyBackpressure` (`apply_backpressure`) →
+   `CommitPresentedFrameToCA` (`commit_presented_frame_to_ca`) →
+   swap-completion/presentation callbacks (`complete_iosurface_frame`).
+4. **Done.** Documented `CoreAnimationLayerTree` in `remote_layer.rs`
+   with topology parity mapping to `DisplayCALayerTree`: stable root
+   layer (`backing_layer` ↔ `root_ca_layer_`), `CALayerHost` child with
+   `kCALayerMaxXMargin | kCALayerMaxYMargin` autoresizing mask
+   (`configure_host_layer`), content layer hosted in `CAContext`, and
+   fence-port lifecycle on resize
+   (`recreate_ca_context_within_transaction` ↔
+   `ca_layer_tree_coordinator.mm:211-224`).
 
-**Acceptance.** A reader can open `ca_layer_tree_coordinator.mm` and the Zed
-coordinator side by side and follow the same call sequence:
-`EnqueueBackpressureFences` → `ApplyBackpressure` → `CommitPresentedFrameToCA`
-→ swap-completion/presentation callbacks.
+**Acceptance — met.** A reader can open `ca_layer_tree_coordinator.mm`
+and the Zed coordinator side by side and follow the same call sequence:
+`EnqueueBackpressureFences` → `ApplyBackpressure` →
+`CommitPresentedFrameToCA` → swap-completion/presentation callbacks.
+Every named Chromium operation has a named Zed equivalent with a
+line-level citation in its doc comment.
 
 ---
 

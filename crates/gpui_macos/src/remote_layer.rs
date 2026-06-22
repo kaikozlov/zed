@@ -16,6 +16,29 @@ use std::{collections::VecDeque, ffi::c_char, sync::OnceLock};
 
 const MAX_CA_CONTEXT_FENCE_PORTS: usize = 4;
 
+/// CoreAnimation layer tree for the Chromium-style CA/IOSurface present path.
+///
+/// Topology parity with Chromium's `DisplayCALayerTree`
+/// (`ui/accelerated_widget_mac/display_ca_layer_tree.{h,mm}`):
+/// - **Stable root layer** (`backing_layer`): created once in
+///   `new_remote`/`new_direct`, never replaced except on
+///   `recreate_ca_context_within_transaction`. Matches Chromium's
+///   `root_ca_layer_` (`ca_layer_tree_coordinator.h:136`).
+/// - **`CALayerHost` child** (`host_layer`): the remote-layer host that
+///   displays the GPU-process-side content via cross-process CoreAnimation.
+///   Configured with `kCALayerMaxXMargin | kCALayerMaxYMargin`
+///   autoresizing mask (`configure_host_layer`), matching Chromium's
+///   `display_ca_layer_tree.mm` layer host setup. `geometryFlipped = YES`
+///   on the backing layer anchors content at the top-left.
+/// - **Content layer** (`content_layer`): the IOSurface-backed layer whose
+///   `contents` are swapped per frame in `commit_presented_frame_to_ca`.
+///   Hosted inside the `CAContext` (`ca_context.layer = content_layer`),
+///   matching Chromium's `ca_context_.layer = root_ca_layer_`.
+/// - **Fence-port lifecycle on resize**:
+///   `recreate_ca_context_within_transaction` creates a fence port on the
+///   old context (`createFencePort`), sets it (`setFencePort:`), nils the
+///   context, and creates a fresh one — matching Chromium's
+///   `ca_layer_tree_coordinator.mm:211-224` resize path.
 pub(crate) struct CoreAnimationLayerTree {
     backing_layer: id,
     host_layer: id,
