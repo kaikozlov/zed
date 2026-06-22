@@ -3090,7 +3090,7 @@ extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
     // yet, request one and return; the next displayLayer: tick can consume it.
     //
     // No CaActionsDisabled guard is held across the wait: every layer mutation
-    // (commit_iosurface_frame's contents swap, set_drawable_size's bounds
+    // (commit_presented_frame_to_ca's contents swap, set_drawable_size's bounds
     // change) already disables implicit actions in its own scope, so holding a
     // nested CATransaction open across the park would only block AppKit's outer
     // window transaction while the main thread is parked. Chromium holds its
