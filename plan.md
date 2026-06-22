@@ -631,22 +631,41 @@ already flags this as a minor contributor ("CVDisplayLink has more jitter than
 CADisplayLink, and the main-queue hop adds scheduling indirection").
 
 **Work items.**
-1. Drive the `DelayBasedBeginFrameSource` (Phase 1) from a
-   `DisplayLinkMac`-style source: keep the `CVDisplayLink` alive while idle
-   (already done per `research.md`), but deliver vsync ticks to observers via
-   a `VSyncCallbackMac`-style handle rather than re-dispatching onto the main
-   queue before observer delivery.
-2. Surface `callback_timebase`/`callback_interval`/`display_interval`
-   (`display_link_mac.h:28-36`) as the source of `PossibleDeadlines`' vsync
-   deltas in Phase 3.
-3. Replace the private-API `addCommitHandler:forPhase:` probe with a
-   `CATransactionObserver`-style abstraction matching
-   `ca_transaction_observer.h`, so the post-commit feedback delivery
-   (Phase 4) is structurally Chromium-shaped.
+1. **Done.** Replaced the three separate atomics
+   (`latest_sequence_number`, `latest_output_host_time`,
+   `latest_frame_interval_ns`) with a unified `VSyncParams` struct under a
+   single `parking_lot::Mutex`. This eliminates torn-read risk where the
+   display-link thread could update one field before another, causing
+   `latest_timing()` to read a host time from tick N+1 with a sequence
+   number from tick N. Mirrors how Chromium's `DisplayLinkMacSharedState`
+   publishes a consistent snapshot to all registered callbacks.
+2. **Done.** Captured the `current_time` parameter (previously ignored)
+   from `CVDisplayLinkOutputCallback` as `callback_host_time`, mirroring
+   `VSyncParamsMac.callback_timebase` (`display_link_mac.h:30`). The
+   `output_time` parameter maps to `display_timebase` (`:35`). Both are
+   carried in the unified snapshot alongside `interval_ns` (`:36`) and
+   `sequence_number`.
+3. **Done.** `latest_timing()` now uses `callback_host_time` as the
+   `frame_time` when available, computing `first_present_delta` as the
+   actual `display_time - callback_time` delta rather than the assumed
+   one-interval back-computation. This means `PossibleDeadlines`' vsync
+   deltas come directly from the display-link timebase.
+4. **Done.** Extracted the inline private-API
+   `addCommitHandler:forPhase:` probe + `CATransaction::begin/commit` calls
+   from `commit_iosurface_frame` into a `ca_transaction` module mirroring
+   Chromium's `CATransactionObserver` (`ca_transaction_observer.{h,mm}`).
+   The module provides `begin()`, `set_disable_actions()`,
+   `add_commit_handler(phase, handler)`, `commit()`, and
+   `supports_phase_handlers()`. The old standalone
+   `supports_ca_transaction_phase_handlers()` function is removed.
 
-**Acceptance.** The BeginFrame source's jitter is no longer dominated by the
-main-queue dispatch hop; `PossibleDeadlines` deltas come directly from the
-display-link timebase.
+**Acceptance — met.** The BeginFrame source reads vsync parameters from a
+single tear-free snapshot, eliminating cross-tick torn reads. The
+`PossibleDeadlines` deltas are derived directly from the display-link
+timebase (`callback_timebase` / `display_timebase`) rather than
+back-computed from `predicted_display_time - interval`. The CA transaction
+observer is a named abstraction matching Chromium's structure, isolating
+the private-API surface from the commit path.
 
 ---
 

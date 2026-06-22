@@ -6,31 +6,80 @@ use dispatch2::{
 use gpui::{BeginFrameArgs, BeginFrameId, PossibleDeadline, PossibleDeadlines};
 use gpui_util::ResultExt;
 use mach2::mach_time::{mach_absolute_time, mach_timebase_info, mach_timebase_info_data_t};
+use parking_lot::Mutex;
 use scheduler::Instant;
 use std::{
     ffi::c_void,
-    sync::{
-        Arc, OnceLock,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, OnceLock},
     time::Duration,
 };
+
+/// VSync parameters captured atomically from the `CVDisplayLink` output
+/// callback, mirroring Chromium's `VSyncParamsMac`
+/// (`ui/display/mac/display_link_mac.h:27-39`).
+///
+/// Chromium distinguishes between *callback* timing (when the display-link
+/// fired) and *display* timing (when the frame will actually be shown):
+/// - `callback_timebase` / `callback_interval` — the raw callback arrival
+///   time and inter-callback interval (`VSyncParamsMac.callback_timebase`,
+///   `display_link_mac.h:30-31`).
+/// - `display_timebase` / `display_interval` — the predicted display time
+///   and refresh period (`VSyncParamsMac.display_timebase`,
+///   `display_link_mac.h:35-36`).
+///
+/// In Zed's current code these are spread across three separate atomics
+/// (`latest_output_host_time`, `latest_frame_interval_ns`,
+/// `latest_sequence_number`), which creates torn-read risk: the display-link
+/// thread could update one field (e.g. `host_time`) before another (e.g.
+/// `sequence_number`), so `latest_timing()` could read a host time from tick
+/// N+1 with a sequence number from tick N. Encapsulating all params in a
+/// single `Mutex<VSyncParams>` snapshot eliminates that risk, matching how
+/// Chromium's `DisplayLinkMacSharedState` publishes a consistent snapshot to
+/// all registered callbacks.
+#[derive(Clone, Default)]
+struct VSyncParams {
+    /// Monotonic sequence counter, incremented on each vsync tick. Matches
+    /// Chromium's internal frame counter that feeds `BeginFrameId`.
+    sequence_number: u64,
+    /// The host time of the `CVTimeStamp` when the callback fired
+    /// (`current_time` parameter of `CVDisplayLinkOutputCallback`), or `0`
+    /// when the callback didn't carry a valid host time. Mirrors
+    /// `VSyncParamsMac.callback_timebase` (`display_link_mac.h:30`).
+    callback_host_time: u64,
+    /// The host time of the `CVTimeStamp` indicating when the frame will be
+    /// displayed (`output_time` parameter), or `0` when invalid. Mirrors
+    /// `VSyncParamsMac.display_timebase` (`display_link_mac.h:35`).
+    display_host_time: u64,
+    /// The display refresh period in nanoseconds, or `0` when the callback
+    /// didn't carry a valid `video_refresh_period`. Mirrors
+    /// `VSyncParamsMac.display_interval` (`display_link_mac.h:36`).
+    interval_ns: u64,
+}
+
+impl VSyncParams {
+    fn is_valid(&self) -> bool {
+        self.display_host_time != 0
+    }
+
+    fn interval(&self) -> Option<Duration> {
+        match self.interval_ns {
+            0 => None,
+            ns => Some(Duration::from_nanos(ns)),
+        }
+    }
+}
 
 pub struct DisplayLink {
     display_link: Option<sys::DisplayLink>,
     frame_requests: DispatchRetained<DispatchSource>,
     source_id: u64,
-    latest_sequence_number: Arc<AtomicU64>,
-    latest_output_host_time: Arc<AtomicU64>,
-    latest_frame_interval_ns: Arc<AtomicU64>,
+    latest_params: Arc<Mutex<VSyncParams>>,
     _callback_context: Box<DisplayLinkCallbackContext>,
 }
 
 struct DisplayLinkCallbackContext {
     frame_requests: *const DispatchSource,
-    latest_sequence_number: Arc<AtomicU64>,
-    latest_output_host_time: Arc<AtomicU64>,
-    latest_frame_interval_ns: Arc<AtomicU64>,
+    latest_params: Arc<Mutex<VSyncParams>>,
 }
 
 #[derive(Clone, Debug)]
@@ -50,7 +99,7 @@ impl DisplayLink {
     ) -> Result<DisplayLink> {
         unsafe extern "C" fn display_link_callback(
             _display_link_out: *mut sys::CVDisplayLink,
-            _current_time: *const sys::CVTimeStamp,
+            current_time: *const sys::CVTimeStamp,
             output_time: *const sys::CVTimeStamp,
             _flags_in: i64,
             _flags_out: *mut i64,
@@ -58,30 +107,55 @@ impl DisplayLink {
         ) -> i32 {
             unsafe {
                 let callback_context = &*(callback_context as *const DisplayLinkCallbackContext);
-                callback_context
-                    .latest_sequence_number
-                    .fetch_add(1, Ordering::AcqRel);
-                if let Some(output_time) = output_time.as_ref()
-                    && output_time.flags & sys::kCVTimeStampHostTimeValid != 0
-                {
-                    callback_context
-                        .latest_output_host_time
-                        .store(output_time.host_time, Ordering::Release);
-                }
-                if let Some(output_time) = output_time.as_ref()
-                    && output_time.flags & sys::kCVTimeStampVideoRefreshPeriodValid != 0
-                    && output_time.video_time_scale > 0
-                    && output_time.video_refresh_period > 0
-                {
-                    let interval_ns = u128::try_from(output_time.video_refresh_period)
-                        .unwrap_or_default()
-                        * 1_000_000_000u128
-                        / u128::try_from(output_time.video_time_scale).unwrap_or(1);
-                    callback_context.latest_frame_interval_ns.store(
-                        interval_ns.min(u128::from(u64::MAX)) as u64,
-                        Ordering::Release,
-                    );
-                }
+
+                // Capture the callback host time (when the display-link fired).
+                // Maps to `VSyncParamsMac.callback_timebase`
+                // (`display_link_mac.h:30`). The `current_time` parameter
+                // carries the callback arrival timestamp.
+                let callback_host_time = current_time
+                    .as_ref()
+                    .filter(|ts| ts.flags & sys::kCVTimeStampHostTimeValid != 0)
+                    .map(|ts| ts.host_time)
+                    .unwrap_or(0);
+
+                // Capture the display host time (when the frame will be shown).
+                // Maps to `VSyncParamsMac.display_timebase`
+                // (`display_link_mac.h:35`).
+                let display_host_time = output_time
+                    .as_ref()
+                    .filter(|ts| ts.flags & sys::kCVTimeStampHostTimeValid != 0)
+                    .map(|ts| ts.host_time)
+                    .unwrap_or(0);
+
+                // Capture the display refresh period.
+                // Maps to `VSyncParamsMac.display_interval`
+                // (`display_link_mac.h:36`).
+                let interval_ns = output_time
+                    .as_ref()
+                    .filter(|ts| {
+                        ts.flags & sys::kCVTimeStampVideoRefreshPeriodValid != 0
+                            && ts.video_time_scale > 0
+                            && ts.video_refresh_period > 0
+                    })
+                    .map(|ts| {
+                        let interval_ns = u128::try_from(ts.video_refresh_period)
+                            .unwrap_or_default()
+                            * 1_000_000_000u128
+                            / u128::try_from(ts.video_time_scale).unwrap_or(1);
+                        interval_ns.min(u128::from(u64::MAX)) as u64
+                    })
+                    .unwrap_or(0);
+
+                // Publish a single consistent snapshot. All fields are
+                // captured under one lock so `latest_timing()` on the main
+                // thread reads a tear-free view from a single vsync tick.
+                let mut params = callback_context.latest_params.lock();
+                params.sequence_number = params.sequence_number.wrapping_add(1);
+                params.callback_host_time = callback_host_time;
+                params.display_host_time = display_host_time;
+                params.interval_ns = interval_ns;
+                drop(params);
+
                 (*callback_context.frame_requests).merge_data(1);
                 0
             }
@@ -99,14 +173,16 @@ impl DisplayLink {
             frame_requests.resume();
 
             let source_id = u64::from(display_id);
-            let latest_sequence_number = Arc::new(AtomicU64::new(initial_sequence_number));
-            let latest_output_host_time = Arc::new(AtomicU64::new(0));
-            let latest_frame_interval_ns = Arc::new(AtomicU64::new(0));
+            let initial_params = VSyncParams {
+                sequence_number: initial_sequence_number,
+                callback_host_time: 0,
+                display_host_time: 0,
+                interval_ns: 0,
+            };
+            let latest_params = Arc::new(Mutex::new(initial_params));
             let callback_context = Box::new(DisplayLinkCallbackContext {
                 frame_requests: &*frame_requests as *const DispatchSource,
-                latest_sequence_number: latest_sequence_number.clone(),
-                latest_output_host_time: latest_output_host_time.clone(),
-                latest_frame_interval_ns: latest_frame_interval_ns.clone(),
+                latest_params: latest_params.clone(),
             });
             let display_link = sys::DisplayLink::new(
                 display_id,
@@ -118,16 +194,23 @@ impl DisplayLink {
                 display_link: Some(display_link),
                 frame_requests,
                 source_id,
-                latest_sequence_number,
-                latest_output_host_time,
-                latest_frame_interval_ns,
+                latest_params,
                 _callback_context: callback_context,
             })
         }
     }
 
+    /// Returns the predicted display time from the latest vsync tick, or
+    /// `None` if no valid timing has been received yet. Kept as a public
+    /// accessor for consumers that only need the display time without the
+    /// full `DisplayLinkTiming` construction.
+    #[allow(dead_code)]
     pub fn latest_output_time(&self) -> Option<Instant> {
-        host_time_to_instant(self.latest_output_host_time.load(Ordering::Acquire))
+        let params = self.latest_params.lock();
+        if !params.is_valid() {
+            return None;
+        }
+        host_time_to_instant(params.display_host_time)
     }
 
     pub fn source_id(&self) -> u64 {
@@ -135,17 +218,36 @@ impl DisplayLink {
     }
 
     pub fn latest_timing(&self) -> Option<DisplayLinkTiming> {
-        let predicted_display_time = self.latest_output_time()?;
-        let frame_interval = match self.latest_frame_interval_ns.load(Ordering::Acquire) {
-            0 => None,
-            interval_ns => Some(Duration::from_nanos(interval_ns)),
+        let params = self.latest_params.lock();
+        if !params.is_valid() {
+            return None;
+        }
+        let sequence_number = params.sequence_number;
+        let interval = params.interval().unwrap_or(Duration::from_micros(16667));
+        let predicted_display_time = host_time_to_instant(params.display_host_time)?;
+
+        // Derive frame_time from the display-link timebase rather than
+        // back-computing from `predicted_display_time - interval`. When the
+        // callback provides `callback_host_time` (callback_timebase), use it
+        // as the frame_time — this is when the display-link actually fired,
+        // and the delta from callback to display is the real first-present
+        // delta, not an assumed one-interval. Falls back to
+        // `predicted_display_time - interval` when callback timing is
+        // unavailable.
+        let (frame_time, first_present_delta) = if params.callback_host_time != 0
+            && params.callback_host_time < params.display_host_time
+        {
+            let callback_time =
+                host_time_to_instant(params.callback_host_time).unwrap_or(predicted_display_time);
+            let delta = predicted_display_time.saturating_duration_since(callback_time);
+            (callback_time, delta)
+        } else {
+            let frame_time = predicted_display_time
+                .checked_sub(interval)
+                .unwrap_or(predicted_display_time);
+            (frame_time, interval)
         };
-        let interval = frame_interval.unwrap_or(Duration::from_micros(16667));
-        let sequence_number = self.latest_sequence_number.load(Ordering::Acquire);
-        let frame_time = predicted_display_time
-            .checked_sub(interval)
-            .unwrap_or(predicted_display_time);
-        let first_present_delta = predicted_display_time.saturating_duration_since(frame_time);
+
         let begin_frame = BeginFrameArgs {
             id: BeginFrameId {
                 source_id: self.source_id,
@@ -164,7 +266,7 @@ impl DisplayLink {
         Some(DisplayLinkTiming {
             begin_frame,
             predicted_display_time,
-            frame_interval,
+            frame_interval: params.interval(),
             frame_deadline: predicted_display_time,
         })
     }

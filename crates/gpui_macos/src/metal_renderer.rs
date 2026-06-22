@@ -30,7 +30,7 @@ use metal::{
     CommandQueue, MTLCommandBufferStatus, MTLGPUFamily, MTLPixelFormat, MTLResourceOptions,
     MTLScissorRect, NSRange, RenderPassColorAttachmentDescriptorRef, SharedEvent,
 };
-use objc::{self, class, msg_send, sel, sel_impl};
+use objc::{self, msg_send, sel, sel_impl};
 use parking_lot::{Condvar, Mutex};
 
 use std::{
@@ -40,7 +40,7 @@ use std::{
     mem, ptr,
     rc::Rc,
     sync::{
-        Arc, OnceLock,
+        Arc,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
@@ -60,8 +60,110 @@ const PATH_SAMPLE_COUNT: u32 = 4;
 const LEGACY_METAL_LAYER_ENV: &str = "ZED_MACOS_LEGACY_METAL_LAYER";
 const IOSURFACE_BUFFER_COUNT: usize = 3;
 const IOSURFACE_MAX_PENDING_SWAPS: usize = IOSURFACE_BUFFER_COUNT - 1;
-const CA_TRANSACTION_PHASE_POST_COMMIT: usize = 2;
 const NO_CURRENT_BUFFER: usize = usize::MAX;
+
+/// CA transaction commit phases, mirroring Chromium's
+/// `ca_transaction_observer.h` phase enum. Used by
+/// [`ca_transaction::add_commit_handler`] when the private
+/// `addCommitHandler:forPhase:` API is available.
+#[allow(dead_code)]
+enum CATransactionPhase {
+    /// Called before the transaction commits. Maps to
+    /// `CA_TRANSACTION_PHASE_PRE_COMMIT` (1).
+    PreCommit = 1,
+    /// Called after the transaction commits. Maps to
+    /// `CA_TRANSACTION_PHASE_POST_COMMIT` (2). This is the phase Chromium
+    /// uses for presentation-feedback delivery
+    /// (`ca_transaction_observer.mm`).
+    PostCommit = 2,
+}
+
+/// Abstraction over the private `+[CATransaction addCommitHandler:forPhase:]`
+/// API, mirroring Chromium's `CATransactionObserver`
+/// (`ui/accelerated_widget_mac/ca_transaction_observer.{h,mm}`).
+///
+/// Chromium registers pre-commit and post-commit handlers to get
+/// deterministic feedback about when a CA commit has landed — the
+/// post-commit callback is where presentation feedback is delivered
+/// (Phase 4 trace-ID matching). Zed approximates this via the same private
+/// API, gated by a runtime `respondsToSelector:` probe.
+///
+/// This module isolates the private-API surface so the commit path in
+/// `commit_iosurface_frame` can use a clean abstraction without inlining
+/// `msg_send!` calls.
+mod ca_transaction {
+    use std::sync::OnceLock;
+
+    use block::ConcreteBlock;
+    use cocoa::base::{YES, id};
+    use objc::{class, msg_send, sel, sel_impl};
+
+    /// Returns `true` if the current macOS version supports the private
+    /// `addCommitHandler:forPhase:` API. Probed once and cached.
+    /// Mirrors Chromium's `if (@available(...))` / `respondsToSelector:`
+    /// gate in `ca_transaction_observer.mm`.
+    pub fn supports_phase_handlers() -> bool {
+        static SUPPORTS: OnceLock<bool> = OnceLock::new();
+        *SUPPORTS.get_or_init(|| unsafe {
+            msg_send![
+                class!(CATransaction),
+                respondsToSelector: sel!(addCommitHandler:forPhase:)
+            ]
+        })
+    }
+
+    /// Registers a block to be called at the given transaction phase.
+    /// Only call this between `begin()` and `commit()`.
+    ///
+    /// If phase handlers are not supported, this is a no-op and the caller
+    /// must handle the fallback (calling the callback synchronously after
+    /// commit). Returns `true` if the handler was registered.
+    pub unsafe fn add_commit_handler<F>(phase: super::CATransactionPhase, handler: F) -> bool
+    where
+        F: Fn() + 'static,
+    {
+        if !supports_phase_handlers() {
+            return false;
+        }
+        let block = ConcreteBlock::new(handler);
+        let copied = block.copy();
+        unsafe {
+            let block_ptr: id = &*copied as *const _ as id;
+            let _: () = msg_send![
+                class!(CATransaction),
+                addCommitHandler: block_ptr
+                forPhase: phase as usize
+            ];
+        }
+        // `copied` is dropped here — CA has retained the block, so it
+        // survives until the transaction completes.
+        true
+    }
+
+    /// Begins a Core Animation transaction. Mirrors
+    /// `CATransaction::begin()` in `ca_transaction_observer.mm`.
+    pub unsafe fn begin() {
+        unsafe {
+            let _: () = msg_send![class!(CATransaction), begin];
+        }
+    }
+
+    /// Disables implicit CA animations for the current transaction,
+    /// preventing crossfade artifacts on layer content swaps.
+    pub unsafe fn set_disable_actions() {
+        unsafe {
+            let _: () = msg_send![class!(CATransaction), setDisableActions: YES];
+        }
+    }
+
+    /// Commits the current Core Animation transaction. Mirrors
+    /// `CATransaction::commit()` in `ca_transaction_observer.mm`.
+    pub unsafe fn commit() {
+        unsafe {
+            let _: () = msg_send![class!(CATransaction), commit];
+        }
+    }
+}
 const IOSURFACE_LATCH_BUFFER: Duration = Duration::from_micros(1500);
 /// Bounded wait for a parallel-produced resize frame. Chromium can afford a
 /// longer timeout because its wait pumps `WindowResizeHelperMac` tasks; this
@@ -856,16 +958,6 @@ fn complete_iosurface_frame(frame: Box<PresentedIosurfaceFrame>, presented: bool
     }
 }
 
-fn supports_ca_transaction_phase_handlers() -> bool {
-    static SUPPORTS_CA_TRANSACTION_PHASE_HANDLERS: OnceLock<bool> = OnceLock::new();
-    *SUPPORTS_CA_TRANSACTION_PHASE_HANDLERS.get_or_init(|| unsafe {
-        msg_send![
-            class!(CATransaction),
-            respondsToSelector: sel!(addCommitHandler:forPhase:)
-        ]
-    })
-}
-
 fn fail_iosurface_frame(frame: Box<PresentedIosurfaceFrame>) {
     let latch_time = scheduler::Instant::now();
     let swap_id = Some(frame.swap_id);
@@ -910,29 +1002,19 @@ fn commit_iosurface_frame(frame: Box<PresentedIosurfaceFrame>) -> bool {
 
     let display_timing = *frame.latest_display_timing.lock();
     let frame = Rc::new(Cell::new(Some(frame)));
-    let post_commit_handler = if supports_ca_transaction_phase_handlers() {
-        let frame = frame.clone();
-        let block = ConcreteBlock::new(move || {
-            if let Some(frame) = frame.take() {
+
+    let registered_post_commit = unsafe {
+        ca_transaction::begin();
+        ca_transaction::set_disable_actions();
+        let frame_for_handler = frame.clone();
+        ca_transaction::add_commit_handler(CATransactionPhase::PostCommit, move || {
+            if let Some(frame) = frame_for_handler.take() {
                 complete_iosurface_frame(frame, true);
             }
-        });
-        Some(block.copy())
-    } else {
-        None
+        })
     };
 
     unsafe {
-        let _: () = msg_send![class!(CATransaction), begin];
-        let _: () = msg_send![class!(CATransaction), setDisableActions: YES];
-        if let Some(post_commit_handler) = &post_commit_handler {
-            let post_commit_handler = &**post_commit_handler;
-            let _: () = msg_send![
-                class!(CATransaction),
-                addCommitHandler: post_commit_handler
-                forPhase: CA_TRANSACTION_PHASE_POST_COMMIT
-            ];
-        }
         if let Some(frame_for_contents) = frame.take() {
             let mut frame_for_contents = frame_for_contents;
             frame_for_contents.committed_display_timing = display_timing;
@@ -959,10 +1041,10 @@ fn commit_iosurface_frame(frame: Box<PresentedIosurfaceFrame>) -> bool {
             }
             frame.set(Some(frame_for_contents));
         }
-        let _: () = msg_send![class!(CATransaction), commit];
+        ca_transaction::commit();
     }
 
-    if let Some(frame) = frame.take() {
+    if !registered_post_commit && let Some(frame) = frame.take() {
         complete_iosurface_frame(frame, true);
     }
 
